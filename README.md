@@ -25,23 +25,27 @@ Concretely, this library:
   never packs a mint call's arguments by hand (`vol_kind_mint`,
   `vol_kind_narrow`).
 - Parses and encodes the 4096-byte PDXB v1 superblock
-  (`pdxb_parse_superblock`, `pdxb_encode_superblock`), and will sign it
-  (`pdxb_sign_superblock`, M3) once the paideia-as `mldsa65_sign`
-  intrinsic is linkable.
+  (`pdxb_parse_superblock`, `pdxb_encode_superblock`) and signs it
+  (`pdxb_sign_superblock`, M3) via the paideia-as `MlDsa65::sign`
+  intrinsic.
 - Parses the `KIND_PDXFS_MOUNT_TABLE` capability row
   (`mount_table_row_parse`) and walks the live `_mount_table[]` array
   it points at (`mount_table_snapshot`).
+- Signs (and, once a verify intrinsic lands, will verify) an inode-tail
+  byte range for a future `fsck.pdxfs` (`pdxb_sign_inode_tail`,
+  `pdxb_verify_inode_tail`, M3).
 
 ## Status
 
-**M1 and M2 landed** (scaffold + module boundary, the
+**M1, M2, and M3 landed** (scaffold + module boundary, the
 `KIND_PDXFS_MOUNT_TABLE` row-layout parser, the PDXB superblock codec,
-the mount-table snapshot walker, and `KIND_VOLUME` op-mask narrowing).
-M3..M5 pending — see [`STATUS.md`](STATUS.md) for the per-milestone
-checklist mirroring `design/tooling/volume-tooling-ux.md` §9.4 in the
+the mount-table snapshot walker, `KIND_VOLUME` op-mask narrowing, and
+the ML-DSA-65 signing helpers). M4..M5 pending — see
+[`STATUS.md`](STATUS.md) for the per-milestone checklist mirroring
+`design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo.
 
-## API surface (M2)
+## API surface (M2 + M3)
 
 | Function | Signature | Body |
 |---|---|---|
@@ -51,6 +55,9 @@ checklist mirroring `design/tooling/volume-tooling-ux.md` §9.4 in the
 | `PdxbSuperblock::pdxb_encode_superblock` | `(sb_ptr: u64, out_ptr: u64, out_len: u64) -> u64` | **real** — zero-fills the 4096-byte output then stamps every field back from the summary; returns `out_len` or `PDXB_ENC_ERR_BUF_TOO_SHORT` |
 | `MountTable::mount_table_row_parse` | `(row_ptr: u64, out_ptr: u64) -> u64` | **real** — decodes the 64-byte `KIND_PDXFS_MOUNT_TABLE` singleton row into a `MountTableRow` at `out_ptr`; returns `LPV_MTR_OK` (0), `LPV_MTR_ERR_BAD_MAGIC` (1), or `LPV_MTR_ERR_ROW_DEAD` (2) |
 | `MountTableSnapshot::mount_table_snapshot` | `(row_ptr: u64, out_ptr: u64, out_cap: u64, out_count_ptr: u64) -> u64` | **real** — walks the live `_mount_table[]` array the singleton row points at, decoding up to `out_cap` `MountTableEntry` slots and writing the count written to `*out_count_ptr`; returns `LPV_MTS_OK` (0), `LPV_MTS_ERR_BAD_MAGIC` (1), or `LPV_MTS_ERR_ROW_DEAD` (2) |
+| `PdxbSign::pdxb_sign_superblock` | `(sb_ptr: u64, seed_ptr: u64, out_sig_ptr: u64, out_sig_len: u64) -> u64` | **real** — signs `sb_ptr[0, 696)` via `MlDsa65::sign` and writes the 3309-byte result to `out_sig_ptr` (pass `sb_ptr + 696` to sign in place); returns `3309` or `PDXB_SIGN_ERR` |
+| `PdxbSign::pdxb_sign_inode_tail` | `(inode_ptr: u64, tail_offset: u64, tail_len: u64, seed_ptr: u64, out_sig_ptr: u64) -> u64` | **real** — same signing path over `inode_ptr[tail_offset, tail_offset+tail_len)`; deferred consumer (`fsck.pdxfs` does not exist yet) |
+| `PdxbSign::pdxb_verify_inode_tail` | `(inode_ptr: u64, tail_offset: u64, tail_len: u64, sig_ptr: u64, sig_len: u64, pub_key_slot: u64) -> u64` | **stub** — no `mldsa65_verify` intrinsic exists in paideia-as v0.24.0; dereferences nothing, always returns `PDXB_VER_ERR_NOT_IMPLEMENTED` |
 
 paideia-as functions return a single `u64` register, so every "returns
 a struct" shape in the upstream design doc becomes an out-pointer +

@@ -1,7 +1,7 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M2 (core parse + encode) — landed
+**Current milestone:** M3 (signing helpers) — landed
 **Version:** unreleased (pre-1.0.0)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
@@ -68,12 +68,28 @@ full 12-issue breakdown this checklist mirrors.
       the full rationale and the flag for main. Signature grew from
       2 args (M1 stub) to 3 (out-pointer convention).
 
-### M3 — Signing helpers (pending)
+### M3 — Signing helpers (landed)
 
-- [ ] **M3-001** — `pdxb_sign_superblock` via paideia-as `mldsa65_sign`
-      intrinsic.
-- [ ] **M3-002** — inode-tail sig helpers (used by future `fsck.pdxfs`;
-      deferred consumer).
+- [x] **M3-001** (#7) — `pdxb_sign_superblock` via the paideia-as
+      `MlDsa65::sign` intrinsic (`src/pdxb_sign.pdx`, new file). Signs
+      `sb_ptr[0, 696)` (volume-fs-substrate.md §2.1's signed range) and
+      writes the 3309-byte result to a caller-chosen `out_sig_ptr`
+      (pass `sb_ptr + 696` to sign in place). Takes a raw `seed_ptr`
+      rather than the issue brief's `sig_key_slot` — `KIND_SIG_KEY`'s
+      landed row is a PUBLIC-key handle, not a private signing seed, and
+      this library issues zero cap-invoke calls by established
+      discipline; see design/architecture.md §8.2 for the full
+      rationale and the flag for main. First real (non-test) caller of
+      `MlDsa65::sign` found anywhere in the paideia-os/paideia-as tree.
+- [x] **M3-002** (#8) — inode-tail sig helpers (`src/pdxb_sign.pdx`),
+      used by future `fsck.pdxfs` (deferred consumer, not yet written).
+      `pdxb_sign_inode_tail` has a real body (same `MlDsa65::sign` call
+      path, no `out_sig_len` gate — matches the issue's literal 5-arg
+      signature, flagged for main in design/architecture.md §8.3).
+      `pdxb_verify_inode_tail` is a documented STUB: no `mldsa65_verify`
+      intrinsic exists in paideia-as v0.24.0 (repo-wide grep empty);
+      always returns a nonzero sentinel, dereferences nothing. See
+      design/architecture.md §8.4.
 
 ### M4 — Tests + fuzz (pending)
 
@@ -89,12 +105,18 @@ full 12-issue breakdown this checklist mirrors.
 
 ## Next milestone
 
-M3 (signing helpers) opens next. `M3-001` (`pdxb_sign_superblock`)
-needs the paideia-as `mldsa65_sign` intrinsic, which has landed
-upstream per recent paideia-as version bumps — main should confirm it
-is callable from this library's build before M3-001 starts. `M3-002`
-(inode-tail sig helpers) has no consumer yet (`fsck.pdxfs` is a
-deferred tool) and may be worth deferring further.
+M4 (tests + fuzz) opens next. `M4-002` ("sig-verify against a
+known-signed superblock fixture") needs main to decide first whether it
+verifies via a real `mldsa65_verify` intrinsic (not landed in
+paideia-as v0.24.0 today — `pdxb_verify_inode_tail` is a stub, see
+design/architecture.md §8.4) or via some other mechanism (e.g. a host-
+side Rust verify path outside this library, mirroring how `mkfs-pdxb`'s
+own dev-key tooling works) until one lands. Build not run for M3 — this
+library's own discipline is main-only builds; main should run
+`bash tools/build.sh` against this landing before M4 starts and confirm
+the `MlDsa65::sign` local-trait-declaration call pattern (design/
+architecture.md §8.1) actually compiles, since it is the first real
+call site for that intrinsic anywhere in the tree.
 
 `M2-004`'s `vol_kind_narrow` landed as validation + passthrough rather
 than a real kernel-enforced narrowing (see `design/architecture.md`

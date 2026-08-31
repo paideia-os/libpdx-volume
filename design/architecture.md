@@ -459,3 +459,179 @@ bug:
 - No cap-invoke calls anywhere in this repo. Every function operates
   on caller-supplied raw pointers or cap-slot integers; none of them
   issue a syscall at M1 (see `caps.decl`'s closing note).
+
+## 8. M3-001/M3-002 landing — signing helpers, and why `seed_ptr` replaces `sig_key_slot`
+
+New file `src/pdxb_sign.pdx` (module `PdxbSign`), landing
+`libpdx-volume#7` (`pdxb_sign_superblock`) and `#8`
+(`pdxb_sign_inode_tail` + `pdxb_verify_inode_tail`). This is a new,
+fourth module rather than an extension of `src/pdxb_superblock.pdx` —
+§6 anticipated exactly this split at M1 ("Signing ... will likely land
+in its own `src/signing.pdx` ... since it depends on a different
+substrate ... than the pure-decode/encode logic").
+
+### 8.1 The `MlDsa65::sign` intrinsic — discovered calling convention
+
+`tools/paideia-as/crates/paideia-stdlib/pdx/mldsa.pdx` (paideia-os's
+`tools/paideia-as` submodule, now at v0.24.0) declares:
+
+```
+trait MlDsa65 {
+  fn sign(seed_ptr: u64, msg_ptr: u64, msg_len: u64, sig_out_ptr: u64)
+    -> i64 !{crypto, mem} @{paideia.crypto};
+}
+```
+
+SysV mapping (from that file and from
+`paideia-pq-sign::ffi::mldsa65_sign_runtime_entry`, the extern-C thunk
+the elaborator's `stdlib_lowering::mldsaops` recipe targets):
+`RDI=seed_ptr` (32-byte seed), `RSI=msg_ptr`, `RDX=msg_len`,
+`RCX=sig_out_ptr` (>= 3309 bytes), `RAX` return code (`0` = OK,
+signature written to `sig_out_ptr[..3309]`; `-1` InvalidParam, a
+required pointer was NULL; `-2` Length, defensive/should be
+unreachable). On any nonzero return the output buffer is left
+untouched.
+
+A repo-wide grep for `MlDsa65::sign` / `mldsa65_sign` across both
+`paideia-os` and its `paideia-as` submodule at this landing found
+**zero real (non-test) call sites** anywhere in the tree —
+`src/kernel/core/fs/pdxfs/superblock_write.pdx` explicitly DESCOPED
+calling it ("the R52 blocker gap"), and `src/tools/mkfs-pdxb/main.pdx`
+still leaves its on-disk `sig` field all-zero. `src/pdxb_sign.pdx`'s
+`pdxb_sign_mldsa65_raw` is, as far as this landing's research
+established, the **first real caller** of this intrinsic anywhere in
+the codebase. The only precedent for the call-site *syntax* is a
+regression-test fixture,
+`tools/paideia-as/tests/build-emit/trait_call_lambda_body.pdx`
+(paideia-as#1290): a trait declared **locally inside the calling
+module** (not imported from the stdlib crate), invoked as a plain
+(non-`unsafe`, non-`block`) lambda body —
+`fn(a, b) -> PerCpuOps::write_u64(a, b)`. This works because the
+elaborator's `stdlib_lowering::lower_stdlib_method`
+(`crates/paideia-as-elaborator/src/stdlib_lowering/mod.rs`) dispatches
+on the literal `(trait_name, method_name)` strings at the call site,
+not on a resolved/imported trait definition — there is no cross-crate
+trait-import mechanism to use even if one were wanted.
+`src/pdxb_sign.pdx` follows this precedent exactly: it locally
+redeclares `trait MlDsa65 { fn sign(...) -> i64 ...; }` verbatim, then
+calls it from a plain lambda body. **Flagged for main:** confirm this
+reading holds against a real `bash tools/build.sh` — main-only per this
+repo's build discipline, not run for this landing.
+
+A raw `unsafe { block: {...} }` body (the mnemonic-sequence grammar
+every other function in this repo uses, including every M1/M2
+function) is a different grammar than a lambda-body tail expression, so
+the trait call cannot be spliced directly into an asm block. `src/
+pdxb_sign.pdx` therefore isolates the trait call in its own tiny plain
+function (`pdxb_sign_mldsa65_raw`, return type `i64` to match the trait
+method exactly) and has `pdxb_sign_superblock`/`pdxb_sign_inode_tail`
+reach it via an ordinary `call pdxb_sign_mldsa65_raw;` from inside
+their own `unsafe` blocks — the same way any sibling function call
+already works throughout this codebase (e.g. `kind_sig_key.pdx`'s
+`sig_key_row_key_type` calling `sig_key_tail_valid`).
+
+### 8.2 `seed_ptr`, not `sig_key_slot` — a required deviation from the issue brief
+
+The issue brief names the signing argument `sig_key_slot` (a cap slot
+holding `KIND_SIG_KEY`). Both `pdxb_sign_superblock` and
+`pdxb_sign_inode_tail` instead take `seed_ptr` — a raw pointer to the
+32-byte ML-DSA-65 seed. Two independent reasons, either sufficient
+alone:
+
+1. **`KIND_SIG_KEY` as landed is a PUBLIC-key handle, not a private
+   seed store.** `src/kernel/core/cap/kind_sig_key.pdx` (paideia-os,
+   R52.M5-001 #1703)'s own module header: "the runtime authority for
+   ONE ML-DSA-65 **public**-key handle used for signed-inode-tail
+   verification ... and for volume-mount key cross-checking." Its row
+   holds `key_hash[32]` (a BLAKE3 fingerprint) and `key_material_lba`
+   (pointing at public key bytes); there is no `R_SIGK_WRITE`, no
+   read-seed op, and — confirmed by grepping the entire kernel tree for
+   a private-signing-key capability kind — no such kind exists
+   anywhere. `design/filesystem/volume-fs-substrate.md` §380
+   corroborates the public-key reading independently: "Volume mount
+   cross-checks `superblock.sig_key_hash == KIND_SIG_KEY.key_hash`", a
+   verification-time check. `src/tools/mkfs-pdxb/main.pdx`'s own
+   `--sig-key <path>` flag defaults to
+   `tests/qemu/keys/pdxb-dev.mldsa65.**pub**` — the public half — used
+   only to compute `sig_key_hash`, never to sign. A `sig_key_slot`
+   cannot supply what `MlDsa65::sign` needs no matter how it is
+   resolved, because the thing it names does not hold that material.
+2. **This library issues zero cap-invoke syscalls, by established
+   discipline** (§7 above, restated at every milestone). Resolving a
+   slot to key material — even if a private-signing-key capability kind
+   existed — is inherently a cap-invoke (or a kernel-internal
+   `_sig_key_table` walk this ring-3 client cannot reach at all, since
+   that table and its accessors are kernel code, not something this
+   satellite library links against). This library has never made that
+   kind of call and does not start here.
+
+`pdxb_verify_inode_tail`'s `pub_key_slot` argument does NOT have the
+same problem — `KIND_SIG_KEY`'s landed shape genuinely is a public-key
+handle, exactly what a verify call would need — but that function is a
+stub (§8.4) and resolves nothing today regardless.
+
+**Flagged for main:** a `sig_key_slot`-shaped wrapper can be layered on
+top of `pdxb_sign_superblock`/`pdxb_sign_inode_tail` once (a) a
+private-signing-key capability kind lands kernel-side, and (b) this
+library or a caller is willing to add its first cap-invoke call to
+resolve it. Neither is scoped to M3.
+
+### 8.3 Signature coverage and destination
+
+`design/filesystem/volume-fs-substrate.md` §2.1 is explicit and
+internally consistent on scope: `sig` (on-disk `[696, 4096)`, 3400
+bytes) is "ML-DSA-65 signature covering bytes `[0, 696)`" — and
+separately, "`sig` scope is bytes `[0, 696)`. This excludes `sig`
+itself and excludes `_reserved`." `pdxb_sign_superblock` signs exactly
+`sb_ptr[0, 696)` (`PDXB_SIGN_MSG_LEN` in `src/pdxb_sign.pdx` — a
+second, duplicated copy of `PdxbSuperblock::PDXB_D_OFF_SIG`, since this
+repo has no cross-module constant-import syntax exercised anywhere;
+both must be kept in sync by hand if the wire format ever changes).
+This is the region PLUS `_reserved` `[160, 696)` — a superset of the
+176-byte `PdxbSuperblockSummary` this library's own parser/encoder
+decode (§3); the signed range is a wire-format fact, independent of
+what this library's in-memory struct happens to expose.
+
+The issue brief asks for both a generic `(out_sig_ptr, out_sig_len)`
+output pair AND "write the signature into `sb_ptr[696..696+3309]`
+(overwriting whatever was there)". This document reads those as one
+contract: `pdxb_sign_superblock` is a plain out-pointer function
+(matching every other function in this library, §2) that signs
+`sb_ptr[0, 696)` and writes the result to wherever `out_sig_ptr`
+points. A caller wanting "sign in place" passes `out_sig_ptr = sb_ptr +
+696`; M4's fuzz/round-trip harness can instead point at an independent
+scratch buffer without mutating the superblock under test. **Flagged
+for main:** confirm this reading; the alternative (always self-target
+`sb_ptr + 696`, ignoring `out_sig_ptr`'s value) is a small change but a
+real API-shape decision.
+
+`pdxb_sign_inode_tail` matches the issue brief's literal 5-argument
+shape (`inode_ptr, tail_offset, tail_len, seed_ptr, out_sig_ptr`) —
+unlike the superblock helper, there is no `out_sig_len` argument to
+gate on. **Flagged for main:** the caller must guarantee `out_sig_ptr`
+has at least `MLDSA65_SIG_LEN` (3309) writable bytes; this should
+either stay a documented caller obligation once `fsck.pdxfs` lands, or
+the signature should grow a 6th argument before that real consumer is
+written.
+
+### 8.4 `mldsa65_verify` does not exist — `pdxb_verify_inode_tail` is a stub
+
+A repo-wide grep for `mldsa65_verify` / `MlDsa65Verify` / any `verify`
+method on the `MlDsa65` trait, across `paideia-os` and its
+`tools/paideia-as` submodule (v0.24.0), found nothing —
+`crates/paideia-stdlib/pdx/mldsa.pdx` declares `sign` only, and
+`paideia-pq-sign::ffi` exports only `mldsa65_sign_runtime_entry`.
+`pdxb_verify_inode_tail` (`src/pdxb_sign.pdx`) is therefore a scaffold
+stub, matching this library's own M1-stub precedent (`vol_kind_mint`,
+the original `pdxb_parse_superblock`/`pdxb_encode_superblock`): it
+dereferences none of its six arguments and unconditionally returns
+`PDXB_VER_ERR_NOT_IMPLEMENTED` (a nonzero sentinel) rather than ever
+claiming a signature is valid it cannot check — fail-closed by
+construction, not fail-open. Once a verify intrinsic lands, the real
+body will mirror `pdxb_sign_inode_tail`'s shape (marshal args, call a
+plain lambda-body wrapper, forward the return code); `pub_key_slot`
+becomes resolvable at that point without the `seed_ptr`-style
+substitution §8.2 required for signing, since `KIND_SIG_KEY` already
+holds exactly the public-key material a verify call would need — that
+still requires this library (or its caller) to add a first cap-invoke
+call, which is a separate decision from today's stub.

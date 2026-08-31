@@ -53,8 +53,21 @@
 #
 #   KIND_SIG_KEY           = 0x1A3  (R52, per design/filesystem/
 #     volume-fs-substrate.md §2.1 sig_key_hash + design/tooling/
-#     volume-tooling-ux.md §2.1) -- (M3) pdxb_sign_superblock. Not
-#     referenced by any M1 function.
+#     volume-tooling-ux.md §2.1) -- NOT referenced by pdxb_sign_superblock
+#     / pdxb_sign_inode_tail (M3, landed): src/kernel/core/cap/
+#     kind_sig_key.pdx's landed row is a PUBLIC-key handle (key_hash +
+#     key_material_lba, used at mount time to cross-check the on-disk
+#     sig_key_hash field), not a private 32-byte ML-DSA-65 signing seed
+#     -- there is no kernel capability kind anywhere in the tree that
+#     holds private signing-key material. Both sign helpers therefore
+#     take a raw `seed_ptr` argument instead of a sig_key_slot, per
+#     this library's zero-cap-invoke discipline (this file's own
+#     closing note) -- see design/architecture.md §8 / src/pdxb_sign.pdx
+#     module header for the full rationale. KIND_SIG_KEY's public-key
+#     shape WOULD be a plausible fit for pdxb_verify_inode_tail's
+#     pub_key_slot argument once a real mldsa65_verify intrinsic lands
+#     (none exists in paideia-as v0.24.0 today) -- that function is a
+#     STUB at this landing and resolves nothing.
 #
 #   KIND_BLOCK_DEVICE      = 0x198..0x19F band (R51, osarch-owned) --
 #     (M2) vol_kind_mint's `dev_cap` argument narrows a probed
@@ -76,3 +89,10 @@
 # header). vol_kind_narrow's real body is validation + passthrough, not
 # a kernel-enforced derivation (no cap_narrow primitive exists for
 # KIND_VOLUME) -- flagged above and in design/architecture.md §5.
+#
+# M3 landing status (see STATUS.md): pdxb_sign_superblock (#7) and
+# pdxb_sign_inode_tail (#8) have real bodies calling the paideia-as
+# MlDsa65::sign intrinsic (src/pdxb_sign.pdx, new file). Both take a raw
+# seed_ptr rather than a sig_key_slot cap -- see the KIND_SIG_KEY entry
+# above. pdxb_verify_inode_tail (#8's verify half) is a STUB: no
+# mldsa65_verify intrinsic exists in paideia-as v0.24.0.
