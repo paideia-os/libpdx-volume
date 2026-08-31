@@ -1,7 +1,7 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M3 (signing helpers) — landed
+**Current milestone:** M4 (tests + fuzz) — landed
 **Version:** unreleased (pre-1.0.0)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
@@ -91,13 +91,52 @@ full 12-issue breakdown this checklist mirrors.
       always returns a nonzero sentinel, dereferences nothing. See
       design/architecture.md §8.4.
 
-### M4 — Tests + fuzz (pending)
+### M4 — Tests + fuzz (landed)
 
-- [ ] **M4-001** — parse-encode round-trip fuzz (10^5 random superblock
-      field values).
-- [ ] **M4-002** — sig-verify against a known-signed superblock fixture.
-- [ ] **M4-003** — `mount_table_snapshot` correctness matrix (0 rows, 1
-      row, 7 rows, full 8 rows).
+- [x] **M4-001** (#9) — parse-encode round-trip fuzz:
+      `tests/test_pdxb_roundtrip.pdx`, new file. 100000 (10^5)
+      iterations against `pdxb_parse_superblock` /
+      `pdxb_encode_superblock` (M2), holding the three parser-gated
+      fields (magic, version, block_size) fixed each iteration and
+      drawing the other 19 `PdxbSuperblockSummary` fields from a
+      64-bit LCG (`state = state * 6364136223846793005 +
+      1442695040888963407 mod 2^64`), masking the one 32-bit-on-disk
+      fuzzed field (`flags`) to its low 32 bits before the compare.
+      Returns 0 / 1 / 2 / `100+field_ordinal` per
+      `tests/README.md`'s return-code convention — no literal
+      `emit`+`exit`, since this library has no console/print
+      capability anywhere in `caps.decl` (see the file's own header
+      for the full rationale, flagged for main alongside every other
+      M4 driver here).
+- [x] **M4-002** (#10) — sig-verify against a known-signed superblock
+      fixture: `tests/test_pdxb_sigverify.pdx`, new file. Builds a
+      deterministic "known-blank-superblock + zero-signature-
+      placeholder" fixture in `.bss` (three stamped header fields,
+      the entire signature region left at its zero-init value — the
+      established equivalent of a literal `@rodata_bin` embed, which
+      does not exist as an attribute in paideia-as) and calls
+      `pdxb_verify_inode_tail` (M3-002 STUB) against it, asserting the
+      fail-closed sentinel (`PDXB_VER_ERR_NOT_IMPLEMENTED`) comes back
+      verbatim. **Flagged for main:** this is NOT a real sign-then-
+      verify round trip — no `mldsa65_verify` intrinsic exists in
+      paideia-as v0.24.0 (repo-wide grep empty, same finding M3-002
+      already documented); a real M4-002 test is blocked on that
+      intrinsic landing on the `MlDsa65` trait.
+- [x] **M4-003** (#11) — `mount_table_snapshot` correctness matrix:
+      `tests/test_mount_table_snapshot.pdx`, new file. Synthetic
+      `KIND_PDXFS_MOUNT_TABLE` row + synthetic 8-slot `_mount_table[]`
+      image in `.bss`, driven through `mount_slot_count` = 0, 1, 7,
+      and 8 (full) via a shared `tmts_run_case` helper; each case
+      verifies `out_count` and every decoded entry's five fields.
+      Returns 0 / case ordinal (1..4) per `tests/README.md`'s
+      return-code convention.
+
+See `tests/README.md` for the full per-file contract, the shared
+return-code convention all three drivers use (a `u64` status code, not
+a literal print+exit — this library has no console capability), and
+why none of the three drivers needs to fault-inject around a syscall
+the way `libpdx-audit`'s M4 drivers do (this library issues zero
+syscalls anywhere in its own call graph, by established discipline).
 
 ### M5 — Signed release (pending)
 

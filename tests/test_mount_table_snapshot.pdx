@@ -1,0 +1,343 @@
+// tests/test_mount_table_snapshot.pdx — libpdx-volume.M4-003 (issue #11)
+// TestMountTableSnapshot: correctness matrix for
+// `MountTableSnapshot::mount_table_snapshot`
+// (src/mount_table_snapshot.pdx, M2-003) over mount_slot_count = 0, 1,
+// 7, and 8 (full).
+//
+// ================================================================
+// The fixture -- a synthetic KIND_PDXFS_MOUNT_TABLE row + a synthetic
+// 8-slot _mount_table[] array, both in this file's own `.bss`
+// ================================================================
+//
+// `mount_table_snapshot(row_ptr, out_ptr, out_cap, out_count_ptr)`
+// takes two caller-owned inputs: a 64-byte KIND_PDXFS_MOUNT_TABLE
+// singleton row (`row_ptr`) whose `table_row_addr` field points at the
+// LIVE `_mount_table[MOUNT_MAX=8]` array it walks
+// (src/kernel/core/fs/mount.pdx, R16-M1-005, reproduced in
+// src/mount_table_snapshot.pdx's own module header). Neither exists
+// as a real kernel object in a bare test-run (no kernel, no boot), so
+// this driver builds both by hand in `.bss`:
+//
+//   `tmts_row` (64 bytes) — header0 = 0x01000000000001A5 (kind=0x1A5
+//   at bits [15:0], in_use=1 at bits [63:56], gen=0, flags=0 --
+//   both gates `mount_table_snapshot` checks pass); header1 =
+//   mount_slot_count, OVERWRITTEN per test case by `tmts_run_case`;
+//   table_row_addr = &tmts_entries, written once; the remaining 40
+//   bytes stay at their `.bss` zero-init value (reserved, never read).
+//
+//   `tmts_entries` (64 bytes = 8 slots x 8 bytes) — a full 8-slot
+//   `_mount_table[]` image, packed per that array's real, frozen
+//   per-slot layout (src/mount_table_snapshot.pdx module header,
+//   copied from src/kernel/core/fs/mount.pdx): slot i holds
+//   mountpoint_vnode_idx = 100+i, root_vnode_idx = 200+i,
+//   backend_type = i, flags = 0x01 (VALID), _reserved = 0x1000+i --
+//   five DISTINCT, DETERMINISTIC values per slot so a correctness
+//   check can tell "slot 3 decoded" apart from "slot 5 decoded into
+//   slot 3's output position" (an off-by-one in the walk loop would
+//   be invisible if every slot carried identical field values). The
+//   eight packed 64-bit words this produces are precomputed offline
+//   (see the field formula in `tmts_run_case`'s justification) and
+//   written here as plain hex immediates -- matching this file's
+//   `.bss`-plus-explicit-stores convention rather than a byte-array
+//   literal (see `test_pdxb_sigverify.pdx`'s header for why no
+//   `@rodata_bin`-equivalent literal-array approach is used in this
+//   repo for anything bigger than a 16-byte GUID).
+//
+// `mount_table_snapshot` walks `min(mount_slot_count, out_cap)` slots
+// UNCONDITIONALLY (live or not -- see that file's own module header);
+// this driver always passes `out_cap = 8` (the synthetic table's full
+// capacity) so `walk_count == mount_slot_count` in every one of the
+// four cases below, keeping the expected-count arithmetic trivial.
+//
+// ================================================================
+// The four cases
+// ================================================================
+//
+//   Case 1 — mount_slot_count = 0: expects out_count == 0 and NO
+//            entry written (verified by zeroing tmts_out before the
+//            call and confirming the zero-check the "0 rows" loop
+//            bound trivially satisfies -- see below).
+//   Case 2 — mount_slot_count = 1: expects out_count == 1 and slot 0
+//            decoded correctly.
+//   Case 3 — mount_slot_count = 7: expects out_count == 7 and slots
+//            0..6 decoded correctly (slot 7 untouched -- this driver
+//            does not assert on it, since `mount_table_snapshot`'s own
+//            contract only promises `out_count` entries written).
+//   Case 4 — mount_slot_count = 8 (full): expects out_count == 8 and
+//            all eight slots decoded correctly.
+//
+// Each case is driven by the shared helper `tmts_run_case(slot_count)`
+// so the population-and-verify logic (a runtime loop over `j = 0 ..
+// slot_count`, not four hand-unrolled field-check blocks) is written
+// once; `run()` itself is four flat, independent
+// `mov rdi, N; call tmts_run_case; cmp rax, 0; jne tmts_caseK_fail;`
+// blocks with no register needing to survive across a call in `run()`
+// -- deliberately avoiding the callee-save push/pop dance a running
+// "which case failed" accumulator would otherwise need.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches every M4 driver in this repo (see tests/README.md and
+// test_pdxb_roundtrip.pdx's own header for why this is a return code
+// rather than a literal "emit + exit" pair -- libpdx-volume has no
+// console/print capability anywhere in `caps.decl`):
+//
+//   0     — all four cases passed ("snapshot ok cases=4").
+//   1..4  — the 1-based ordinal of the first case that failed
+//           ("snapshot fail case=<N>"): 1 = the 0-row case, 2 = the
+//           1-row case, 3 = the 7-row case, 4 = the 8-row (full) case.
+//           A failure inside a case can be the `mount_table_snapshot`
+//           return code itself, the `out_count` mismatch, OR any
+//           single field mismatch in the per-entry verify loop --
+//           `tmts_run_case` collapses all three into one `1` so
+//           `run()`'s per-case return code stays a clean case ordinal;
+//           a future consumer with a print primitive that wants
+//           finer-grained diagnosis re-runs the failing case's inputs
+//           through `mount_table_snapshot` directly and inspects
+//           `tmts_out` / `tmts_out_count` by hand.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - `push r15; push rdi; ... call mount_table_snapshot; ... pop r13;
+//     pop r15;` in `tmts_run_case` preserves `slot_count` (the
+//     incoming `rdi` argument) across the ONE nested call this driver
+//     makes -- `mount_table_snapshot` clobbers r8..r14 per its own
+//     documented register plan (src/mount_table_snapshot.pdx), so
+//     `slot_count` cannot simply be left in a register across that
+//     call. Pushed as a pair (real data + an unused r15 spacer) for
+//     the same rsp-parity reason libpdx-audit's `test_broker_refusal.
+//     pdx` pushes r12+r13 in pairs around its own nested calls.
+//   - `imul r10, r14, 40` — three-operand reg,reg,imm form, proven at
+//     `mount_table_snapshot.pdx`'s own `imul r13, r9, 40` (this
+//     repo, M2-003) for the identical MTE_SUMMARY_BYTES stride.
+//   - No `add reg, [mem]` anywhere -- every `add` is reg,reg or
+//     reg,imm (the zero-fill loop, the verify loop's index and
+//     expected-value arithmetic, the entry-address computation).
+//   - No byte loads -- every packed `_mount_table[]` word and every
+//     decoded `MountTableEntry` slot is a full qword `mov`.
+//   - No `test`; every check is `cmp reg, reg` or `cmp reg, imm`, all
+//     well inside the 0x7FFFFFFF cmp-imm bound (no staging needed
+//     anywhere in this file).
+//   - Cross-module call (`call mount_table_snapshot;`) uses the bare
+//     unqualified symbol name, per this repo's established convention
+//     (see test_pdxb_roundtrip.pdx's header for the full rationale
+//     and the libpdx-audit precedent). `tools/build.sh` compiles this
+//     file standalone with no link step, so this is an
+//     unresolved-external reference in this file's own `.o`.
+//   - Label prefix `tmts_` (TestMountTableSnapshot).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#11);
+// src/mount_table_snapshot.pdx (this repo, M2-003); src/mount_table.pdx
+// (this repo, M1-002, row layout); tests/README.md (this repo,
+// return-code convention).
+
+module TestMountTableSnapshot = structure {
+
+  // --- MountTableEntry summary offsets, duplicated from
+  // src/mount_table_snapshot.pdx per this repo's no-cross-module-
+  // constant-import convention. ---
+  pub let TMTS_MTE_OFF_MOUNTPOINT_VNODE_IDX : u64 = 0
+  pub let TMTS_MTE_OFF_ROOT_VNODE_IDX       : u64 = 8
+  pub let TMTS_MTE_OFF_BACKEND_TYPE         : u64 = 16
+  pub let TMTS_MTE_OFF_FLAGS                : u64 = 24
+  pub let TMTS_MTE_OFF_RESERVED             : u64 = 32
+  pub let TMTS_MTE_SUMMARY_BYTES            : u64 = 40
+
+  // --- .bss fixture + scratch. See module header "The fixture". ---
+  pub let mut tmts_row       : [u8; 64]  = uninit @align(8)  // synthetic KIND_PDXFS_MOUNT_TABLE row
+  pub let mut tmts_entries   : [u8; 64]  = uninit @align(8)  // synthetic 8-slot _mount_table[]
+  pub let mut tmts_out       : [u8; 320] = uninit @align(8)  // 8 * MTE_SUMMARY_BYTES(40)
+  pub let mut tmts_out_count : u64       = uninit @align(8)
+
+  // ==========================================================================
+  // tmts_run_case(slot_count) -> u64
+  //
+  // Stamps `tmts_row`'s mount_slot_count to `slot_count`, zeroes the
+  // output scratch, calls `mount_table_snapshot`, and verifies
+  // out_count plus every decoded entry in `[0, slot_count)`. Returns 0
+  // on pass, 1 on any failure (see module header "Return-code
+  // convention").
+  // ==========================================================================
+  pub let tmts_run_case : (u64) -> u64 !{mem} @{} =
+    fn (slot_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-003 (#11): tmts_run_case entry point, shared by all four correctness-matrix cases. Stamps tmts_row's header1 (mount_slot_count) to the incoming rdi argument via a direct `mov [r11+8], rdi`. Zeroes tmts_out (320 bytes = 40 qwords) via a bounded xor/store/add/cmp/jb loop (same shape as pdxb_encode_superblock's own zero-fill loop) and tmts_out_count, so a prior case's leftover data cannot masquerade as this case's output. Preserves slot_count across the nested `call mount_table_snapshot;` by pushing it (paired with an unused r15 spacer for rsp-parity, per libpdx-audit's push-in-pairs precedent) since that callee clobbers r8..r14 per its own documented register plan -- pops it back into r13 immediately after the call returns. Marshals SysV args rdi=&tmts_row, rsi=&tmts_out, rdx=8 (out_cap, the synthetic table's full capacity, so walk_count==slot_count in every case), rcx=&tmts_out_count. On a nonzero return (LPV_MTS_ERR_BAD_MAGIC/_ROW_DEAD), jumps to tmts_rc_fail (return 1) -- should never fire given this driver's own row is always well-formed. Loads *tmts_out_count and compares it to r13 (the preserved expected slot_count); mismatch -> tmts_rc_fail. Runs a verify loop j=0..slot_count (r14): out_entry_ptr = &tmts_out + j*40 via `imul r10,r14,40; add r10,r11` (three-operand imul, proven at mount_table_snapshot.pdx's own MTE_SUMMARY_BYTES stride computation); compares five expected values against the five decoded fields at that address -- mountpoint_vnode_idx == 100+j, root_vnode_idx == 200+j, backend_type == j, flags == 1, _reserved == 0x1000+j -- matching exactly the packed-word formula tmts_entries was populated with in run() (word = mv | (rv<<16) | (bt<<32) | (fl<<40) | (rs<<48), mv=100+i, rv=200+i, bt=i, fl=1, rs=0x1000+i). Any single field mismatch jumps to tmts_rc_fail. On the loop exhausting j==slot_count with every field matched (including the slot_count=0 case, where the loop body never executes at all -- j=0 immediately fails `cmp r14,r13; jae tmts_rc_ok` since r13=0), falls through to tmts_rc_ok (return 0). No add reg,[mem]. No byte loads. No test mnemonic. Label prefix tmts_.",
+      block: {
+        // ---- Stamp this case's mount_slot_count into the row's header1. ----
+        lea r11, [rip + tmts_row];
+        mov [r11 + 8], rdi;
+
+        // ---- Zero tmts_out (320 bytes = 40 qwords). ----
+        lea r12, [rip + tmts_out];
+        xor rax, rax;
+        xor rcx, rcx;
+      tmts_zero_loop:
+        mov [r12 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 40;
+        jb  tmts_zero_loop;
+
+        // ---- Zero tmts_out_count. ----
+        lea r11, [rip + tmts_out_count];
+        mov [r11 + 0], rax;              // rax is still 0 from the zero loop
+
+        // ---- Call mount_table_snapshot(row_ptr, out_ptr, out_cap=8,
+        // out_count_ptr). Preserve slot_count (rdi) across the call. ----
+        push r15;
+        push rdi;
+
+        lea rdi, [rip + tmts_row];
+        lea rsi, [rip + tmts_out];
+        mov rdx, 8;
+        lea rcx, [rip + tmts_out_count];
+        call mount_table_snapshot;
+
+        pop r13;                         // r13 = expected slot_count
+        pop r15;
+
+        cmp rax, 0;
+        jne tmts_rc_fail;
+
+        // ---- out_count must equal the expected slot_count. ----
+        lea r11, [rip + tmts_out_count];
+        mov rax, [r11 + 0];
+        cmp rax, r13;
+        jne tmts_rc_fail;
+
+        // ---- Per-entry field verification loop: j = 0 .. slot_count. ----
+        xor r14, r14;                    // j = 0
+      tmts_verify_loop:
+        cmp r14, r13;
+        jae tmts_rc_ok;
+
+        lea r11, [rip + tmts_out];
+        imul r10, r14, 40;
+        add r10, r11;                    // out_entry_ptr = &tmts_out + j*40
+
+        // expected mountpoint_vnode_idx = 100 + j
+        mov rax, 100;
+        add rax, r14;
+        mov rcx, [r10 + 0];
+        cmp rax, rcx;
+        jne tmts_rc_fail;
+
+        // expected root_vnode_idx = 200 + j
+        mov rax, 200;
+        add rax, r14;
+        mov rcx, [r10 + 8];
+        cmp rax, rcx;
+        jne tmts_rc_fail;
+
+        // expected backend_type = j
+        mov rax, r14;
+        mov rcx, [r10 + 16];
+        cmp rax, rcx;
+        jne tmts_rc_fail;
+
+        // expected flags = 1 (VALID)
+        mov rax, 1;
+        mov rcx, [r10 + 24];
+        cmp rax, rcx;
+        jne tmts_rc_fail;
+
+        // expected _reserved = 0x1000 + j
+        mov rax, 0x1000;
+        add rax, r14;
+        mov rcx, [r10 + 32];
+        cmp rax, rcx;
+        jne tmts_rc_fail;
+
+        add r14, 1;
+        jmp tmts_verify_loop;
+
+      tmts_rc_ok:
+        xor rax, rax;
+        ret;
+
+      tmts_rc_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Populates the synthetic 8-slot _mount_table[] and the row's fixed
+  // fields once, then drives the four-case matrix (0, 1, 7, 8 rows) via
+  // tmts_run_case. See module header for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-003 (#11): TestMountTableSnapshot::run entry point. One-time setup: writes the eight precomputed packed _mount_table[] slot words (slot i: mountpoint_vnode_idx=100+i, root_vnode_idx=200+i, backend_type=i, flags=0x01, _reserved=0x1000+i, packed per that array's real per-slot bit layout) into tmts_entries at offsets 0,8,...,56; writes tmts_row's header0 (0x01000000000001A5 -- kind=0x1A5 at bits[15:0], in_use=1 at bits[63:56], both gates mount_table_snapshot checks) and table_row_addr (&tmts_entries, via a single-symbol `lea rax,[rip+tmts_entries]` then a plain store -- not a two-register lea) at offsets 0 and 16; the row's header1 (mount_slot_count) is left at its .bss zero value here since tmts_run_case stamps it per case. Then runs the four-case matrix as four independent, flat blocks -- `mov rdi,N; call tmts_run_case; cmp rax,0; jne tmts_caseK_fail;` for N in {0,1,7,8} and K in {1,2,3,4} -- deliberately with NO register carrying state across these calls (unlike tmts_run_case's own single nested call, run() itself never needs a push/pop pair since each case's outcome is checked and dispatched immediately after its call returns, before the next case's call reuses any register). Returns 0 if all four cases returned 0, else the 1-based ordinal of the first case that failed. No add reg,[mem]. No byte loads. No test mnemonic. Label prefix tmts_.",
+      block: {
+        // ---- One-time setup: synthetic 8-slot _mount_table[] image. ----
+        // Packed per slot i: mv=100+i | (rv=200+i)<<16 | (bt=i)<<32 |
+        // (fl=1)<<40 | (rs=0x1000+i)<<48.
+        lea r11, [rip + tmts_entries];
+        mov rax, 0x1000010000c80064; mov [r11 + 0],  rax;  // slot 0
+        mov rax, 0x1001010100c90065; mov [r11 + 8],  rax;  // slot 1
+        mov rax, 0x1002010200ca0066; mov [r11 + 16], rax;  // slot 2
+        mov rax, 0x1003010300cb0067; mov [r11 + 24], rax;  // slot 3
+        mov rax, 0x1004010400cc0068; mov [r11 + 32], rax;  // slot 4
+        mov rax, 0x1005010500cd0069; mov [r11 + 40], rax;  // slot 5
+        mov rax, 0x1006010600ce006a; mov [r11 + 48], rax;  // slot 6
+        mov rax, 0x1007010700cf006b; mov [r11 + 56], rax;  // slot 7
+
+        // ---- One-time setup: the row's fixed fields. ----
+        lea r11, [rip + tmts_row];
+        mov rax, 0x01000000000001A5;    // header0: in_use=1 | flags=0 | gen=0 | kind=0x1A5
+        mov [r11 + 0], rax;
+        lea rax, [rip + tmts_entries];
+        mov [r11 + 16], rax;            // table_row_addr
+
+        // ---- Case 1: 0 rows. ----
+        mov rdi, 0;
+        call tmts_run_case;
+        cmp rax, 0;
+        jne tmts_case1_fail;
+
+        // ---- Case 2: 1 row. ----
+        mov rdi, 1;
+        call tmts_run_case;
+        cmp rax, 0;
+        jne tmts_case2_fail;
+
+        // ---- Case 3: 7 rows. ----
+        mov rdi, 7;
+        call tmts_run_case;
+        cmp rax, 0;
+        jne tmts_case3_fail;
+
+        // ---- Case 4: 8 rows (full). ----
+        mov rdi, 8;
+        call tmts_run_case;
+        cmp rax, 0;
+        jne tmts_case4_fail;
+
+        xor rax, rax;                    // 0: all four cases passed
+        ret;
+
+      tmts_case1_fail:
+        mov rax, 1;
+        ret;
+
+      tmts_case2_fail:
+        mov rax, 2;
+        ret;
+
+      tmts_case3_fail:
+        mov rax, 3;
+        ret;
+
+      tmts_case4_fail:
+        mov rax, 4;
+        ret;
+      }
+    }
+}

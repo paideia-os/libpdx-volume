@@ -1,0 +1,454 @@
+// tests/test_pdxb_roundtrip.pdx — libpdx-volume.M4-001 (issue #9)
+// TestPdxbRoundtrip: parse/encode round-trip fuzz over
+// PdxbSuperblockSummary field values (src/pdxb_superblock.pdx, M2).
+//
+// ================================================================
+// Return-code convention (matches every M4 driver in this repo, see
+// tests/README.md) — NOT a literal "emit text + exit" pair
+// ================================================================
+//
+// This issue's brief asks for `emit "roundtrip fail iter=<N>
+// field=<name>"` + `exit 1` on failure and `emit "roundtrip ok
+// iters=<N>"` + `exit 0` on success. libpdx-volume is a shared
+// library with no runnable executable of its own (mirrors
+// libpdx-audit's own M4 test drivers exactly — see
+// libpdx-audit/tests/README.md "Why the drivers do not invoke
+// sys_ipc_send directly") and `caps.decl` declares zero console/print
+// capability anywhere in this tree: there is no primitive this file
+// could call to print a string or to `sys_exit`. `run()` therefore
+// returns a `u64` status code instead, exactly like every other
+// function in this library:
+//
+//   0        — all ITER_COUNT iterations round-tripped every field
+//              exactly ("roundtrip ok iters=100000").
+//   1        — pdxb_encode_superblock returned something other than
+//              4096 at the FIRST iteration where that happened
+//              ("roundtrip fail" at the encode step).
+//   2        — pdxb_parse_superblock returned something other than
+//              PDXB_OK (0) at the first such iteration.
+//   101..122 — a field mismatch at the first iteration/field where one
+//              occurred: 100 + FIELD_ORDINAL, where FIELD_ORDINAL is
+//              the field's 1-based position in PdxbSuperblockSummary's
+//              own SBS_OFF_* order (1=magic, 2=version, 3=uuid_lo,
+//              4=uuid_hi, 5=block_size, 6=flags, 7=total_blocks,
+//              8=itable_lba, 9=itable_bcount, 10=alloc_lba,
+//              11=alloc_bcount, 12=journal_lba, 13=journal_bcount,
+//              14=data_lba, 15=data_bcount, 16=root_inode,
+//              17=mount_gen, 18=snap_head, 19..22=sig_key_hash[0..3]).
+//              This is the "field=<name>" the issue asks for, encoded
+//              as a stable ordinal rather than a printed string —
+//              a future runnable consumer that links this driver and
+//              has a real print primitive can map the ordinal back to
+//              a name via the table above (or via SBS_OFF_*/8 + 1 in
+//              src/pdxb_superblock.pdx) before printing it.
+//
+// A future consumer (`fsck.pdxfs`, or a `pkg`/`shell`-hosted test
+// runner, per libpdx-audit's own M4-001 precedent) that DOES have a
+// print + exit primitive walks this convention exactly like it would
+// libpdx-audit's drivers: `cmp rax, 0; jne <print the ordinal>; ...`.
+//
+// ================================================================
+// Iteration count — 10^5, as the issue's headline number asks
+// ================================================================
+//
+// ITER_COUNT = 100000 (10^5), not a reduced number. Nothing here is
+// impractical at that count: the loop body is fixed-size machine code
+// (population + one encode call + one parse call + 22 field compares,
+// roughly a few hundred instructions total, EXECUTED 100000 times at
+// runtime, not unrolled 100000 times in the object file) — this is the
+// same bounded-counting-loop shape `pdxb_encode_superblock`'s own
+// 512-iteration zero-fill loop already uses (src/pdxb_superblock.pdx),
+// just with a larger trip count and a richer body. 100000 iterations of
+// a few hundred cheap integer instructions each is on the order of
+// single-digit milliseconds on any x86_64 core this kernel targets —
+// there is no QEMU-smoke-timeout concern here, unlike a real hardware
+// I/O loop.
+//
+// ================================================================
+// Why three fields are held FIXED across every iteration, not fuzzed
+// ================================================================
+//
+// `pdxb_parse_superblock` gates on exactly three on-disk fields before
+// it will decode anything at all (src/pdxb_superblock.pdx module
+// header): magic == PDXB_MAGIC, version == PDXB_VERSION_V1 (1),
+// block_size == PDXB_BLOCK_SIZE (4096). If this driver fuzzed those
+// three fields too, essentially every iteration would fail gate 2
+// immediately (P(random 32-bit == PDXB_MAGIC) is astronomically small)
+// and the driver would report a bogus "PDXB_ERR_BAD_MAGIC on iteration
+// 1" instead of ever exercising the round-trip this issue actually
+// wants tested. This driver therefore stamps those three fields to
+// their one legal value on every iteration and fuzzes the remaining 19
+// SBS_OFF_* slots — every field a real, valid, differently-shaped
+// superblock could actually carry. This is the fuzzer's own
+// discipline, not a limitation of the codec under test: a SEPARATE,
+// not-yet-written driver would be the right place to fuzz
+// magic/version/block_size themselves and assert the four
+// PDXB_ERR_* gates fire correctly (that is a gate-correctness test,
+// a different invariant than this issue's round-trip contract).
+//
+// `flags` (SBS_OFF_FLAGS, +40) is fuzzed but masked to its low 32
+// bits before being written into the summary: it is a genuine 32-bit
+// on-disk field (`mov_d` on both the encode and decode sides per
+// pdxb_superblock.pdx), so a full 64-bit random LCG output would only
+// ever round-trip its low 32 bits, making every high-bit-set fuzz
+// value a guaranteed FALSE mismatch unrelated to any real codec bug.
+// The mask is `shl rax, 32; shr rax, 32;` rather than `and rax,
+// 0xFFFFFFFF;` — paideia-as's AND encoder rejects that immediate:
+// its imm8/imm32 sign-extension trap guard requires `imm ==
+// (imm as i32 as i64)`, and 0xFFFFFFFF as i32 is -1, which is not
+// equal to 4294967295, so AND has no encodable form for this exact
+// value (see `crates/paideia-as-encoder/src/encode_and_or_xor.rs`,
+// paideia-as). The double-shift has no such restriction — shift
+// counts are small unsigned immediates (0..63), not general 64-bit
+// values subject to the AND/OR/XOR trap guard, and `shr rcx, 56;` /
+// `shl r13, 3;` are already proven at this exact shift-count
+// magnitude in `src/mount_table.pdx` / `src/mount_table_snapshot.pdx`
+// (this repo). Every other fuzzed field is a genuine on-disk u64 (or
+// one of the four 8-byte sig_key_hash words, likewise u64-wide) and
+// needs no masking — the full 64-bit LCG output round-trips exactly.
+//
+// ================================================================
+// The LCG
+// ================================================================
+//
+// `tpr_lcg_next` implements the classic Knuth/PCG-family 64-bit LCG
+// this issue names: state = state * 6364136223846793005 +
+// 1442695040888963407 (mod 2^64). Both constants are written here in
+// hex (0x5851F42D4C957F2D, 0x14057B7EF767814F) rather than decimal —
+// this codebase's convention for every large 64-bit constant (e.g.
+// libpdx-audit's FNV_OFFSET_BASIS) — and are loaded via a plain `mov`
+// into a register, which paideia-as encodes as MOVABS for any
+// immediate exceeding the 32-bit sign-extend bound (proven at
+// `test_replay_golden.pdx`'s `mov r13, 0xcbf29ce484222325;`, this
+// org's other satellite library). `imul rax, r10` is the two-operand
+// register-register form — proven at
+// `src/user/aml/aml_arith.pdx:271` (`imul rax, rcx;`) and
+// `src/tools/mkfs-pdxb/main.pdx:477` (`imul r9, rcx;`) in the
+// paideia-os kernel tree — which truncates its 128-bit signed product
+// to the low 64 bits in the destination register, exactly the "mod
+// 2^64" semantics an LCG needs (signedness is irrelevant here; only
+// the low 64 bits are ever read). The trailing `add rax, r10` wraps
+// mod 2^64 for free via ordinary two's-complement ADD. The seed is
+// stamped once at `run()` entry (`0xC0FFEE1234567890`, arbitrary but
+// fixed for reproducibility across runs) into the `.bss` state slot —
+// technically redundant since `.bss` already zero-inits it and a
+// zero-seeded LCG with this odd increment is not degenerate, but
+// written explicitly so a reader does not have to reason about
+// implicit `.bss` zero behaviour to know this driver is deterministic.
+//
+// Each field write is its OWN `call tpr_lcg_next;` (19 calls per
+// iteration, one per fuzzed field) rather than one call producing a
+// value this driver then bit-slices per field — the issue's "take
+// various bit-slices for each field" language is satisfied more
+// simply and more conservatively by giving every field its own fresh
+// 64-bit draw: no shift/mask sequences are needed for any field except
+// the one (`flags`) that is narrower than 64 bits on disk (see above).
+//
+// ================================================================
+// paideia-as encoder notes for this file
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere — every `add` is reg,reg or
+//     reg,imm (the zero-fill loop's pointer arithmetic, the LCG
+//     step, and the outer/inner loop counters).
+//   - No byte loads — every summary/on-disk field handled here is a
+//     4-or-8-byte value read via a full qword `mov`, so the
+//     xor-then-mov_b zero-extend pattern this repo uses elsewhere
+//     does not apply.
+//   - No `test` instruction; every check is `cmp reg, reg` or
+//     `cmp reg, imm`.
+//   - `cmp rax, r10` (staged) rather than a bare `cmp rax, imm64` is
+//     used nowhere in this file — every immediate compared against
+//     here (100000, 4096, 0, 22, 1, 2, 101..122) is well inside the
+//     0x7FFFFFFF cmp-imm bound and needs no staging.
+//   - Cross-module calls (`call pdxb_encode_superblock;`,
+//     `call pdxb_parse_superblock;`) use the bare, unqualified
+//     function name — this repo's established convention (see
+//     libpdx-audit's `test_broker_refusal.pdx` calling `reset` and
+//     `audit_can_emit_output` the same way): each top-level `pub let`
+//     binding is its own global symbol regardless of which `module
+//     X = structure { ... }` block declares it; the module name is
+//     source-level organisation only, not part of the emitted symbol.
+//     `tools/build.sh` compiles every `src/*.pdx` and `tests/*.pdx`
+//     file to its own `.o` independently with NO link step, so these
+//     calls are unresolved-external references in this file's own
+//     object — exactly like libpdx-audit's drivers — resolved only
+//     once a future consumer tool links this file alongside
+//     `src/pdxb_superblock.pdx`.
+//   - Register plan: r12 = outer iteration counter i (the ONLY
+//     register that must survive `call pdxb_encode_superblock;` /
+//     `call pdxb_parse_superblock;` / `call tpr_lcg_next;` — pushed
+//     once at entry, popped once before every `ret`, since none of
+//     those three callees touches r12 per their own documented
+//     register plans). r13/r14 are used as fresh scratch (via `lea
+//     r13/r14, [rip + sym]`) AFTER each call completes, never live
+//     ACROSS a call, so they need no preservation. rax/rcx/rdx/r10/r11
+//     are ordinary caller-save scratch throughout.
+//   - Label prefix `tpr_` (TestPdxbRoundtrip), per this project's
+//     reserved-label discipline (`loop`, `if`, etc. are keywords —
+//     every label here is prefixed, so none collides).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#9);
+// src/pdxb_superblock.pdx (this repo, M2-001/M2-002); tests/README.md
+// (this repo, return-code convention).
+
+module TestPdxbRoundtrip = structure {
+
+  // Number of fuzz iterations. See module header "Iteration count".
+  pub let TPR_ITER_COUNT : u64 = 100000
+
+  // --- .bss scratch. All zero-initialised; every byte this driver
+  // relies on being zero at first use is written explicitly anyway
+  // (population happens every iteration for tpr_sb_in; the zero-loop
+  // covers tpr_sb_out before every parse). ---
+  pub let mut tpr_sb_in    : [u8; 176]  = uninit @align(8)  // input PdxbSuperblockSummary
+  pub let mut tpr_sb_out   : [u8; 176]  = uninit @align(8)  // decoded-back PdxbSuperblockSummary (sb2)
+  pub let mut tpr_encoded  : [u8; 4096] = uninit @align(8)  // on-disk-shaped encode target
+  pub let mut tpr_lcg_state : u64       = uninit @align(8)  // LCG state
+
+  // ==========================================================================
+  // tpr_lcg_next() -> u64
+  //
+  // One step of the 64-bit LCG this issue specifies: state = state *
+  // 6364136223846793005 + 1442695040888963407 (mod 2^64). Reads and
+  // rewrites the `.bss` `tpr_lcg_state` slot; returns the NEW state in
+  // rax (the value the caller uses as the next fuzzed field). See
+  // module header "The LCG" for the constant-encoding and truncation
+  // rationale. Pure leaf: no push/pop, no nested call.
+  // ==========================================================================
+  pub let tpr_lcg_next : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-001 (#9): tpr_lcg_next entry point. Loads the current state via lea r11,[rip+tpr_lcg_state]; mov rax,[r11]. Stages the multiplier (0x5851F42D4C957F2D, MOVABS since it exceeds the 32-bit imm bound) into r10 and computes rax = rax * r10 via the two-operand `imul rax, r10` form (proven at aml_arith.pdx / mkfs-pdxb/main.pdx in the paideia-os tree), which truncates the signed 128-bit product to the low 64 bits in rax -- exactly the mod-2^64 semantics an LCG multiply needs regardless of signedness. Stages the increment (0x14057B7EF767814F, also MOVABS) into r10 and computes rax = rax + r10 via plain reg,reg `add`, which wraps mod 2^64 for free via ordinary two's-complement addition. Stores the new state back to the same r11 address (never reloaded -- r11 is untouched by imul/add) and returns it verbatim in rax. No add reg,[mem]. No byte loads. No test; the function contains no comparison at all. Label-free (single straight-line path).",
+      block: {
+        lea r11, [rip + tpr_lcg_state];
+        mov rax, [r11];
+
+        mov r10, 0x5851F42D4C957F2D;      // LCG multiplier
+        imul rax, r10;
+
+        mov r10, 0x14057B7EF767814F;      // LCG increment
+        add rax, r10;
+
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Executes TPR_ITER_COUNT (100000) round-trip iterations. See module
+  // header for the full return-code convention, the fixed-vs-fuzzed
+  // field split, and the register plan.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-001 (#9): TestPdxbRoundtrip::run entry point. Seeds tpr_lcg_state to a fixed, arbitrary non-zero value (0xC0FFEE1234567890) for reproducibility, then loops i=0..100000 (r12, pushed once at entry, the only register live across every nested call in this function). Per iteration: (1) populate tpr_sb_in -- three fixed gate fields (magic=0x42584450, version=1, block_size=4096) written as immediates, then 19 fuzzed fields (uuid_lo/hi, flags [masked to its low 32 bits with `shl rax,32; shr rax,32` since it is a genuine 32-bit on-disk field and paideia-as's AND encoder rejects `and rax,0xFFFFFFFF` as an unencodable imm64 -- see module header], total_blocks, itable_lba/bcount, alloc_lba/bcount, journal_lba/bcount, data_lba/bcount, root_inode, mount_gen, snap_head, sig_key_hash[0..4)), each drawn from its own `call tpr_lcg_next;` and stored at its SBS_OFF_* offset -- re-lea'ing tpr_sb_in's address after every call since tpr_lcg_next clobbers r11. (2) call pdxb_encode_superblock(sb_ptr=&tpr_sb_in, out_ptr=&tpr_encoded, out_len=4096); cmp rax,4096; jne tpr_fail_encode (return 1) -- this is the round-trip's forward half. (3) zero tpr_sb_out (176 bytes = 22 qwords) via a bounded xor/store/add/cmp/jb loop identical in shape to pdxb_encode_superblock's own 512-iteration zero-fill loop, just with a 22-iteration bound -- this matches the issue's explicit 'zero the summary struct' step and lets a genuine gate-failure-leaves-out-ptr-untouched bug manifest as an all-zero sb2 rather than silently comparing against stale data from a prior iteration. (4) call pdxb_parse_superblock(buf_ptr=&tpr_encoded, buf_len=4096, out_ptr=&tpr_sb_out); cmp rax,0; jne tpr_fail_parse (return 2) -- the round-trip's inverse half; every fixed field this driver stamps is guaranteed to satisfy all four PDXB_ERR_* gates so this should never fire absent a real codec regression. (5) compare all 22 SBS_OFF_* slots between tpr_sb_in and tpr_sb_out pairwise via 22 explicit `mov rax,[r13+N]; mov rcx,[r14+N]; cmp rax,rcx; jne tpr_field_K;` blocks (r13/r14 re-lea'd fresh after the parse call, never carried across a call); each tpr_field_K label returns 100+K (101..122), the field's 1-based SBS_OFF_*/8+1 ordinal (see module header table for the name each ordinal maps to). On all 22 fields matching, falls through to increment r12 and loop. After TPR_ITER_COUNT iterations complete with no mismatch, returns 0. No `add reg,[mem]` anywhere -- every add is reg,reg or reg,imm. No byte loads -- every field is a full qword mov. No `test`; every check is `cmp`. Every immediate compared (100000, 4096, 0, 22, 1, 2, 101..122) is within the 0x7FFFFFFF cmp-imm bound, no r10/r11 staging needed for any cmp in this function. Cross-module calls (pdxb_encode_superblock, pdxb_parse_superblock) use the bare unqualified symbol name per this repo's established convention (see libpdx-audit's test drivers calling `reset` / `audit_can_emit_output` the same way) -- tools/build.sh compiles this file standalone with no link step, so these are unresolved-external references in this file's own .o, resolved only once a future consumer links src/pdxb_superblock.pdx alongside it. Label prefix tpr_.",
+      block: {
+        push r12;
+
+        // Seed the LCG once, deterministically.
+        mov rax, 0xC0FFEE1234567890;
+        lea r11, [rip + tpr_lcg_state];
+        mov [r11], rax;
+
+        xor r12, r12;                    // i = 0
+
+      tpr_loop:
+        cmp r12, 100000;
+        jae tpr_all_pass;
+
+        // ---- Populate tpr_sb_in. ----
+
+        // Fixed gate fields.
+        lea r11, [rip + tpr_sb_in];
+        mov rax, 0x42584450;             // PDXB_MAGIC
+        mov [r11 + 0], rax;
+        mov rax, 1;                      // PDXB_VERSION_V1
+        mov [r11 + 8], rax;
+        mov rax, 4096;                   // PDXB_BLOCK_SIZE
+        mov [r11 + 32], rax;
+
+        // Fuzzed fields (19), one LCG draw each.
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 16], rax;             // uuid_lo
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 24], rax;             // uuid_hi
+
+        call tpr_lcg_next;
+        shl rax, 32;                     // flags is a 32-bit on-disk field --
+        shr rax, 32;                     // clear the high 32 bits (AND with
+                                          // 0xFFFFFFFF is not encodable here:
+                                          // it fails paideia-as's imm8/imm32
+                                          // sign-extension trap guard, since
+                                          // 0xFFFFFFFF round-trips through
+                                          // i32 as -1, not itself)
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 40], rax;             // flags
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 48], rax;             // total_blocks
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 56], rax;             // itable_lba
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 64], rax;             // itable_bcount
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 72], rax;             // alloc_lba
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 80], rax;             // alloc_bcount
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 88], rax;             // journal_lba
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 96], rax;             // journal_bcount
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 104], rax;            // data_lba
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 112], rax;            // data_bcount
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 120], rax;            // root_inode
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 128], rax;            // mount_gen
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 136], rax;            // snap_head
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 144], rax;            // sig_key_hash[0..8)
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 152], rax;            // sig_key_hash[8..16)
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 160], rax;            // sig_key_hash[16..24)
+
+        call tpr_lcg_next;
+        lea r11, [rip + tpr_sb_in];
+        mov [r11 + 168], rax;            // sig_key_hash[24..32)
+
+        // ---- Encode. ----
+        lea rdi, [rip + tpr_sb_in];
+        lea rsi, [rip + tpr_encoded];
+        mov rdx, 4096;
+        call pdxb_encode_superblock;
+        cmp rax, 4096;
+        jne tpr_fail_encode;
+
+        // ---- Zero tpr_sb_out (176 bytes = 22 qwords) before parse. ----
+        lea r13, [rip + tpr_sb_out];
+        xor rax, rax;
+        xor rcx, rcx;
+      tpr_zero_loop:
+        mov [r13 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 22;
+        jb  tpr_zero_loop;
+
+        // ---- Parse. ----
+        lea rdi, [rip + tpr_encoded];
+        mov rsi, 4096;
+        lea rdx, [rip + tpr_sb_out];
+        call pdxb_parse_superblock;
+        cmp rax, 0;
+        jne tpr_fail_parse;
+
+        // ---- Compare all 22 fields. ----
+        lea r13, [rip + tpr_sb_in];
+        lea r14, [rip + tpr_sb_out];
+
+        mov rax, [r13 + 0];   mov rcx, [r14 + 0];   cmp rax, rcx; jne tpr_field_1;
+        mov rax, [r13 + 8];   mov rcx, [r14 + 8];   cmp rax, rcx; jne tpr_field_2;
+        mov rax, [r13 + 16];  mov rcx, [r14 + 16];  cmp rax, rcx; jne tpr_field_3;
+        mov rax, [r13 + 24];  mov rcx, [r14 + 24];  cmp rax, rcx; jne tpr_field_4;
+        mov rax, [r13 + 32];  mov rcx, [r14 + 32];  cmp rax, rcx; jne tpr_field_5;
+        mov rax, [r13 + 40];  mov rcx, [r14 + 40];  cmp rax, rcx; jne tpr_field_6;
+        mov rax, [r13 + 48];  mov rcx, [r14 + 48];  cmp rax, rcx; jne tpr_field_7;
+        mov rax, [r13 + 56];  mov rcx, [r14 + 56];  cmp rax, rcx; jne tpr_field_8;
+        mov rax, [r13 + 64];  mov rcx, [r14 + 64];  cmp rax, rcx; jne tpr_field_9;
+        mov rax, [r13 + 72];  mov rcx, [r14 + 72];  cmp rax, rcx; jne tpr_field_10;
+        mov rax, [r13 + 80];  mov rcx, [r14 + 80];  cmp rax, rcx; jne tpr_field_11;
+        mov rax, [r13 + 88];  mov rcx, [r14 + 88];  cmp rax, rcx; jne tpr_field_12;
+        mov rax, [r13 + 96];  mov rcx, [r14 + 96];  cmp rax, rcx; jne tpr_field_13;
+        mov rax, [r13 + 104]; mov rcx, [r14 + 104]; cmp rax, rcx; jne tpr_field_14;
+        mov rax, [r13 + 112]; mov rcx, [r14 + 112]; cmp rax, rcx; jne tpr_field_15;
+        mov rax, [r13 + 120]; mov rcx, [r14 + 120]; cmp rax, rcx; jne tpr_field_16;
+        mov rax, [r13 + 128]; mov rcx, [r14 + 128]; cmp rax, rcx; jne tpr_field_17;
+        mov rax, [r13 + 136]; mov rcx, [r14 + 136]; cmp rax, rcx; jne tpr_field_18;
+        mov rax, [r13 + 144]; mov rcx, [r14 + 144]; cmp rax, rcx; jne tpr_field_19;
+        mov rax, [r13 + 152]; mov rcx, [r14 + 152]; cmp rax, rcx; jne tpr_field_20;
+        mov rax, [r13 + 160]; mov rcx, [r14 + 160]; cmp rax, rcx; jne tpr_field_21;
+        mov rax, [r13 + 168]; mov rcx, [r14 + 168]; cmp rax, rcx; jne tpr_field_22;
+
+        // All 22 fields matched this iteration.
+        add r12, 1;
+        jmp tpr_loop;
+
+      tpr_all_pass:
+        xor rax, rax;                    // 0 = all iterations passed
+        pop r12;
+        ret;
+
+      tpr_fail_encode:
+        mov rax, 1;
+        pop r12;
+        ret;
+
+      tpr_fail_parse:
+        mov rax, 2;
+        pop r12;
+        ret;
+
+      tpr_field_1:  mov rax, 101; pop r12; ret;
+      tpr_field_2:  mov rax, 102; pop r12; ret;
+      tpr_field_3:  mov rax, 103; pop r12; ret;
+      tpr_field_4:  mov rax, 104; pop r12; ret;
+      tpr_field_5:  mov rax, 105; pop r12; ret;
+      tpr_field_6:  mov rax, 106; pop r12; ret;
+      tpr_field_7:  mov rax, 107; pop r12; ret;
+      tpr_field_8:  mov rax, 108; pop r12; ret;
+      tpr_field_9:  mov rax, 109; pop r12; ret;
+      tpr_field_10: mov rax, 110; pop r12; ret;
+      tpr_field_11: mov rax, 111; pop r12; ret;
+      tpr_field_12: mov rax, 112; pop r12; ret;
+      tpr_field_13: mov rax, 113; pop r12; ret;
+      tpr_field_14: mov rax, 114; pop r12; ret;
+      tpr_field_15: mov rax, 115; pop r12; ret;
+      tpr_field_16: mov rax, 116; pop r12; ret;
+      tpr_field_17: mov rax, 117; pop r12; ret;
+      tpr_field_18: mov rax, 118; pop r12; ret;
+      tpr_field_19: mov rax, 119; pop r12; ret;
+      tpr_field_20: mov rax, 120; pop r12; ret;
+      tpr_field_21: mov rax, 121; pop r12; ret;
+      tpr_field_22: mov rax, 122; pop r12; ret;
+      }
+    }
+}

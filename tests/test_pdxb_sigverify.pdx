@@ -1,0 +1,174 @@
+// tests/test_pdxb_sigverify.pdx — libpdx-volume.M4-002 (issue #10)
+// TestPdxbSigverify: exercises `PdxbSign::pdxb_verify_inode_tail`
+// (src/pdxb_sign.pdx, M3-002) against a fixture shaped like a "known"
+// PDXB superblock, and asserts it returns its documented fail-closed
+// STUB sentinel.
+//
+// ================================================================
+// This is NOT a real sign-then-verify round-trip test
+// ================================================================
+//
+// `pdxb_verify_inode_tail` has no real body to test: src/pdxb_sign.pdx
+// §"mldsa65_verify -- does not exist" (M3-002 landing) documents a
+// repo-wide grep across both paideia-os and its paideia-as v0.24.0
+// submodule for `mldsa65_verify` / `MlDsa65Verify` / any `verify`
+// method on the `MlDsa65` trait that came back EMPTY -- the stdlib
+// intrinsic `pdxb_sign_superblock`/`pdxb_sign_inode_tail` call
+// (`MlDsa65::sign`) has no verify counterpart at all. Accordingly
+// `pdxb_verify_inode_tail` is a scaffold STUB: it dereferences NONE of
+// its six arguments and unconditionally returns
+// `PDXB_VER_ERR_NOT_IMPLEMENTED` (0xFFFFFFFFFFFFFFFF) -- fail-closed,
+// never claiming a signature is valid it cannot actually check.
+//
+// A real M4-002 test -- sign a superblock with `pdxb_sign_superblock`
+// (which DOES have a real body, via the `MlDsa65::sign` intrinsic,
+// requiring a 32-byte seed) and then verify that exact signature round-
+// trips through `pdxb_verify_inode_tail` -- cannot be written until a
+// verify intrinsic lands on the `MlDsa65` trait (or a sibling trait).
+// This file is the honest, buildable substitute the issue's own brief
+// anticipates ("If a real signed fixture isn't available ... embed
+// ... document that the 'verify' step is stubbed"): it proves the stub
+// is still wired the way M3-002 left it (fail-closed, not fail-open,
+// no crash on a plausible-looking fixture) so a future landing of the
+// real verify body has a driver already in place to extend rather than
+// write from scratch.
+//
+// ================================================================
+// The fixture -- no `@rodata_bin` attribute exists in this dialect
+// ================================================================
+//
+// This issue's brief suggests embedding the fixture "via `@rodata_bin`
+// or equivalent". A repo-wide grep for `rodata_bin` / `@rodata` across
+// paideia-os, its paideia-as submodule, and every satellite repo in
+// this org found NOTHING -- no such attribute exists in paideia-as at
+// this landing. The only byte-array-with-content precedent this tree
+// has is a `[u8; N] = "literal string"` or `[u8; N] = [0x.., ...]`
+// array literal (e.g. the 16-byte EFI GUID arrays in
+// `src/boot/uefi_guids.pdx`, paideia-os) -- and the largest of those is
+// 16 bytes. Hand-writing a 4096-byte hex literal array would be both
+// impractical to review and out of step with every other buffer this
+// library declares.
+//
+// The "equivalent" this file uses instead is the SAME pattern
+// `pdxb_encode_superblock` (src/pdxb_superblock.pdx, M2-002) already
+// establishes for producing a deterministic on-disk-shaped buffer: a
+// `.bss` region relies on load-time zero-init for every byte it does
+// not care about, then a handful of explicit field stores overlay the
+// bytes that matter. Concretely: `tsv_fixture` is 4096 zero bytes
+// (`.bss`) with exactly THREE `u32` fields stamped over it at their
+// real on-disk offsets (`PdxbSuperblock::PDXB_D_OFF_MAGIC` = 0,
+// `_VERSION` = 4, `_BLOCK_SIZE` = 24 -- duplicated here as immediates
+// with a comment, per this repo's established no-cross-module-
+// constant-import convention) -- exactly the issue's own "FIRST 696
+// bytes of a known blank superblock" (a superblock with a valid
+// header and every other field blank/zero) "+ 3400 bytes of
+// zero-signature placeholder" (bytes [696, 4096), which the `.bss`
+// zero-init already gives us, and which this file never writes a
+// single byte into). This is byte-for-byte equivalent to a literal
+// 4096-byte embed of that exact content, produced deterministically
+// and reviewably in six lines instead of 4096 hex bytes.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches every M4 driver in this repo (see tests/README.md and
+// test_pdxb_roundtrip.pdx's own header for why this is a return code
+// rather than a literal emit+exit pair -- libpdx-volume has no
+// console/print capability anywhere in `caps.decl`):
+//
+//   0 — pdxb_verify_inode_tail returned PDXB_VER_ERR_NOT_IMPLEMENTED
+//       (0xFFFFFFFFFFFFFFFF) verbatim, i.e. the fail-closed STUB
+//       contract still holds against this fixture.
+//   1 — pdxb_verify_inode_tail returned anything else. This is the
+//       signal a future landing of the real verify body should expect
+//       to see once `mldsa65_verify` exists and this stub's caller
+//       (or this driver itself) is updated to check a real pass/fail
+//       result instead of the sentinel.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - Pointer arithmetic for `sig_ptr = &tsv_fixture + 696` uses
+//     `mov rcx, r13; add rcx, 696;` (register-to-register add after a
+//     single-symbol `lea`), never a two-register `lea` -- matches
+//     `pdxb_sign_inode_tail`'s `msg_ptr = inode_ptr + tail_offset`
+//     precedent in src/pdxb_sign.pdx.
+//   - `cmp rax, r10` (staged) rather than a bare `cmp rax, imm64` for
+//     the sentinel check: 0xFFFFFFFFFFFFFFFF cannot sign-extend from a
+//     32-bit immediate, so it is staged into r10 first via a plain
+//     `mov` (MOVABS) and compared register-to-register -- the same
+//     discipline `test_replay_golden.pdx` (libpdx-audit) uses for
+//     FNV_OFFSET_BASIS.
+//   - No `add reg, [mem]` anywhere. No byte loads (every value here is
+//     a full pointer, length, or return code). No `test`; the only
+//     comparison in this file is the final `cmp rax, r10`.
+//   - Label prefix `tsv_` (TestPdxbSigverify).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#10);
+// src/pdxb_sign.pdx (this repo, M3-002 STUB); src/pdxb_superblock.pdx
+// (this repo, PDXB_D_OFF_* on-disk offsets); tests/README.md (this
+// repo, return-code convention).
+
+module TestPdxbSigverify = structure {
+
+  // --- Fixture buffer: 4096 zero bytes with three fields stamped
+  // over them. See module header "The fixture". ---
+  pub let mut tsv_fixture : [u8; 4096] = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Stamps the fixture, calls pdxb_verify_inode_tail against it, and
+  // asserts the STUB's fail-closed sentinel comes back verbatim. See
+  // module header for the full return-code convention.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-002 (#10): TestPdxbSigverify::run entry point. Stamps tsv_fixture -- 4096 .bss-zeroed bytes -- with three u32 fields at their real on-disk offsets (PdxbSuperblock::PDXB_D_OFF_MAGIC=0, _VERSION=4, _BLOCK_SIZE=24, duplicated here as immediates per this repo's no-cross-module-constant-import convention) via `mov_d [r11+N], rax`, matching pdxb_encode_superblock's own store-sized-field-over-zeroed-buffer pattern -- see module header 'The fixture' for why this stands in for a literal 4096-byte @rodata_bin embed (no such attribute exists in paideia-as). Marshals SysV args for pdxb_verify_inode_tail(inode_ptr, tail_offset, tail_len, sig_ptr, sig_len, pub_key_slot): rdi=&tsv_fixture (inode_ptr), rsi=696 (tail_offset -- the start of the fixture's zero-signature placeholder region, PdxbSuperblock::PDXB_D_OFF_SIG), rdx=3400 (tail_len -- the placeholder region's length, PDXB_D_SIG_BYTES), rcx=&tsv_fixture+696 computed via mov+add register arithmetic (never a two-register lea, matching pdxb_sign_inode_tail's own msg_ptr computation) as sig_ptr, r8=3309 (sig_len, MLDSA65_SIG_LEN) as a plausible-looking argument even though the stub never reads it, r9=0 (pub_key_slot -- no real capability exists to pass; the stub dereferences nothing regardless). call pdxb_verify_inode_tail; the STUB (src/pdxb_sign.pdx, no branches, single-path body) always returns 0xFFFFFFFFFFFFFFFF (PDXB_VER_ERR_NOT_IMPLEMENTED) regardless of any argument's value, so this call cannot fault no matter what tsv_fixture's bytes look like. Stages that sentinel into r10 via a plain `mov` (MOVABS -- the constant exceeds the 32-bit cmp-imm sign-extend bound) and compares register-to-register (`cmp rax, r10`), matching test_replay_golden.pdx's FNV_OFFSET_BASIS staging discipline in libpdx-audit. Returns 0 if the sentinel matched verbatim (the fail-closed contract holds), 1 otherwise (the stub's behaviour changed -- a signal a real verify body has landed and this driver needs a real update, not just a return-code check). No add reg,[mem]. No byte loads. No test mnemonic. Label prefix tsv_.",
+      block: {
+        // ---- Stamp the fixture's three real header fields; every
+        // other byte -- including the entire [696, 4096) signature
+        // placeholder region -- stays at its .bss zero-init value. ----
+        lea r11, [rip + tsv_fixture];
+
+        mov rax, 0x42584450;              // PDXB_MAGIC
+        mov_d [r11 + 0], rax;
+
+        mov rax, 1;                       // PDXB_VERSION_V1
+        mov_d [r11 + 4], rax;
+
+        mov rax, 4096;                    // PDXB_BLOCK_SIZE
+        mov_d [r11 + 24], rax;
+
+        // ---- pdxb_verify_inode_tail(inode_ptr, tail_offset, tail_len,
+        // sig_ptr, sig_len, pub_key_slot). ----
+        lea r13, [rip + tsv_fixture];
+
+        mov rdi, r13;                     // inode_ptr
+        mov rsi, 696;                     // tail_offset (PDXB_D_OFF_SIG)
+        mov rdx, 3400;                    // tail_len (PDXB_D_SIG_BYTES)
+
+        mov rcx, r13;
+        add rcx, 696;                     // sig_ptr = tsv_fixture + 696
+
+        mov r8, 3309;                     // sig_len (MLDSA65_SIG_LEN)
+        xor r9, r9;                       // pub_key_slot = 0 (stub dereferences nothing)
+
+        call pdxb_verify_inode_tail;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;      // PDXB_VER_ERR_NOT_IMPLEMENTED
+        cmp rax, r10;
+        jne tsv_unexpected;
+
+        xor rax, rax;                     // 0: fail-closed sentinel confirmed
+        ret;
+
+      tsv_unexpected:
+        mov rax, 1;                       // 1: stub no longer returns the sentinel
+        ret;
+      }
+    }
+}

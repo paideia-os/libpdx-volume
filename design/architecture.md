@@ -635,3 +635,60 @@ substitution §8.2 required for signing, since `KIND_SIG_KEY` already
 holds exactly the public-key material a verify call would need — that
 still requires this library (or its caller) to add a first cap-invoke
 call, which is a separate decision from today's stub.
+
+## 9. M4 — test coverage
+
+Three drivers under `tests/` (`design/tooling/volume-tooling-ux.md`
+§9.4 M4-001/M4-002/M4-003, `paideia-os/libpdx-volume` issues #9/#10/#11)
+exercise this library's real (non-stub) bodies. Full per-file contracts
+live in `tests/README.md`; this section records the two shape-level
+decisions that recur across all three and why they follow directly
+from facts already established elsewhere in this document.
+
+### 9.1 Return codes, not print+exit
+
+Every M4 issue brief describes its pass/fail contract as literal text
+("emit `roundtrip fail iter=<N> field=<name>`, exit 1"). `caps.decl`
+(§ opening paragraph, "performs no `sys_svc_lookup` of its own") lists
+no console/print capability anywhere in this library's surface, and
+none of the functions under test issue any syscall — so there is
+nothing a driver could call to print a string or terminate a process.
+Every driver therefore returns a `u64` status code instead (0 = pass,
+a documented nonzero code identifying the first failure), mirroring
+`libpdx-audit`'s own M4 driver convention exactly (this org's other
+satellite library, which hits the identical "shared library, no
+runnable executable of its own" constraint). `tools/build.sh` compiles
+every `tests/*.pdx` file standalone with no link step, so a driver's
+calls into this library's own `src/*.pdx` functions
+(`pdxb_encode_superblock`, `pdxb_parse_superblock`,
+`mount_table_snapshot`) are unresolved-external references in the
+driver's own object — exactly the shape libpdx-audit's drivers already
+established for calling `AuditRecord::reset` / `AuditClient::
+audit_can_emit_output` the same way. **Flagged for main:** once a real
+consumer tool (`fsck.pdxfs`, or a `pkg`/`shell`-hosted test runner,
+per libpdx-audit's own M4-001 QEMU protocol) links these drivers and
+has a real print primitive, mapping a nonzero return to the issue's
+literal message text is mechanical — the table lives in each driver's
+own file header.
+
+### 9.2 No `@rodata_bin` — `.bss` zero-init plus explicit field stores
+
+`test_pdxb_sigverify.pdx`'s issue brief suggests embedding its fixture
+"via `@rodata_bin` or equivalent." A repo-wide grep across paideia-os,
+its paideia-as submodule, and every satellite repo in this org found
+no such attribute — the only byte-array-with-content precedent
+anywhere in the tree is a `[u8; N]` string or hex-array literal, and
+the largest one found is the 16-byte EFI GUID arrays in
+`src/boot/uefi_guids.pdx` (paideia-os). Both the sig-verify fixture
+(4096 bytes) and the mount-table-snapshot test's synthetic
+`_mount_table[]` image use this library's own established alternative
+instead — the exact pattern `pdxb_encode_superblock` (§2, M2-002) uses
+to produce a deterministic on-disk-shaped buffer: rely on `.bss`
+zero-init for every byte that does not matter, then overlay the few
+bytes that do via explicit `mov`/`mov_d` stores at their real offsets.
+This is byte-for-byte equivalent to a literal array embed, produced in
+a handful of reviewable lines instead of thousands of hex digits.
+Confirm this reading holds if a future M5+ fixture needs content too
+irregular for a handful of field stores to express economically — at
+that point a real literal-array approach (however large) becomes the
+right call instead.
