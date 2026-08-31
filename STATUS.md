@@ -1,8 +1,9 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M4 (tests + fuzz) — landed
-**Version:** unreleased (pre-1.0.0)
+**Current milestone:** M5 (signed release) — landed
+**Version:** 1.0.0 (release manifest scaffolded; dual-sign + mirror
+push deferred — see `release/RELEASE-1.0.0.md` §3)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -138,32 +139,71 @@ why none of the three drivers needs to fault-inject around a syscall
 the way `libpdx-audit`'s M4 drivers do (this library issues zero
 syscalls anywhere in its own call graph, by established discipline).
 
-### M5 — Signed release (pending)
+### M5 — Signed release (landed)
 
-- [ ] **M5-001** — dual-signed release + `.pdxdoc` + mirror push.
+- [x] **M5-001** — dual-signed release + `.pdxdoc` + mirror push:
+      `release/manifest.pdxsig.txt` (new file), release manifest
+      source form matching `libpdx-audit`'s own manifest structure
+      section-for-section. Every `blake3-256 = <BLAKE3-*>` hash slot is
+      a documented placeholder (recomputed from the working tree at
+      tag time by the release tool, same convention `libpdx-audit`'s
+      own committed manifest uses); every `[signatures]` slot carries
+      the literal sentinel `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN`
+      instead, since no live release-line ML-DSA-65 seed key exists in
+      this repo — the actual dual-sign + mirror-push run is a
+      release-time step performed with hardware-backed key custody
+      outside this milestone. See design/architecture.md §10 for the
+      full rationale and the flag for main. `doc/libpdx-volume.pdxdoc`
+      (new file) documents every exported symbol across the library's
+      five modules plus both on-wire byte layouts and a LIMITATIONS
+      section. `release/RELEASE-1.0.0.md` (new file) is the operator
+      runbook + release note covering what v1.0.0 ships, what remains
+      deferred, and the substrate readiness gates (S1..S4) blocking an
+      actual signed cut. `CHANGELOG.md` (new file) closes with a
+      `## 1.0.0` entry summarising M1..M5.
 
 ## Next milestone
 
-M4 (tests + fuzz) opens next. `M4-002` ("sig-verify against a
-known-signed superblock fixture") needs main to decide first whether it
-verifies via a real `mldsa65_verify` intrinsic (not landed in
-paideia-as v0.24.0 today — `pdxb_verify_inode_tail` is a stub, see
-design/architecture.md §8.4) or via some other mechanism (e.g. a host-
-side Rust verify path outside this library, mirroring how `mkfs-pdxb`'s
-own dev-key tooling works) until one lands. Build not run for M3 — this
-library's own discipline is main-only builds; main should run
-`bash tools/build.sh` against this landing before M4 starts and confirm
-the `MlDsa65::sign` local-trait-declaration call pattern (design/
-architecture.md §8.1) actually compiles, since it is the first real
-call site for that intrinsic anywhere in the tree.
+All milestones M1..M5 landed at v1.0.0 (release manifest scaffolded;
+signing deferred). No M6 is scoped in `design/tooling/volume-tooling-
+ux.md` §9.4 — the library is feature-complete for its declared M1..M5
+scope. Downstream work continues in the three consumer repos this
+library targets (`mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`, per
+`README.md`'s "Callers" section), none of which exist yet.
 
-`M2-004`'s `vol_kind_narrow` landed as validation + passthrough rather
-than a real kernel-enforced narrowing (see `design/architecture.md`
-§5.1) because `KIND_VOLUME` still has no `mount`/`flush`/`snapshot` ops
-and no generic `cap_narrow` primitive exists anywhere in the kernel
-tree for this KIND. Main should track whether a future R53 KIND_VOLUME
-landing adds either, at which point `vol_kind_narrow`'s passthrough
-line (not its signature) needs to become a real call-through.
+Deferred to a future patch/minor release (see `CHANGELOG.md`'s semver
+policy):
+
+- **Dual-sign + mirror-push run.** Blocked on (a) the paideia-as
+  toolchain reachable in CI, (b) the `pkgs.paideia-os` mirror endpoint
+  standing (does not exist as of R53 close), and (c) a live
+  release-line ML-DSA-65 seed key. See `release/RELEASE-1.0.0.md` §3
+  and design/architecture.md §10.
+- **`mldsa65_verify` intrinsic.** `pdxb_verify_inode_tail` stays a
+  fail-closed stub and `tests/test_pdxb_sigverify.pdx` stays a
+  sentinel-only test until this lands on the `MlDsa65` trait
+  (design/architecture.md §8.4).
+- **`vol_kind_mint` / `vol_kind_narrow`'s kernel-enforced derivation.**
+  `M2-004`'s `vol_kind_narrow` landed as validation + passthrough
+  rather than a real kernel-enforced narrowing (see
+  `design/architecture.md` §5.1) because `KIND_VOLUME` still has no
+  `mount`/`flush`/`snapshot` ops and no generic `cap_narrow` primitive
+  exists anywhere in the kernel tree for this KIND. Main should track
+  whether a future R53 KIND_VOLUME landing adds either, at which point
+  `vol_kind_narrow`'s passthrough line (not its signature) needs to
+  become a real call-through; `vol_kind_mint` needs a ring-3-reachable
+  mint syscall to stop being a stub at all.
+- **`doc` M2 compile pass.** The `.pdxdoc` compiled binary form ships
+  once `doc`.M2 lands. Until then consumers render the source form at
+  `doc/libpdx-volume.pdxdoc` verbatim.
+
+Build not run for M5 — this library's own discipline is main-only
+builds; M5-001 adds no new `.pdx` code (only `release/`, `doc/`,
+`CHANGELOG.md`, and a `design/architecture.md` §10 addition), so there
+is nothing new for `bash tools/build.sh` to compile, but main should
+still run it to confirm the M1..M4 source tree this manifest's
+`[artifacts.source]` section enumerates still builds clean before any
+future tag is cut.
 
 ## Upstream design
 

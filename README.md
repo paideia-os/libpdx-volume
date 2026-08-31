@@ -37,13 +37,16 @@ Concretely, this library:
 
 ## Status
 
-**M1, M2, and M3 landed** (scaffold + module boundary, the
+**M1..M5 landed — v1.0.0.** Scaffold + module boundary, the
 `KIND_PDXFS_MOUNT_TABLE` row-layout parser, the PDXB superblock codec,
-the mount-table snapshot walker, `KIND_VOLUME` op-mask narrowing, and
-the ML-DSA-65 signing helpers). M4..M5 pending — see
+the mount-table snapshot walker, `KIND_VOLUME` op-mask narrowing, the
+ML-DSA-65 signing helpers, three test drivers, and a release manifest
++ `.pdxdoc` scaffold (dual-sign + mirror push deferred — see
+[`release/RELEASE-1.0.0.md`](release/RELEASE-1.0.0.md) §3). See
 [`STATUS.md`](STATUS.md) for the per-milestone checklist mirroring
 `design/tooling/volume-tooling-ux.md` §9.4 in the
-[paideia-os](https://github.com/paideia-os/paideia-os) repo.
+[paideia-os](https://github.com/paideia-os/paideia-os) repo, and
+[`CHANGELOG.md`](CHANGELOG.md) for the v1.0.0 release entry.
 
 ## API surface (M2 + M3)
 
@@ -94,7 +97,12 @@ landing):
   confirmation.
 - [`caps.decl`](caps.decl) — the KIND surfaces this library's functions
   are typed against.
+- [`doc/libpdx-volume.pdxdoc`](doc/libpdx-volume.pdxdoc) — user-facing
+  reference for `doc libpdx-volume`: full API contract, both on-wire
+  byte layouts, and a limitations index.
 - [`STATUS.md`](STATUS.md) — per-milestone landing checklist.
+- [`release/RELEASE-1.0.0.md`](release/RELEASE-1.0.0.md) — the v1.0.0
+  release note + mirror-push runbook.
 - `design/tooling/volume-tooling-ux.md` §2.4, §9.4 and
   `design/filesystem/volume-fs-substrate.md` §2.1 in the
   [paideia-os](https://github.com/paideia-os/paideia-os) repo — the

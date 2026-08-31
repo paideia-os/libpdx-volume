@@ -1,0 +1,276 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc libpdx-volume`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5-001 source lives in the repo under version control
+%%% and the release tool ships the compiled `.pdxdoc` alongside the
+%%% library into /pkgs/libpdx-volume-1.0.0/doc/libpdx-volume.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+libpdx-volume — KIND_VOLUME client helpers, PDXB superblock codec, and
+mount-table view for paideia-os volume tooling.
+
+==== SYNOPSIS
+    module VolKind = structure {
+      pub let vol_kind_mint   : (u64) -> u64 !{} @{}
+      pub let vol_kind_narrow : (u64, u64, u64) -> u64 !{mem} @{}
+    }
+    module PdxbSuperblock = structure {
+      pub let pdxb_parse_superblock  : (u64, u64, u64) -> u64 !{mem} @{}
+      pub let pdxb_encode_superblock : (u64, u64, u64) -> u64 !{mem} @{}
+    }
+    module MountTable = structure {
+      pub let mount_table_row_parse : (u64, u64) -> u64 !{mem} @{}
+    }
+    module MountTableSnapshot = structure {
+      pub let mount_table_snapshot : (u64, u64, u64, u64) -> u64 !{mem} @{}
+    }
+    module PdxbSign = structure {
+      pub let pdxb_sign_superblock   : (u64, u64, u64, u64) -> u64 !{mem, crypto} @{paideia.crypto}
+      pub let pdxb_sign_inode_tail   : (u64, u64, u64, u64, u64) -> u64 !{mem, crypto} @{paideia.crypto}
+      pub let pdxb_verify_inode_tail : (u64, u64, u64, u64, u64, u64) -> u64 !{} @{}
+    }
+
+==== DESCRIPTION
+libpdx-volume is the single shared client-side library `mkfs.pdxfs`,
+`mount.pdxfs`, and `umount.pdxfs` (and, later, `df` / `fsck.pdxfs`) all
+link, so the on-disk PDXB wire format and the `KIND_PDXFS_MOUNT_TABLE`
+row layout are decoded and encoded in exactly one place rather than
+once per tool. It performs no `sys_svc_lookup` of its own and binds no
+ambient service at process start — every public entry point takes a
+caller-supplied capability slot or raw pointer as a plain `u64`
+argument and operates against a KIND surface the CALLER already holds
+(see `caps.decl`'s closing note). The library issues **zero cap-invoke
+syscalls anywhere in its own call graph**, at every milestone through
+v1.0.0.
+
+Five modules cover three concerns:
+
+- **`VolKind`** — thin wrappers over `KIND_VOLUME` mint/narrow so a
+  caller never hand-packs a mint/narrow call's arguments.
+- **`PdxbSuperblock`** — the PDXB v1 on-disk 4096-byte superblock
+  codec: the single place that wire format is decoded/encoded.
+- **`MountTable`** / **`MountTableSnapshot`** — the client-side view of
+  the `KIND_PDXFS_MOUNT_TABLE` capability's singleton metadata row, and
+  the live per-mount-entry array it points at.
+- **`PdxbSign`** — ML-DSA-65 signing helpers over a superblock or an
+  inode-tail byte range, via the paideia-as `MlDsa65::sign` intrinsic.
+
+See [[cref: WIRE-FORMATS]] for both on-wire byte layouts this library
+decodes, [[cref: API]] for the full per-function contract, and
+[[cref: LIMITATIONS]] for what is stubbed or deferred at v1.0.0.
+
+==== API
+
+---- vol_kind_mint(dev_cap) -> vol_cap
+**STUB.** Always returns `LPV_STUB_NOT_IMPLEMENTED`. Blocked on a
+ring-3-reachable `KIND_VOLUME` mint syscall that does not exist yet
+(`kind_volume.pdx`'s own "no cap-invoke op reaches kind_volume_mint"
+note). Dereferences nothing.
+
+---- vol_kind_narrow(cap_slot, requested_ops_mask, out_narrowed_cap_slot) -> err
+Validates `requested_ops_mask` against `KIND_VOLUME`'s real, frozen op
+catalog — ordinals 0..9, `VK_OPS_VALID_MASK = 0x3FF`. On a valid mask,
+writes `cap_slot` through to `*out_narrowed_cap_slot` **unchanged**
+(documented passthrough, not a kernel-enforced derivation — no
+`cap_narrow` primitive exists anywhere in the kernel tree for
+`KIND_VOLUME`) and returns `LPV_VK_OK` (0). On an invalid mask, returns
+`LPV_VK_ERR_BAD_OPS_MASK` (1) and does not write `out_narrowed_cap_slot`.
+
+CAUTION: this function's real value is the validation gate, not
+capability narrowing. A caller expecting a genuinely narrower
+capability back gets the same `cap_slot` it passed in.
+
+---- pdxb_parse_superblock(buf_ptr, buf_len, out_ptr) -> err
+Decodes a 4096-byte on-disk PDXB v1 superblock buffer at `buf_ptr` into
+a 176-byte `PdxbSuperblockSummary` at `out_ptr` (see
+[[cref: WIRE-FORMATS]]). Four gates, checked in order:
+`buf_len >= 4096` (`PDXB_ERR_BUF_TOO_SHORT`), `magic == PDXB_MAGIC`
+(`PDXB_ERR_BAD_MAGIC`), `version == 1` (`PDXB_ERR_BAD_VERSION`),
+`block_size == 4096` (`PDXB_ERR_BAD_BLOCK_SIZE`). Returns `PDXB_OK` (0)
+on success. There is no on-disk checksum field to validate against —
+the on-disk PDXB v1 layout has none; `block_size` is the closest real
+substitute per `design/architecture.md` §3.1.
+
+---- pdxb_encode_superblock(sb_ptr, out_ptr, out_len) -> written_or_err
+Inverse of `pdxb_parse_superblock`: reads a `PdxbSuperblockSummary` at
+`sb_ptr` and writes the full 4096-byte on-disk layout to `out_ptr`.
+Zero-fills the entire output buffer first, then overlays all eighteen
+real fields — `_reserved` and `sig` are left at their zeroed state (no
+signature is produced here; see `pdxb_sign_superblock`). Returns
+`out_len` (4096) on success, `PDXB_ENC_ERR_BUF_TOO_SHORT` if the
+caller's buffer is smaller than 4096 bytes.
+
+---- mount_table_row_parse(row_ptr, out_ptr) -> err
+Decodes the 64-byte `KIND_PDXFS_MOUNT_TABLE` singleton capability
+metadata row at `row_ptr` into a 56-byte `MountTableRow` at `out_ptr`
+(see [[cref: WIRE-FORMATS]]). Two gates: the row's `kind` field must
+equal `0x1A5` (`LPV_MTR_ERR_BAD_MAGIC`, 1), and its `in_use` byte must
+be nonzero (`LPV_MTR_ERR_ROW_DEAD`, 2). Returns `LPV_MTR_OK` (0) on
+success. This row has no separate version field — `kind` is its only
+discriminator.
+
+---- mount_table_snapshot(row_ptr, out_ptr, out_cap, out_count_ptr) -> err
+Re-validates the same singleton row as `mount_table_row_parse` (same
+two gates, same two error codes, `LPV_MTS_OK` / `LPV_MTS_ERR_BAD_MAGIC`
+/ `LPV_MTS_ERR_ROW_DEAD`), then walks the LIVE `_mount_table[8]`
+per-slot array the row's `table_row_addr` field points at, decoding up
+to `out_cap` entries into `out_ptr` and writing the number actually
+written (`min(mount_slot_count, out_cap)`) to `*out_count_ptr`. The
+walk is unconditional over the slot range — empty slots are decoded
+and written too; a caller wanting only live mounts filters by the
+decoded `flags` field's bit 0 (`MOUNT_FLAG_VALID`) itself.
+
+---- pdxb_sign_superblock(sb_ptr, seed_ptr, out_sig_ptr, out_sig_len) -> written_or_err
+Signs `sb_ptr[0, 696)` (the wire format's documented signed range,
+[[cref: WIRE-FORMATS]]) via the paideia-as `MlDsa65::sign` intrinsic
+using the 32-byte seed at `seed_ptr`, and writes the 3309-byte
+signature to `out_sig_ptr`. Pass `out_sig_ptr = sb_ptr + 696` to sign
+in place, matching the on-disk `sig` field's own offset. Returns
+`3309` on success, `PDXB_SIGN_ERR` if the intrinsic call fails. Takes a
+raw `seed_ptr` rather than a `KIND_SIG_KEY` cap slot — see
+[[cref: LIMITATIONS]].
+
+---- pdxb_sign_inode_tail(inode_ptr, tail_offset, tail_len, seed_ptr, out_sig_ptr) -> written_or_err
+Same signing path as `pdxb_sign_superblock`, over an arbitrary
+`inode_ptr[tail_offset, tail_offset + tail_len)` byte range instead of
+a fixed superblock prefix. Deferred consumer — no `fsck.pdxfs` exists
+yet to call this. The caller MUST guarantee `out_sig_ptr` has at least
+3309 writable bytes; there is no `out_sig_len` argument to gate on
+(unlike `pdxb_sign_superblock`).
+
+---- pdxb_verify_inode_tail(inode_ptr, tail_offset, tail_len, sig_ptr, sig_len, pub_key_slot) -> err
+**STUB — fail-closed by construction.** Always returns
+`PDXB_VER_ERR_NOT_IMPLEMENTED` and dereferences none of its six
+arguments. No `mldsa65_verify` intrinsic exists in paideia-as v0.24.0
+(repo-wide grep across paideia-os and its paideia-as submodule came
+back empty). See [[cref: LIMITATIONS]].
+
+==== WIRE-FORMATS
+
+---- PdxbSuperblockSummary (in-memory decoded struct, 176 bytes / 22 u64 slots)
+Decodes the fixed-field region of the on-disk 4096-byte PDXB v1
+superblock (`design/filesystem/volume-fs-substrate.md` §2.1,
+paideia-os — authoritative; this library never redefines it). Every
+slot is a full aligned `u64` regardless of the on-disk field's real
+width, since paideia-as has no native sub-8-byte struct-field
+addressing beyond raw byte offsets.
+
+    [  0,  8) magic           (on-disk [0,4),   zero-extended u32)
+    [  8, 16) version         (on-disk [4,8),   zero-extended u32)
+    [ 16, 24) uuid_lo         (on-disk [8,16),  uuid bytes 0..8)
+    [ 24, 32) uuid_hi         (on-disk [16,24), uuid bytes 8..16)
+    [ 32, 40) block_size      (on-disk [24,28), zero-extended u32)
+    [ 40, 48) flags           (on-disk [28,32), zero-extended u32)
+    [ 48, 56) total_blocks    (on-disk [32,40))
+    [ 56, 64) itable_lba      (on-disk [40,48))
+    [ 64, 72) itable_bcount   (on-disk [48,56))
+    [ 72, 80) alloc_lba       (on-disk [56,64))
+    [ 80, 88) alloc_bcount    (on-disk [64,72))
+    [ 88, 96) journal_lba     (on-disk [72,80))
+    [ 96,104) journal_bcount  (on-disk [80,88))
+    [104,112) data_lba        (on-disk [88,96))
+    [112,120) data_bcount     (on-disk [96,104))
+    [120,128) root_inode      (on-disk [104,112))
+    [128,136) mount_gen       (on-disk [112,120))
+    [136,144) snap_head       (on-disk [120,128))
+    [144,176) sig_key_hash    (on-disk [128,160), 4 x u64 slots)
+
+Not decoded: on-disk `_reserved` (536 B at offset 160) and `sig`
+(3400 B at offset 696, ML-DSA-65 signature covering on-disk `[0,696)`
+— this is a SUPERSET of the 176-byte summary above, since it also
+covers `_reserved`). `pdxb_sign_superblock` reads directly from the
+original on-disk buffer, not from the decoded summary.
+
+---- MountTableRow (in-memory decoded struct, 56 bytes / 7 u64 slots)
+Decodes the `KIND_PDXFS_MOUNT_TABLE` singleton capability metadata row
+(64 bytes on-wire, `src/kernel/core/cap/kind_pdxfs_mount_table.pdx`
+SECTION 1, paideia-os). This is ONE row describing the capability
+itself — a pointer to the kernel's `_mount_table[]` array plus a slot
+count — NOT one row per active mount.
+
+    [ 0,  8) kind              (header0 bits [15:0]  — must equal 0x1A5)
+    [ 8, 16) in_use            (header0 bits [63:56] — 0 or 1)
+    [16, 24) flags             (header0 bits [55:32] — 24 bits)
+    [24, 32) gen               (header0 bits [31:16])
+    [32, 40) mount_slot_count  (header1 bits [15:0]  — informational only)
+    [40, 48) reserved_hi       (header1 bits [63:32])
+    [48, 56) table_row_addr    (row word 2, verbatim)
+
+`table_row_addr` points at `src/kernel/core/fs/mount.pdx`'s
+`_mount_table[MOUNT_MAX=8]` array (R16-M1-005, frozen, 8 bytes/slot),
+which `mount_table_snapshot` walks:
+
+    _mount_table[8] per-slot layout (8 bytes/slot):
+      [ 0, 16) mountpoint_vnode_idx (u16)
+      [16, 32) root_vnode_idx       (u16)
+      [32, 40) backend_type         (u8)  NONE=0 TMPFS=1 DEVFS=2
+                                            PROCFS=3 TTY=4 PDXFS_BLOCK=5
+      [40, 48) flags                (u8)  bit0 VALID bit1 ROOT
+                                            bit2 PENDING_UNMOUNT
+      [48, 64) _reserved            (u16)
+
+This is NOT the richer `{mount_id, volume_uuid, mount_point_id,
+backend_id, flags, mount_gen, invoker_user}` per-mount record
+`design/tooling/volume-tooling-ux.md` §2.2 sketches — that record has
+no landed kernel representation anywhere in the tree as of v1.0.0. See
+[[cref: LIMITATIONS]].
+
+==== LIMITATIONS
+Cited from `design/architecture.md`; each item names the section with
+the full rationale.
+
+- **`vol_kind_mint` is a permanent stub** until `KIND_VOLUME` gains a
+  ring-3-reachable mint syscall (§7).
+- **`vol_kind_narrow` does not produce a kernel-enforced narrower
+  capability.** `KIND_VOLUME`'s op catalog is query-only (ordinals
+  0..9, all `VOL_OP_QUERY_*` plus `VOL_OP_DEBUG_PRINT`); no
+  `mount`/`flush`/`snapshot` op exists to narrow to, and no generic
+  `cap_narrow` primitive exists anywhere in the kernel tree for this
+  KIND (§5, §5.1).
+- **`mount_table_row_parse` / `mount_table_snapshot` decode the
+  singleton capability metadata row and the live `_mount_table[]`
+  vnode-layer array — not the design doc's own §2.2 per-mount-entry
+  sketch**, which has no landed kernel representation (no mint path,
+  no write op, no field-packing code exists for it anywhere in the
+  tree) (§4, §4.3).
+- **No on-disk checksum field exists in PDXB v1.** `pdxb_parse_
+  superblock` gates on `block_size == 4096` in its place — the closest
+  real, mount-time-refusable field the spec defines (§3.1).
+- **`_reserved` non-zero forward-compatibility refusal is NOT
+  implemented** in the codec — that policy belongs at the mount-time
+  caller, not the decode layer (§3.1).
+- **Signing helpers take a raw `seed_ptr`, not a `KIND_SIG_KEY` cap
+  slot.** `KIND_SIG_KEY`'s landed shape is a PUBLIC-key handle (used
+  for mount-time cross-checking), not a private signing-seed store —
+  no kernel capability kind anywhere in the tree holds private
+  ML-DSA-65 signing-key material. This library also issues zero
+  cap-invoke calls by established discipline, so it would not resolve
+  such a slot even if one existed (§8.2).
+- **`pdxb_verify_inode_tail` is a fail-closed stub.** No
+  `mldsa65_verify` intrinsic exists in paideia-as v0.24.0 (§8.4).
+- **The dual-signed release manifest is not actually signed at
+  v1.0.0.** `release/manifest.pdxsig.txt` ships with every hash and
+  signature slot as a documented placeholder — sign-then-push requires
+  live release-line key material this repo does not hold, and is a
+  release-time step outside this milestone (`design/architecture.md`
+  §10).
+
+==== SEE-ALSO
+Upstream design: `design/tooling/volume-tooling-ux.md` §2.4 + §9.4 and
+`design/filesystem/volume-fs-substrate.md` §2.1 in the paideia-os repo.
+Repo-internal shape: `design/architecture.md` in this repo. Per-driver
+test contracts: `tests/README.md`. Release workflow:
+`release/RELEASE-1.0.0.md`.
+
+==== VERSION
+libpdx-volume 1.0.0 (R53 wave, M5-001 signed-release scaffold). The
+actual dual-sign + mirror-push run happens once substrates S1
+(paideia-as toolchain) and S2 (pkgs.paideia-os endpoint) go green and a
+live release-line seed key is available, per `release/RELEASE-1.0.0.md`
+§3.

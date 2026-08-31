@@ -692,3 +692,61 @@ Confirm this reading holds if a future M5+ fixture needs content too
 irregular for a handful of field stores to express economically — at
 that point a real literal-array approach (however large) becomes the
 right call instead.
+
+## 10. M5-001 landing — release manifest, `.pdxdoc`, and why the dual-sign step is deferred
+
+`release/manifest.pdxsig.txt` (new file) is this library's release
+manifest source form, matching `libpdx-audit`'s own
+`release/manifest.pdxsig.txt` structure section-for-section
+(`[artifacts.*]`, `[depends-on]`, `[substrate]`, `[signatures]`) — see
+that file for the worked template, and `doc/libpdx-volume.pdxdoc` /
+`release/RELEASE-1.0.0.md` (new files) for the two companion M5-001
+deliverables built the same way against `libpdx-audit`'s own
+`doc/libpdx-audit.pdxdoc` / `release/RELEASE.md`.
+
+**The manifest is ready for signing; sign-then-push is not performed
+at this milestone.** Every `blake3-256 = <BLAKE3-*>` hash slot in
+`[artifacts.*]` is left as a placeholder — matching `libpdx-audit`'s
+own manifest, which leaves the identical placeholders unresolved in
+its repo-committed source form, since the release tool recomputes
+every hash from the working tree AT THE RELEASE TAG, not at
+arbitrary-commit authoring time. The `[signatures]` block's four
+slots (`ed25519-key-id`, `ed25519-signature`, `ml-dsa-65-key-id`,
+`ml-dsa-65-signature`) instead carry the literal sentinel
+`SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN`, per this milestone's own
+scope note — a deliberate wording choice distinguishing "the release
+tool has not run yet" (`libpdx-audit`'s `<...>` placeholder convention,
+which implies the tool WILL fill this in mechanically) from "no
+signing key exists anywhere in this repo for the tool to use even if
+it ran" (this repo's actual state).
+
+The distinction matters because it is the same shape §8.2 already
+established one layer down, for `pdxb_sign_superblock`'s own
+`seed_ptr` argument: a private ML-DSA-65 signing seed is release-line
+custody (hardware-backed TPM 2.0 in CI, or a cloud KMS once one
+supports the scheme — `design/02-development-environment.md` §1164),
+never resident in a source-controlled repo. The paideia-as
+`mldsa65_sign` intrinsic this library's own signing helpers call is
+available (v0.24.0, discovered at M3 — §8.1) and could technically run
+against a manifest hash today, but doing so would require generating
+or importing a live seed key into this repo's working tree solely to
+produce a manifest signature — exactly the anti-pattern §8.2 already
+refused for the library's own code. **Flagged for main:** the actual
+dual-sign + mirror-push run is a release-time operation performed
+from the paideia-os workspace CI (or an operator with access to the
+release-line key custody chain) once substrates S1
+(paideia-as toolchain reachable) and S2 (`pkgs.paideia-os` mirror
+endpoint standing — does not exist as of R53 close, same gap
+`libpdx-audit`'s own runbook documents) go green; see
+`release/RELEASE-1.0.0.md` §3/§4 for the full runbook this repo's
+manifest is staged against.
+
+`doc/libpdx-volume.pdxdoc` documents every exported symbol from
+`src/vol_kind.pdx`, `src/pdxb_superblock.pdx`, `src/mount_table.pdx`,
+`src/mount_table_snapshot.pdx`, and `src/pdxb_sign.pdx` (five modules,
+matching §6's module-split rationale), plus both on-wire byte layouts
+this library decodes (`PdxbSuperblockSummary`, `MountTableRow`) and a
+LIMITATIONS section citing every deferred/stub item this document
+already flags (§5.1, §4.3, §3.1, §8.2, §8.4) — a single reader-facing
+index into decisions otherwise scattered across ten sections of this
+file.
