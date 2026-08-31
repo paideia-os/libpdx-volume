@@ -276,6 +276,167 @@ No `src/signing.pdx` and no `tests/` content at this landing, matching
 the M1 issue brief's explicit scope ("Nothing under `tests/` yet — M4
 lands the fuzz/round-trip harness").
 
+## 3.1 M2-001/M2-002 landing — real parse/encode bodies
+
+`pdxb_parse_superblock` and `pdxb_encode_superblock` (§2, §3 above) now
+have real bodies, cross-checked against **two** independent sources
+that agree byte-for-byte: `design/filesystem/volume-fs-substrate.md`
+§2.1 (the authoritative spec) and `src/tools/mkfs-pdxb/main.pdx`
+(paideia-os, R53.M1-001 — the host-side tool that actually WRITES this
+layout on disk today, via `mkfs_pdxb_sb_populate`). Both agree on every
+offset this library decodes.
+
+**Validation gates.** The M2-001 issue brief asks for "invalid
+magic/version/checksum" refusal. There is **no checksum field** in the
+on-disk PDXB v1 superblock — §2.1's table has no `checksum` row, and
+neither does `mkfs-pdxb/main.pdx`'s mirror of that layout. This
+document's read is that the issue brief's "checksum" is generic
+template language (the same brief text likely applies across several
+libpdx-volume issues) rather than a real field this library must gate
+on. In its place, `pdxb_parse_superblock` gates on **`block_size`**
+(must equal 4096) — a real on-disk field §2.1 explicitly calls out as
+mount-time-refusable ("rejected at mount if different"), giving four
+concrete gates: `buf_len >= 4096`, `magic == PDXB_MAGIC`,
+`version == 1`, `block_size == 4096`. **Flagged for main:** confirm
+there is no separate checksum field this parser should be validating
+instead — if the design doc is later amended to add one (e.g. a CRC32C
+of the fixed-field region, mirroring the journal block's own `csum`
+field at §2.4), this parser's gate list needs a fifth entry.
+
+**`_reserved` non-zero refusal — deliberately NOT implemented.** §2.1's
+discipline note says a non-zero `_reserved` byte "indicates a
+from-the-future superblock; refuse rather than silently ignore." This
+parser does not scan the 536-byte `_reserved` region. Rationale: that
+refusal is a **mount-time forward-compatibility policy**, not a
+decode-correctness concern — this library's contract is "decode what
+the wire format defines," and the mount path (not this codec) is where
+policy about future-versioned images belongs, mirroring this repo's
+existing "the parser decodes, the caller (mkfs.pdxfs) owns the
+PDXB/PDXL refusal-gate policy" split from the M1 landing. **Flagged for
+main:** if a future landing wants this refusal at the codec layer
+instead, it is a straightforward addition (a 67-iteration qword-OR
+loop over `_reserved`) but changes this function from a pure structural
+decoder into a policy gate.
+
+**Encoder zero-fill strategy.** `pdxb_encode_superblock` zero-fills the
+*entire* 4096-byte output buffer first (one bounded 512-iteration
+qword loop) rather than tracking `_reserved` and `sig`'s bounds
+separately. This is simpler to verify by inspection than two
+narrower zero-fill ranges and costs nothing extra — the eighteen real
+field writes that follow overwrite the zeroed bytes at their offsets
+regardless.
+
+## 4.3 M2-003 landing — `mount_table_snapshot`, and where the real per-mount-entry layout came from
+
+§4's "confirm with main before relying on this" flag from M1 asked
+whether a genuine per-mount-entry record exists anywhere, distinct
+from the `KIND_PDXFS_MOUNT_TABLE` singleton row. **It does** — just not
+the one `volume-tooling-ux.md` §2.2 sketches.
+
+`table_row_addr` (the singleton row's word at on-disk offset `+16`)
+points at `src/kernel/core/fs/mount.pdx`'s `_mount_table[MOUNT_MAX=8]`
+array (paideia-os, R16-M1-005, `#574` — frozen well before R53, at
+`design/kernel/r16-m1-005-mount-table.md` §2). That array's per-slot
+layout is real, frozen, and already load-bearing kernel code (vnode
+mount/lookup uses it today):
+
+```
+_mount_table[8]: [u64; 8], @align(64), 8 bytes/slot:
+  [0, 16)  mountpoint_vnode_idx (u16)
+  [16, 32) root_vnode_idx       (u16)
+  [32, 40) backend_type         (u8)   NONE=0, TMPFS=1, DEVFS=2,
+                                        PROCFS=3, TTY=4, PDXFS_BLOCK=5
+  [40, 48) flags                (u8)   bit0 VALID, bit1 ROOT,
+                                        bit2 PENDING_UNMOUNT
+  [48, 64) _reserved            (u16)
+```
+
+This is **not** the `{mount_id, volume_uuid, mount_point_id,
+backend_id, flags, mount_gen, invoker_user}` record §2.2 sketches — it
+has no `mount_id`, no `volume_uuid`, no `invoker_user`. Those richer
+fields belong to a higher-level mount-lifecycle record that, per §4's
+original write-up, has landed nowhere in the tree — no mint path, no
+write op, no field-packing code. `mount_table_snapshot`
+(`src/mount_table_snapshot.pdx`) decodes the REAL, frozen
+`_mount_table[]` layout instead of inventing a 32-byte placeholder,
+because a real frozen layout existed to find (a `grep` for
+`_mount_table` in `core/fs/mount.pdx` surfaces it immediately) and
+using it means this function's output is byte-accurate against live
+kernel state today rather than a shape nothing produces.
+
+**Confirm with main:** if a future landing introduces the richer §2.2
+per-mount record as a genuinely separate structure (e.g. a
+`KIND_PDXFS_MOUNT_TABLE` write op that mints per-mount metadata
+distinct from `_mount_table[]`'s vnode-layer bookkeeping),
+`mount_table_snapshot`'s decode target will need to change, or a
+second entry point will be needed — same non-interchangeability caveat
+`mount_table_row_parse` already carries for the singleton-vs-per-entry
+split.
+
+**Signature.** `mount_table_snapshot(row_ptr, out_ptr, out_cap,
+out_count_ptr) -> u64` — a 4-arg out-pointer + status-code shape (not a
+"return a Vec" shape, per §2's arity rationale): `out_cap` bounds how
+many `MountTableEntry` slots the caller's `out_ptr` buffer holds,
+`out_count_ptr` receives how many were actually written
+(`min(mount_slot_count, out_cap)`), and the `u64` return is
+`LPV_MTS_OK` / `LPV_MTS_ERR_BAD_MAGIC` / `LPV_MTS_ERR_ROW_DEAD` — the
+same two failure codes `mount_table_row_parse` uses, by the same
+numeric values, since both gate the identical singleton row.
+
+The walk is **unconditional over slot range**, not filtered to
+`MOUNT_FLAG_VALID` slots — every slot in `[0, walk_count)` is decoded
+and written, empty or not. A `df`/`mount`-style CLI consumer wants to
+see empty slots too (e.g. to report remaining mount-table capacity);
+filtering by `MTE_OFF_FLAGS & 0x01` is left to the caller.
+
+## 5.1 M2-004 landing — `vol_kind_narrow`'s real body
+
+§5 above (M1) already surfaced the blocker this issue runs into:
+`KIND_VOLUME`'s op catalog is query-only, and there is no `mount` /
+`flush` / `snapshot` op to narrow *to*. Before writing this issue's
+body, a repo-wide grep for a generic capability-op-narrowing primitive
+(`*_cap_narrow`, `*_narrow_ops`, or similar) came back with exactly
+**one** hit in the entire kernel tree: `kind_ec_query.pdx`'s
+`ec_query_row_narrow`. That function is unrelated to this problem — it
+clears one bit of a per-row EC-query event-notify bitmap; there is no
+generic `cap_narrow` syscall this library could call through for
+`KIND_VOLUME`.
+
+Given that, `vol_kind_narrow`'s real body does the one thing this
+library can own without a kernel-side derivation surface: it validates
+`requested_ops_mask` against the real, frozen op catalog (bits 0..9,
+`VK_OPS_VALID_MASK = 0x3FF`) and, on a valid mask, writes `cap_slot`
+through to `*out_narrowed_cap_slot` **unchanged** — a documented
+passthrough, not a real derivation. This is deliberately the second of
+the M2 issue brief's two offered remediations ("do the mask validation
+locally and return a placeholder narrowed slot") rather than a bare
+stub, because the validation itself is a genuine, real correctness
+check today: it catches an out-of-range op request at the client
+library boundary rather than letting it reach a syscall that would
+refuse it with a less specific error. What it does **not** do is
+produce a kernel-enforced narrower capability — `KIND_VOLUME`'s rights
+model (`R_VOL_READ` / `WRITE` / `INVOKE` / `REVOKE` / `REFRESH` /
+`OBSERVE`) gates whole categories of operations, not individual
+`VOL_OP_*` ordinals, so there is no narrower capability a valid
+`ops_mask` could actually produce with today's kernel surface.
+
+**Signature change from M1.** The M1 stub was `vol_kind_narrow(vol_cap,
+ops_mask) -> u64` (2 args, cap-or-sentinel return). The M2 issue brief
+specifies a 3-arg out-pointer shape,
+`vol_kind_narrow(cap_slot, requested_ops_mask, out_narrowed_cap_slot)
+-> u64`, matching this library's established out-pointer + status-code
+convention (§2) rather than the "return a capability value in `rax`"
+shape the M1 stub used. This is a breaking API change from M1's
+placeholder signature — acceptable because M1's stub was never callable
+for anything real (it always returned the sentinel) and no consumer
+links against it yet.
+
+**Confirm with main:** when `KIND_VOLUME` gains a real per-op or
+per-rights-subset derivation primitive (kernel-side), this function's
+passthrough line becomes a real call through that primitive. The
+validation gate and the function's signature should not need to change
+at that point — only the body between the gate and the return.
+
 ## 7. What M1 explicitly does not do
 
 Called out here so a reader of M1 code does not mistake absence for

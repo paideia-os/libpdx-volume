@@ -1,7 +1,7 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M1 (design + skeleton) — in progress
+**Current milestone:** M2 (core parse + encode) — landed
 **Version:** unreleased (pre-1.0.0)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
@@ -35,16 +35,38 @@ full 12-issue breakdown this checklist mirrors.
       two issues, or whether a third scaffold-verification issue should
       be opened before M2 begins.
 
-### M2 — Core parse + encode (pending)
+### M2 — Core parse + encode (landed)
 
-- [ ] **M2-001** — `pdxb_parse_superblock`: every offset in R52 §2.1 →
-      `PdxbSuperblockSummary`.
-- [ ] **M2-002** — `pdxb_encode_superblock`: inverse of parse; canonical
-      byte layout.
-- [ ] **M2-003** — `mount_table_snapshot`: read `KIND_PDXFS_MOUNT_TABLE`
-      + return `Vec<MountTableRow>`.
-- [ ] **M2-004** — `vol_kind_narrow`: narrow `ops_mask` on `KIND_VOLUME`
-      (matches R52 op catalog).
+- [x] **M2-001** (#3) — `pdxb_parse_superblock`: every offset in R52
+      §2.1 decoded into `PdxbSuperblockSummary` (`src/pdxb_superblock.pdx`).
+      Cross-checked against `src/tools/mkfs-pdxb/main.pdx` (paideia-os)
+      byte-for-byte. Four gates: `buf_len >= 4096`, `magic == PDXB_MAGIC`,
+      `version == 1`, `block_size == 4096` (no on-disk checksum field
+      exists — see design/architecture.md §3.1 for the substitution
+      rationale and the flag for main).
+- [x] **M2-002** (#4) — `pdxb_encode_superblock`: real inverse of parse
+      (`src/pdxb_superblock.pdx`). Zero-fills the entire 4096-byte
+      output first (one bounded loop covers `_reserved` + `sig`
+      deterministically), then overlays all eighteen real fields.
+      Returns `out_len` on success, `PDXB_ENC_ERR_BUF_TOO_SHORT` on a
+      too-small buffer.
+- [x] **M2-003** (#5) — `mount_table_snapshot`: reads the
+      `KIND_PDXFS_MOUNT_TABLE` singleton row's `table_row_addr` and
+      walks the REAL, frozen `_mount_table[8]` per-slot layout from
+      `src/kernel/core/fs/mount.pdx` (R16-M1-005) — not an invented
+      32-byte record; see design/architecture.md §4.3 for why the
+      design doc's §2.2 sketch has no landed kernel representation and
+      what this function decodes instead. New file
+      `src/mount_table_snapshot.pdx`.
+- [x] **M2-004** (#6) — `vol_kind_narrow`: validates `requested_ops_mask`
+      against `KIND_VOLUME`'s real op catalog (bits 0..9,
+      `VK_OPS_VALID_MASK = 0x3FF`) and passes `cap_slot` through
+      unchanged on a valid mask (`src/vol_kind.pdx`). No kernel-side
+      `cap_narrow` primitive exists for `KIND_VOLUME` (the only "narrow"
+      hit anywhere in the kernel tree is `kind_ec_query.pdx`'s unrelated
+      notify-bitmap bit-clear) — see design/architecture.md §5.1 for
+      the full rationale and the flag for main. Signature grew from
+      2 args (M1 stub) to 3 (out-pointer convention).
 
 ### M3 — Signing helpers (pending)
 
@@ -67,15 +89,20 @@ full 12-issue breakdown this checklist mirrors.
 
 ## Next milestone
 
-M2 opens once `libpdx-volume.M1` closes and the two substrate-prep
-blockers named in `design/tooling/volume-tooling-ux.md` §9.0
-(`R53-PREP-000` UEJ constants, `R53-PREP-001`
-`KIND_PDXFS_MOUNT_TABLE` — already landed in paideia-os as of this M1
-landing) are satisfied. `M2-004` (`vol_kind_narrow`) additionally needs
-`KIND_VOLUME`'s op catalog to gain `{mount, flush, snapshot}` ops it
-does not have yet (see `design/architecture.md` §5) — main should
-confirm whether that gap blocks `M2-004` opening or whether the issue
-should be re-scoped.
+M3 (signing helpers) opens next. `M3-001` (`pdxb_sign_superblock`)
+needs the paideia-as `mldsa65_sign` intrinsic, which has landed
+upstream per recent paideia-as version bumps — main should confirm it
+is callable from this library's build before M3-001 starts. `M3-002`
+(inode-tail sig helpers) has no consumer yet (`fsck.pdxfs` is a
+deferred tool) and may be worth deferring further.
+
+`M2-004`'s `vol_kind_narrow` landed as validation + passthrough rather
+than a real kernel-enforced narrowing (see `design/architecture.md`
+§5.1) because `KIND_VOLUME` still has no `mount`/`flush`/`snapshot` ops
+and no generic `cap_narrow` primitive exists anywhere in the kernel
+tree for this KIND. Main should track whether a future R53 KIND_VOLUME
+landing adds either, at which point `vol_kind_narrow`'s passthrough
+line (not its signature) needs to become a real call-through.
 
 ## Upstream design
 

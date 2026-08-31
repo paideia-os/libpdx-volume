@@ -1,0 +1,258 @@
+// src/mount_table_snapshot.pdx — libpdx-volume.M2-003 (issue #5)
+// MountTableSnapshot: walks the LIVE per-mount-entry array a
+// KIND_PDXFS_MOUNT_TABLE row points at.
+//
+// `mount_table_row_parse` (src/mount_table.pdx, M1-002) decodes the
+// SINGLETON capability-metadata row -- one row describing the
+// KIND_PDXFS_MOUNT_TABLE capability itself (a pointer to the kernel's
+// `_mount_table[]` array, plus a slot count), not one row per active
+// mount (see that file's own header + design/architecture.md §4 for
+// the full R53-PREP-001-vs-volume-tooling-ux.md-§2.2 discrepancy
+// write-up). `mount_table_snapshot` is the function that actually
+// walks the per-mount entries: it re-reads the same 64-byte singleton
+// row's `table_row_addr` field (word at on-disk offset +16) and then
+// decodes `mount_slot_count` (header1 bits [15:0]) consecutive 8-byte
+// entries starting at that address.
+//
+// -----------------------------------------------------------------------------
+// The per-mount-entry layout -- REAL, not invented
+// -----------------------------------------------------------------------------
+//
+// design/tooling/volume-tooling-ux.md §2.2 sketches a per-mount-entry
+// record ({mount_id, volume_uuid, mount_point_id, backend_id, flags,
+// mount_gen, invoker_user}) that, per design/architecture.md §4, has
+// NO landed kernel representation anywhere in the tree -- no mint
+// path, no write op, no field-packing code. But the array
+// `table_row_addr` actually points at -- `_mount_table[MOUNT_MAX=8]`
+// in `src/kernel/core/fs/mount.pdx` (paideia-os, R16-M1-005 #574,
+// frozen at design/kernel/r16-m1-005-mount-table.md §2) -- DOES have a
+// real, frozen, per-slot layout, reproduced verbatim below:
+//
+//   _mount_table[MOUNT_MAX=8] is an @align(64) array of u64 entries.
+//   Each entry packs five fields into one 8-byte slot:
+//   - [0, 16)  mountpoint_vnode_idx (u16)
+//   - [16, 32) root_vnode_idx       (u16)
+//   - [32, 40) backend_type         (u8)  -- NONE=0, TMPFS=1, DEVFS=2,
+//                                            PROCFS=3, TTY=4,
+//                                            PDXFS_BLOCK=5
+//   - [40, 48) flags                (u8)  -- bit0 VALID=0x01,
+//                                            bit1 ROOT=0x02,
+//                                            bit2 PENDING_UNMOUNT=0x04
+//   - [48, 64) _reserved            (u16)
+//
+// This is a DIFFERENT record than volume-tooling-ux.md §2.2 sketches
+// (no mount_id, no volume_uuid, no invoker_user -- those fields belong
+// to a higher-level mount-lifecycle record that has not landed
+// kernel-side) but it IS the actual live table `table_row_addr`
+// addresses, per Mount::MOUNT_ENTRY_SIZE (8) / MOUNT_MAX (8) /
+// MOUNT_TABLE_BYTES (64) in that file. This function decodes THAT
+// layout. **Flagged for main, matching M1's discrepancy-flagging
+// style:** if a future landing introduces the richer §2.2-style
+// per-mount record as a SEPARATE structure (e.g. a
+// KIND_PDXFS_MOUNT_TABLE write op that mints per-mount metadata
+// distinct from the vnode-mount bookkeeping `_mount_table[]` already
+// serves), this function's decode target will need to change or a
+// second entry point will be needed -- the two record shapes are not
+// interchangeable, mirroring mount_table_row_parse's own
+// singleton-vs-per-entry confirm-with-main note.
+//
+// -----------------------------------------------------------------------------
+// Entry point
+// -----------------------------------------------------------------------------
+//
+//   mount_table_snapshot(row_ptr, out_ptr, out_cap, out_count_ptr) -> u64
+//     rdi = row_ptr        (64-byte KIND_PDXFS_MOUNT_TABLE singleton row,
+//                            same input mount_table_row_parse takes)
+//     rsi = out_ptr        (caller-allocated array of MountTableEntry
+//                            summaries, out_cap * MTE_SUMMARY_BYTES (40)
+//                            bytes)
+//     rdx = out_cap        (max ENTRIES out_ptr can hold -- NOT bytes)
+//     rcx = out_count_ptr  (u64 write target: entries actually written)
+//     rax = LPV_MTS_OK (0) | LPV_MTS_ERR_BAD_MAGIC (1) |
+//           LPV_MTS_ERR_ROW_DEAD (2)
+//
+//   Walks min(mount_slot_count, out_cap) slots UNCONDITIONALLY -- every
+//   slot in range is decoded and written, live (VALID flag set) or
+//   not. This function reports the raw table; filtering by
+//   MTE_OFF_FLAGS & MOUNT_FLAG_VALID (0x01) is the caller's job (a
+//   `df`/`mount`-style CLI wants to see empty slots too, e.g. to
+//   report free mount-table capacity). Status codes 1/2 deliberately
+//   reuse MountTable::LPV_MTR_ERR_BAD_MAGIC / LPV_MTR_ERR_ROW_DEAD's
+//   numeric values -- both functions gate on the exact same singleton
+//   row, so a caller checking "is this row usable at all" sees one
+//   consistent vocabulary across both entry points.
+//
+// This function does NOT call `mount_table_row_parse` -- it inlines
+// the same two gates (kind check, liveness check) directly, because
+// mount_table_row_parse's full 56-byte MountTableRow decode includes
+// fields (flags, gen, reserved_hi) this function does not need, and
+// avoiding the nested call means this function stays a leaf with no
+// stack scratch buffer for an intermediate summary. The duplication is
+// two shift/mask sequences (~10 lines); if a third consumer of the
+// singleton row's gates appears, extracting a shared
+// `mount_table_row_gate` helper becomes worth it.
+//
+// paideia-as encoder notes:
+//   - KIND_PDXFS_MOUNT_TABLE (0x1A5) is staged through r11 before the
+//     `cmp` per kind_pdxfs_mount_table.pdx SECTION 4's own encoder-gap
+//     note (0x100..0x1FF-band KIND-tag constants do not sign-extend
+//     cleanly for `cmp reg, imm`) -- same discipline mount_table.pdx
+//     already follows.
+//   - `and reg, imm` is used directly (0xFFFF, 0xFF) rather than
+//     staging the mask through a second register first -- this mirrors
+//     the majority pattern across the kernel tree (cap_handler_tui_
+//     canvas.pdx, device_cap.pdx, blkdev_cap_request.pdx all `and`
+//     directly against an immediate); mount_table.pdx's own two-step
+//     `mov rdx,imm; and rcx,rdx` form is this repo's only instance of
+//     staging a mask and is not a hard requirement.
+//   - `imul r13, r9, 40` -- three-operand reg,reg,imm form, proven at
+//     kind_color_profile.pdx (`imul r11, r11, 32`, paideia-os).
+//   - No `add reg, [mem]` anywhere. No byte loads (every field is
+//     extracted via shift + mask from a full 8-byte load). No `test`;
+//     every check is `cmp`. Label prefix `lpv_mts_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §2.2, §9.4;
+// src/kernel/core/cap/kind_pdxfs_mount_table.pdx;
+// src/kernel/core/fs/mount.pdx (all paideia-os).
+
+module MountTableSnapshot = structure {
+
+  // Mirrors MountTable::KIND_PDXFS_MOUNT_TABLE (0x1A5) -- duplicated
+  // rather than cross-module-referenced because this codebase has no
+  // precedent for a `pub let` cross-module numeric reference (see
+  // pdxb_superblock.pdx's own header note on the same point, inherited
+  // from the M1 landing).
+  pub let LPV_MTS_KIND_PDXFS_MOUNT_TABLE : u64 = 0x1A5
+
+  // --- Status codes. Deliberately share numeric values with
+  // MountTable::LPV_MTR_OK / LPV_MTR_ERR_BAD_MAGIC / LPV_MTR_ERR_ROW_DEAD
+  // (see module header). ---
+  pub let LPV_MTS_OK             : u64 = 0
+  pub let LPV_MTS_ERR_BAD_MAGIC  : u64 = 1
+  pub let LPV_MTS_ERR_ROW_DEAD   : u64 = 2
+
+  // --- Mount::MOUNT_MAX / MOUNT_ENTRY_SIZE mirrors (informational;
+  // this function trusts the row's own mount_slot_count field, capped
+  // by the caller's out_cap, rather than hard-coding 8). ---
+  pub let LPV_MTS_MOUNT_ENTRY_SIZE : u64 = 8    // bytes per on-disk _mount_table[] slot
+
+  // ==========================================================================
+  // MountTableEntry — in-memory decoded struct this function writes to
+  // out_ptr[i]. 5 u64-aligned slots, 40 bytes, one per caller-allocated
+  // entry. Expands the kernel's packed 8-byte _mount_table[] slot into
+  // full-width slots, matching this library's "every slot a full u64"
+  // convention (PdxbSuperblockSummary, MountTableRow).
+  // ==========================================================================
+  pub let MTE_OFF_MOUNTPOINT_VNODE_IDX : u64 = 0    // slot bits [0,16)
+  pub let MTE_OFF_ROOT_VNODE_IDX       : u64 = 8    // slot bits [16,32)
+  pub let MTE_OFF_BACKEND_TYPE         : u64 = 16   // slot bits [32,40)
+  pub let MTE_OFF_FLAGS                : u64 = 24   // slot bits [40,48)
+  pub let MTE_OFF_RESERVED             : u64 = 32   // slot bits [48,64)
+  pub let MTE_SUMMARY_BYTES            : u64 = 40   // 5 * 8
+
+  // ==========================================================================
+  // mount_table_snapshot(row_ptr, out_ptr, out_cap, out_count_ptr) -> u64
+  //   See module header for the full contract.
+  //
+  // Leaf function: no nested calls, no callee-save register touched
+  // (rax/rcx/rdx/r8..r14 only, all caller-save under SysV) -- no
+  // push/pop needed.
+  // ==========================================================================
+  pub let mount_table_snapshot : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M2-003 (#5): mount_table_snapshot entry point. Gate 1 (kind): mov r8,[rdi+0] (header0); mov r9,r8; and r9,0xFFFF; mov r11,0x1A5 (staged per §4 encoder-gap note); cmp r9,r11; jne bad_magic. Gate 2 (liveness): mov r9,r8; shr r9,56; cmp r9,0; je row_dead. Both gates read only header0 -- identical bit positions to mount_table_row_parse's own gates, deliberately duplicated rather than called (see module header 'does not call mount_table_row_parse' note). Body: mov r8,[rdi+8] (header1); and r8,0xFFFF -> r8=mount_slot_count. mov r12,[rdi+16] -> r12=table_row_addr (base of the live _mount_table[] array). walk_count = min(mount_slot_count, out_cap): cmp r8,rdx; jbe have_count; mov r8,rdx; have_count: r8=walk_count. Store *out_count_ptr = walk_count via mov [rcx+0],r8. Loop i=0..walk_count (r9=i, xor-zeroed): cmp r9,r8; jae done. Compute slot address: mov r13,r9; shl r13,3; add r13,r12; mov r14,[r13+0] -> r14=entry_word (the packed 8-byte _mount_table[] slot). Compute this iteration's output address: imul r13,r9,40 (MTE_SUMMARY_BYTES, three-operand form per kind_color_profile.pdx precedent); add r13,rsi -> r13=&out_ptr[i]. Decode five fields via shift+mask from r14 into r10, each stored at its MTE_OFF_* offset from r13: mountpoint_vnode_idx = r14 & 0xFFFF -> +0; root_vnode_idx = (r14>>16) & 0xFFFF -> +8; backend_type = (r14>>32) & 0xFF -> +16; flags = (r14>>40) & 0xFF -> +24; reserved = (r14>>48) & 0xFFFF -> +32. add r9,1; jmp loop. done: xor rax,rax (LPV_MTS_OK); ret. No `add reg,[mem]` anywhere -- every add is reg,reg or reg,imm. No byte loads -- every field is a shift+mask off a full 8-byte load. No `test`; every check is `cmp reg,imm` or `cmp reg,reg`. Every register used (rax/r8/r9/r10/r11/r12/r13/r14) is caller-save under SysV; leaf, no push/pop. Labels prefixed lpv_mts_.",
+      block: {
+        // ---- Gate 1: kind field must be KIND_PDXFS_MOUNT_TABLE (0x1A5). ----
+        mov r8, [rdi + 0];                // header0
+        mov r9, r8;
+        and r9, 0xFFFF;
+        mov r11, 0x1A5;                   // staged per encoder-gap note
+        cmp r9, r11;
+        jne lpv_mts_bad_magic;
+
+        // ---- Gate 2: row must be live. ----
+        mov r9, r8;
+        shr r9, 56;
+        cmp r9, 0;
+        je  lpv_mts_row_dead;
+
+        // ---- mount_slot_count (header1 bits [15:0]). ----
+        mov r8, [rdi + 8];
+        and r8, 0xFFFF;                   // r8 = mount_slot_count
+
+        // ---- table_row_addr (word 2, verbatim base pointer). ----
+        mov r12, [rdi + 16];
+
+        // ---- walk_count = min(mount_slot_count, out_cap). ----
+        cmp r8, rdx;
+        jbe lpv_mts_have_count;
+        mov r8, rdx;
+      lpv_mts_have_count:
+        // r8 = walk_count
+
+        // ---- *out_count_ptr = walk_count. ----
+        mov [rcx + 0], r8;
+
+        // ---- Walk loop: i = 0 .. walk_count. ----
+        xor r9, r9;                       // i = 0
+      lpv_mts_loop:
+        cmp r9, r8;
+        jae lpv_mts_done;
+
+        // entry_word = _mount_table[i] = *(table_row_addr + i*8)
+        mov r13, r9;
+        shl r13, 3;
+        add r13, r12;
+        mov r14, [r13 + 0];
+
+        // out_entry_ptr = out_ptr + i*40
+        imul r13, r9, 40;
+        add r13, rsi;
+
+        // mountpoint_vnode_idx = entry_word[0,16) -> +0
+        mov r10, r14;
+        and r10, 0xFFFF;
+        mov [r13 + 0], r10;
+
+        // root_vnode_idx = entry_word[16,32) -> +8
+        mov r10, r14;
+        shr r10, 16;
+        and r10, 0xFFFF;
+        mov [r13 + 8], r10;
+
+        // backend_type = entry_word[32,40) -> +16
+        mov r10, r14;
+        shr r10, 32;
+        and r10, 0xFF;
+        mov [r13 + 16], r10;
+
+        // flags = entry_word[40,48) -> +24
+        mov r10, r14;
+        shr r10, 40;
+        and r10, 0xFF;
+        mov [r13 + 24], r10;
+
+        // _reserved = entry_word[48,64) -> +32
+        mov r10, r14;
+        shr r10, 48;
+        and r10, 0xFFFF;
+        mov [r13 + 32], r10;
+
+        add r9, 1;
+        jmp lpv_mts_loop;
+
+      lpv_mts_done:
+        xor rax, rax;                     // LPV_MTS_OK
+        ret;
+
+      lpv_mts_bad_magic:
+        mov rax, 1;                       // LPV_MTS_ERR_BAD_MAGIC
+        ret;
+
+      lpv_mts_row_dead:
+        mov rax, 2;                       // LPV_MTS_ERR_ROW_DEAD
+        ret;
+      }
+    }
+}

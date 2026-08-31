@@ -1,10 +1,13 @@
-// src/vol_kind.pdx — libpdx-volume.M1-001
+// src/vol_kind.pdx — libpdx-volume.M1-001 (scaffold) + M2-004 (#6)
 // VolKind: client-side KIND_VOLUME mint/narrow helpers.
 //
-// Two entry points, matching design/tooling/volume-tooling-ux.md §2.4:
+// Two entry points, matching design/tooling/volume-tooling-ux.md §2.4
+// (vol_kind_narrow's arity grew from two to three args at M2-004 to
+// match this library's out-pointer + status-code convention -- see
+// below):
 //
-//   vol_kind_mint(dev_cap)             -> Cap<KIND_VOLUME> | sentinel
-//   vol_kind_narrow(vol_cap, ops_mask) -> Cap<KIND_VOLUME> | sentinel
+//   vol_kind_mint(dev_cap) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
+//   vol_kind_narrow(cap_slot, requested_ops_mask, out_narrowed_cap_slot) -> u64
 //
 // `vol_kind_mint` is the client-side helper `mount.pdxfs` calls when a
 // probed KIND_BLOCK_DEVICE has a valid PDXB superblock but no
@@ -22,28 +25,83 @@
 // volume-tooling-ux.md §4.1 mental-model paragraph).
 //
 // ================================================================
-// M1 landing: BOTH functions are placeholder stubs. Neither
-// dereferences its argument nor issues a syscall. Real bodies land at
-// libpdx-volume.M2-004 (vol_kind_narrow) and a yet-unscheduled M2 slot
-// for vol_kind_mint (not itemised as its own M2 issue in
-// volume-tooling-ux.md §9.4 — flagged in design/architecture.md §5 as
-// a gap main should confirm before M2 opens).
+// M1 landing: BOTH functions were placeholder stubs.
 //
-// Blocking gap this stub inherits: KIND_VOLUME (kind_volume.pdx) has
-// no ring-3 mint surface today ("No cap-invoke op that reaches
-// kind_volume_mint" per that file's own SECTION 0) and its op table
-// (VOL_OP_QUERY_* + VOL_OP_DEBUG_PRINT, ordinals 0..9) has no `mount`,
-// `flush`, or `snapshot` op the design doc's `ops_mask` parameter
-// narrows against. Real implementations of both functions here are
-// blocked on whichever future R53 kernel landing adds those ops and
-// (for vol_kind_mint) exposes a syscall this library can call through
-// rather than only a kernel-internal primitive.
+// M2-004 landing (this file): `vol_kind_narrow` now has a real body.
+// `vol_kind_mint` remains a stub -- it is not itemised as its own M2
+// issue in volume-tooling-ux.md §9.4 (flagged in design/architecture.md
+// §5) and is additionally blocked on KIND_VOLUME exposing a ring-3-
+// reachable mint syscall, which does not exist today ("No cap-invoke
+// op that reaches kind_volume_mint" per kind_volume.pdx's own
+// SECTION 0).
 //
-// Reserved-label discipline: no labels are needed in either stub body
-// (single straight-line block, no branch) but the file-wide prefix for
-// any future control flow is `lpv_vk_`.
+// -----------------------------------------------------------------------------
+// vol_kind_narrow's real body -- what "narrow" means when there is no
+// kernel-side cap_narrow primitive for KIND_VOLUME
+// -----------------------------------------------------------------------------
 //
-// Upstream: design/tooling/volume-tooling-ux.md §2.4, §9.4 (paideia-os).
+// design/architecture.md §5 (M1 landing) already flagged the gap this
+// issue runs into: `src/kernel/core/cap/kind_volume.pdx`'s op catalog
+// (VOL_OP_*, ordinals 0..9, reproduced below) is query-only -- there is
+// no `mount`, `flush`, or `snapshot` op, and grepping the ENTIRE kernel
+// tree for a generic per-op capability-narrowing primitive
+// (`*_cap_narrow`, `*_narrow_ops`) finds exactly one hit anywhere:
+// `kind_ec_query.pdx`'s `ec_query_row_narrow`, which is NOT a generic
+// primitive -- it clears one bit of a per-row EC-query notify bitmap
+// and has no relationship to KIND_VOLUME or to op-mask narrowing at
+// all. There is no `cap_narrow` syscall this library can call through.
+//
+// Given that, `vol_kind_narrow`'s real body does the ONE thing this
+// library CAN own without a kernel-side derivation surface: it
+// validates `requested_ops_mask` against the known op catalog (bits
+// 0..9, i.e. `requested_ops_mask & ~VK_OPS_VALID_MASK` must be zero)
+// and, on a valid mask, writes `cap_slot` straight through to
+// `*out_narrowed_cap_slot` -- a documented PASSTHROUGH, not a real
+// derivation, because KIND_VOLUME's rights model (R_VOL_READ/WRITE/
+// INVOKE/REVOKE/REFRESH/OBSERVE) gates whole categories of ops, not
+// individual VOL_OP_* ordinals, so there is no kernel-enforced
+// narrower capability a valid ops_mask could actually produce yet.
+// This matches the M2 issue brief's own second remediation option
+// ('do the mask validation locally and return a placeholder narrowed
+// slot') over stubbing outright, because mask validation against a
+// real, frozen op catalog IS a genuine correctness check a caller
+// benefits from today (an out-of-range op request is caught here
+// rather than silently reaching a syscall that would refuse it with a
+// less specific error) even though the SLOT value it hands back is not
+// yet a kernel-narrower capability. **Flagged for main:** when
+// KIND_VOLUME gains a real per-op or per-rights-subset derivation
+// primitive, this function's passthrough line becomes a real call
+// through that primitive; the validation gate and the function
+// signature should not need to change.
+//
+// Reproduced verbatim from kind_volume.pdx (R52.M5-001, paideia-os) --
+// this is the op catalog `requested_ops_mask` is validated against:
+//
+//   VOL_OP_QUERY_DEVICE_SLOT   0
+//   VOL_OP_QUERY_MOUNT_SLOT    1
+//   VOL_OP_QUERY_UUID_LO       2
+//   VOL_OP_QUERY_UUID_HI       3
+//   VOL_OP_QUERY_ROOT_INODE    4
+//   VOL_OP_QUERY_MOUNT_GEN     5
+//   VOL_OP_QUERY_INODE_COUNT   6
+//   VOL_OP_QUERY_FREE_BLOCKS   7
+//   VOL_OP_QUERY_SIG_KEY_SLOT  8
+//   VOL_OP_DEBUG_PRINT         9
+//
+// `requested_ops_mask` is a BITMASK, bit i corresponding to op ordinal
+// i (bit 0 = VOL_OP_QUERY_DEVICE_SLOT ... bit 9 = VOL_OP_DEBUG_PRINT).
+// The only valid bits are 0..9; `VK_OPS_VALID_MASK` (0x3FF) is exactly
+// those ten bits set. A mask of 0 (narrow to no ops at all) is legal.
+//
+// paideia-as encoder notes: no KIND-tag constant is compared here
+// (cap_slot is an opaque caller-supplied integer this library never
+// dereferences as a descriptor), so no r11 staging is needed anywhere
+// in vol_kind_narrow -- VK_OPS_VALID_MASK (0x3FF) is a small immediate,
+// used directly. No `add reg,[mem]`, no byte loads, no `test`. Labels
+// prefixed `lpv_vk_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §2.4, §9.4;
+// src/kernel/core/cap/kind_volume.pdx (paideia-os).
 
 module VolKind = structure {
 
@@ -51,12 +109,32 @@ module VolKind = structure {
   // (paideia-os) SECTION line `pub let KIND_VOLUME : u64 = 0x1A0`.
   pub let KIND_VOLUME : u64 = 0x1A0
 
-  // Sentinel returned by every M1 stub in this module. Deliberately
-  // outside the valid cap-slot range ([0..255], per every kind_*.pdx
-  // mint's own parent-slot bounds check in the kernel tree) so a
-  // caller that forgets this is a stub sees an obviously-invalid slot
-  // rather than a value that could be mistaken for slot 0.
+  // Sentinel returned by the remaining M1 stub (vol_kind_mint) in this
+  // module. Deliberately outside the valid cap-slot range ([0..255],
+  // per every kind_*.pdx mint's own parent-slot bounds check in the
+  // kernel tree) so a caller that forgets this is a stub sees an
+  // obviously-invalid slot rather than a value that could be mistaken
+  // for slot 0.
   pub let LPV_STUB_NOT_IMPLEMENTED : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // --- vol_kind_narrow status codes. ---
+  pub let LPV_VK_OK                  : u64 = 0
+  pub let LPV_VK_ERR_BAD_OPS_MASK    : u64 = 1
+
+  // --- KIND_VOLUME op catalog (kind_volume.pdx VOL_OP_*, ordinals
+  // 0..9, reproduced in the module header). VK_OPS_VALID_MASK has
+  // exactly bits 0..9 set -- the only ops requested_ops_mask may name. ---
+  pub let VK_OP_QUERY_DEVICE_SLOT   : u64 = 0
+  pub let VK_OP_QUERY_MOUNT_SLOT    : u64 = 1
+  pub let VK_OP_QUERY_UUID_LO       : u64 = 2
+  pub let VK_OP_QUERY_UUID_HI       : u64 = 3
+  pub let VK_OP_QUERY_ROOT_INODE    : u64 = 4
+  pub let VK_OP_QUERY_MOUNT_GEN     : u64 = 5
+  pub let VK_OP_QUERY_INODE_COUNT   : u64 = 6
+  pub let VK_OP_QUERY_FREE_BLOCKS   : u64 = 7
+  pub let VK_OP_QUERY_SIG_KEY_SLOT  : u64 = 8
+  pub let VK_OP_DEBUG_PRINT         : u64 = 9
+  pub let VK_OPS_VALID_MASK         : u64 = 0x3FF   // bits 0..9 set
 
   // ============================================================================
   // vol_kind_mint(dev_cap) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
@@ -77,20 +155,50 @@ module VolKind = structure {
     }
 
   // ============================================================================
-  // vol_kind_narrow(vol_cap, ops_mask) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
+  // vol_kind_narrow(cap_slot, requested_ops_mask, out_narrowed_cap_slot) -> u64
+  //   rdi = cap_slot               (caller-held KIND_VOLUME cap slot, opaque)
+  //   rsi = requested_ops_mask     (bitmask, bit i = VOL_OP_* ordinal i)
+  //   rdx = out_narrowed_cap_slot  (u64 write target)
+  //   rax = LPV_VK_OK (0) | LPV_VK_ERR_BAD_OPS_MASK (1)
   //
-  // M1 STUB. Does not dereference vol_cap or ops_mask. Real body lands
-  // at libpdx-volume.M2-004 per design/tooling/volume-tooling-ux.md
-  // §9.4, gated on KIND_VOLUME's op catalog gaining the {mount, flush,
-  // snapshot} ops the design brief's `ops_mask` parameter narrows
-  // against (today's op catalog is query-only; see module header).
+  // M2-004 (#6). See module header for the full "no kernel-side
+  // cap_narrow primitive exists yet" rationale. Validates
+  // requested_ops_mask against VK_OPS_VALID_MASK (bits 0..9); on a
+  // valid mask, writes cap_slot through to *out_narrowed_cap_slot
+  // UNCHANGED (a documented passthrough, not a real derivation) and
+  // returns LPV_VK_OK. On an invalid mask (any bit >= 10 set),
+  // *out_narrowed_cap_slot is left untouched and LPV_VK_ERR_BAD_OPS_MASK
+  // is returned -- matches mount_table_row_parse's "out_ptr untouched
+  // on failure" discipline.
+  //
+  // Leaf function: no nested calls, no callee-save register touched
+  // (rax/r10/r11 only, all caller-save under SysV) -- no push/pop
+  // needed.
   // ============================================================================
-  pub let vol_kind_narrow : (u64, u64) -> u64 !{} @{} =
-    fn (vol_cap: u64) (ops_mask: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-volume.M1-001: vol_kind_narrow scaffold stub. Returns LPV_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, MOVABS load, never compared) without touching vol_cap or ops_mask. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Real body deferred to libpdx-volume.M2-004 (matches R52 op catalog per volume-tooling-ux.md §9.4), itself gated on KIND_VOLUME growing the {mount, flush, snapshot} ops (see module header).",
+  pub let vol_kind_narrow : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (cap_slot: u64) (requested_ops_mask: u64) (out_narrowed_cap_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M2-004 (#6): vol_kind_narrow real body. Gate: mov r10,0x3FF (VK_OPS_VALID_MASK, small immediate, no r11 staging needed -- not a KIND-tag constant); mov r11,r10; mov r10, 0xFFFFFFFFFFFFFFFF (MOVABS all-ones, used to build the complement -- paideia-as has no unary `not` on an immediate directly usable this way, so the complement is built via `xor r10,r11` after r10 is all-ones, giving r10 = ~VK_OPS_VALID_MASK); mov rax, rsi; and rax, r10; cmp rax,0; jne bad_mask (any bit at or above ordinal 10 set is a refusal). On a valid mask: mov [rdx+0], rdi (passthrough store of cap_slot into *out_narrowed_cap_slot); xor rax,rax (LPV_VK_OK); ret. bad_mask: mov rax,1 (LPV_VK_ERR_BAD_OPS_MASK); ret -- out_narrowed_cap_slot untouched. No `add reg,[mem]` anywhere. No byte loads. No `test`; the only check is `cmp reg,imm`. Labels prefixed lpv_vk_.",
       block: {
-        mov rax, 0xFFFFFFFFFFFFFFFF;
+        // ---- Gate: requested_ops_mask must be a subset of the
+        //      known op catalog (bits 0..9, VK_OPS_VALID_MASK = 0x3FF). ----
+        mov r10, 0x3FF;                  // VK_OPS_VALID_MASK
+        mov r11, r10;                    // r11 = VK_OPS_VALID_MASK (preserved)
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // all-ones
+        xor r10, r11;                    // r10 = ~VK_OPS_VALID_MASK
+
+        mov rax, rsi;                    // requested_ops_mask
+        and rax, r10;                    // rax = out-of-catalog bits, if any
+        cmp rax, 0;
+        jne lpv_vk_bad_mask;
+
+        // ---- Valid mask: passthrough cap_slot to *out_narrowed_cap_slot. ----
+        mov [rdx + 0], rdi;
+        xor rax, rax;                    // LPV_VK_OK
+        ret;
+
+      lpv_vk_bad_mask:
+        mov rax, 1;                      // LPV_VK_ERR_BAD_OPS_MASK
         ret;
       }
     }

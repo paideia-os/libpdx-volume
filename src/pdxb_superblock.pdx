@@ -1,4 +1,4 @@
-// src/pdxb_superblock.pdx — libpdx-volume.M1-001
+// src/pdxb_superblock.pdx — libpdx-volume.M1-001 (scaffold) + M2-001/M2-002
 // PdxbSuperblock: read-only parser + inverse encoder for the PDXB
 // v1 on-disk superblock (LBA 0, exactly 4096 bytes).
 //
@@ -7,47 +7,93 @@
 // constants below (SBS_OFF_*) are this library's OWN in-memory decoded
 // struct (`PdxbSuperblockSummary`), not the on-disk byte offsets --
 // see design/architecture.md §3 in this repo for the full field-by-
-// field mapping between the two.
+// field mapping between the two. The on-disk offset table is ALSO
+// reproduced (with byte-identical field order) in
+// src/tools/mkfs-pdxb/main.pdx (paideia-os repo, R53.M1-001) which
+// this parser's/encoder's offsets were cross-checked against --
+// mkfs-pdxb writes exactly the layout this file reads back.
 //
 // Two entry points:
 //
 //   pdxb_parse_superblock(buf_ptr, buf_len, out_ptr) -> u64
 //     Reads up to 4096 bytes at buf_ptr, decodes the fixed-field
 //     region (on-disk bytes [0, 160)) into a PdxbSuperblockSummary at
-//     out_ptr, returns PDXB_OK (0) or a future PDXB_ERR_* code.
+//     out_ptr, returns PDXB_OK (0) or a PDXB_ERR_* code (see below).
 //     paideia-as functions return a single u64 register, so the
 //     "-> PdxbSuperblockSummary" shape design/tooling/volume-tooling-
 //     ux.md §2.4 sketches becomes an out-parameter + status-code pair
 //     here, matching the (row_ptr, out_ptr) -> u64 shape
 //     mount_table_row_parse (src/mount_table.pdx) already uses and the
-//     kernel's own kind_*.pdx row-accessor convention. Flagged for
-//     main to confirm in the M1-001 report.
+//     kernel's own kind_*.pdx row-accessor convention.
 //
 //   pdxb_encode_superblock(sb_ptr, out_ptr, out_len) -> u64
 //     Inverse of the parser: encodes a PdxbSuperblockSummary at sb_ptr
 //     into a 4096-byte on-disk buffer at out_ptr (caller-checked
-//     out_len >= 4096). Signature matches the literal shape given in
-//     the M1 issue brief.
+//     out_len >= 4096). Zero-fills the ENTIRE 4096-byte output first
+//     (a single 512-iteration qword loop) so every byte this function
+//     does not explicitly stamp -- `_reserved` [160,696) and `sig`
+//     [696,4096) -- is deterministically zero, then overlays the real
+//     fields on top. Returns out_len on success, a sentinel on
+//     failure (out_len too small).
 //
 // ================================================================
-// M1 landing: BOTH functions are placeholder stubs.
+// M2-001/M2-002 landing (this file): BOTH functions now have real
+// bodies. Every offset in volume-fs-substrate.md §2.1 is decoded /
+// encoded; `_reserved` and `sig` are never decoded into the summary
+// (see §3 rationale below, unchanged from M1) but ARE deterministically
+// zeroed by the encoder.
 //
-//   pdxb_parse_superblock zeroes the 176-byte PdxbSuperblockSummary at
-//   out_ptr and returns PDXB_OK unconditionally -- it does not read
-//   buf_ptr at all yet. Real field-by-field decode (every offset in
-//   volume-fs-substrate.md §2.1) lands at libpdx-volume.M2-001.
+// Validation gates `pdxb_parse_superblock` enforces (all four, matching
+// this issue's "invalid magic/version/checksum" contract mapped onto
+// the fields that actually exist on-disk -- see design/architecture.md
+// §3.1 for why there is no on-disk checksum field to gate on):
+//   1. buf_len >= PDXB_SB_BYTES (4096)     -> PDXB_ERR_BUF_TOO_SHORT
+//   2. magic  == PDXB_MAGIC ("PDXB")       -> PDXB_ERR_BAD_MAGIC
+//   3. version == PDXB_VERSION_V1 (1)      -> PDXB_ERR_BAD_VERSION
+//   4. block_size == PDXB_BLOCK_SIZE (4096)-> PDXB_ERR_BAD_BLOCK_SIZE
+// Gate 2 does not separately special-case the PDXL magic (0x4C584450)
+// -- a PDXL block simply fails gate 2 with PDXB_ERR_BAD_MAGIC like any
+// other non-PDXB magic. Distinguishing "PDXL, suggest --upgrade" from
+// "garbage" remains mkfs.pdxfs's own refusal-gate/UX concern (design/
+// tooling/volume-tooling-ux.md §3.3), not this library's -- this
+// parser only reports pass/fail, not a diagnosis. `_reserved` being
+// nonzero ("indicates a from-the-future superblock" per §2.1's own
+// discipline note) is NOT gated here -- flagged in design/architecture.md
+// §3.1 as a scope call main should confirm; the 536-byte region is
+// cheap to scan but doing so changes this parser from "decode" to
+// "decode + forward-compat refusal policy", which the design doc
+// assigns to the mount path, not the codec.
 //
-//   pdxb_encode_superblock returns PDXB_OK (0) unconditionally and
-//   writes nothing to out_ptr. Real body (the inverse of the parser,
-//   canonical byte layout) lands at libpdx-volume.M2-002.
+// On any gate failure, `pdxb_parse_superblock` writes NOTHING to
+// out_ptr (matches mount_table_row_parse's failure discipline: a
+// caller must check the return code before trusting *out_ptr).
 //
-// Neither stub validates `magic` (0x42584450 "PDXB" vs 0x4C584450
-// "PDXL") -- that refusal-gate logic belongs to mkfs.pdxfs's own
-// non-blank-target check (design/tooling/volume-tooling-ux.md §3.3),
-// which calls this parser but owns the gate policy itself.
+// paideia-as encoder notes for this file:
+//   - PDXB_MAGIC (0x42584450) and PDXL_MAGIC (0x4C584450) both fit
+//     the imm32 sign-extend bound (< 0x7FFFFFFF) for `cmp reg, imm`
+//     directly -- no r11 staging needed. This mirrors
+//     nvme_reliability.pdx's "NSSR magic (0x4E564D65) fits imm32"
+//     precedent (paideia-os repo): the r11-staging requirement
+//     documented elsewhere in this codebase is specific to KIND-TAG
+//     constants in the 0x100..0x1FF band (see kind_inode_handle.pdx
+//     SECTION 4 in paideia-os), not a general rule about immediate
+//     magnitude. Neither magic value nor 1 (version) nor 4096
+//     (block_size) is a KIND tag, so none needs staging.
+//   - u32 on-disk fields (magic, version, block_size, flags) are
+//     loaded/stored via `mov_d` (sized 32-bit form; zero-extends on
+//     load, per this codebase's G1 sized-store/load discipline --
+//     see kind_blkdev.pdx / ioapic.pdx for identical usage). u64
+//     on-disk fields are loaded/stored via plain `mov`.
+//   - No `add reg, [mem]` anywhere: every field extract/store is a
+//     `mov` load followed by a `mov` store, or a `cmp`/`mov_d` against
+//     an immediate. No byte loads (no field is sub-4-byte here), so
+//     the mov_b zero-extend pattern does not apply.
+//   - No `test` instruction; every zero/equality check is `cmp`.
+//   - Label prefixes: `pdxb_ps_` (parse), `pdxb_es_` (encode).
 //
 // Upstream: design/tooling/volume-tooling-ux.md §2.4, §9.4;
-// design/filesystem/volume-fs-substrate.md §2.1 (both paideia-os).
+// design/filesystem/volume-fs-substrate.md §2.1 (both paideia-os);
+// src/tools/mkfs-pdxb/main.pdx (paideia-os, offset cross-check).
 
 module PdxbSuperblock = structure {
 
@@ -55,11 +101,50 @@ module PdxbSuperblock = structure {
   pub let PDXB_MAGIC : u64 = 0x42584450   // "PDXB" -- PdxFS block-backed v1
   pub let PDXL_MAGIC : u64 = 0x4C584450   // "PDXL" -- R25 lite-format (refuse + suggest --upgrade)
 
+  // --- On-disk version + block-size constants (volume-fs-substrate.md §2.1). ---
+  pub let PDXB_VERSION_V1  : u64 = 1
+  pub let PDXB_BLOCK_SIZE  : u64 = 4096
+
   // --- Status codes. 0 = OK, matching every other module in this repo. ---
-  pub let PDXB_OK : u64 = 0
+  pub let PDXB_OK                  : u64 = 0
+  pub let PDXB_ERR_BUF_TOO_SHORT   : u64 = 1
+  pub let PDXB_ERR_BAD_MAGIC       : u64 = 2
+  pub let PDXB_ERR_BAD_VERSION     : u64 = 3
+  pub let PDXB_ERR_BAD_BLOCK_SIZE  : u64 = 4
+
+  // --- pdxb_encode_superblock failure sentinel (out_len too small). ---
+  // Deliberately outside any legal out_len a caller would pass for a
+  // 4096-byte-fixed on-disk format, matching LPV_STUB_NOT_IMPLEMENTED's
+  // "obviously invalid" posture in src/vol_kind.pdx.
+  pub let PDXB_ENC_ERR_BUF_TOO_SHORT : u64 = 0xFFFFFFFFFFFFFFFF
 
   // --- On-disk superblock size (volume-fs-substrate.md §2.1 "Total"). ---
   pub let PDXB_SB_BYTES : u64 = 4096
+
+  // --- On-disk byte offsets (volume-fs-substrate.md §2.1). All widths
+  // in bytes; u32 fields use `mov_d`, u64 fields use plain `mov`. ---
+  pub let PDXB_D_OFF_MAGIC          : u64 = 0     // u32
+  pub let PDXB_D_OFF_VERSION        : u64 = 4     // u32
+  pub let PDXB_D_OFF_UUID           : u64 = 8     // u8[16] -> two u64 halves at 8, 16
+  pub let PDXB_D_OFF_BLOCK_SIZE     : u64 = 24    // u32
+  pub let PDXB_D_OFF_FLAGS          : u64 = 28    // u32
+  pub let PDXB_D_OFF_TOTAL_BLOCKS   : u64 = 32    // u64
+  pub let PDXB_D_OFF_ITABLE_LBA     : u64 = 40    // u64
+  pub let PDXB_D_OFF_ITABLE_BCOUNT  : u64 = 48    // u64
+  pub let PDXB_D_OFF_ALLOC_LBA      : u64 = 56    // u64
+  pub let PDXB_D_OFF_ALLOC_BCOUNT   : u64 = 64    // u64
+  pub let PDXB_D_OFF_JOURNAL_LBA    : u64 = 72    // u64
+  pub let PDXB_D_OFF_JOURNAL_BCOUNT : u64 = 80    // u64
+  pub let PDXB_D_OFF_DATA_LBA       : u64 = 88    // u64
+  pub let PDXB_D_OFF_DATA_BCOUNT    : u64 = 96    // u64
+  pub let PDXB_D_OFF_ROOT_INODE     : u64 = 104   // u64
+  pub let PDXB_D_OFF_MOUNT_GEN      : u64 = 112   // u64
+  pub let PDXB_D_OFF_SNAP_HEAD      : u64 = 120   // u64
+  pub let PDXB_D_OFF_SIG_KEY_HASH   : u64 = 128   // u8[32] -> four u64 words at 128,136,144,152
+  pub let PDXB_D_OFF_RESERVED       : u64 = 160   // u8[536], never decoded/encoded field-wise
+  pub let PDXB_D_RESERVED_BYTES     : u64 = 536
+  pub let PDXB_D_OFF_SIG            : u64 = 696   // u8[3400], never decoded/encoded field-wise
+  pub let PDXB_D_SIG_BYTES          : u64 = 3400
 
   // ==========================================================================
   // PdxbSuperblockSummary — in-memory decoded struct this library
@@ -72,8 +157,7 @@ module PdxbSuperblock = structure {
   // hash) rather than packed sub-8-byte regions -- this is an
   // in-memory convenience layout, NOT the wire format. The `_reserved`
   // (536 B) and `sig` (3400 B) on-disk regions are NOT decoded into
-  // the summary; they carry no fields a consumer needs before M3
-  // signing support lands. See design/architecture.md §3 for the full
+  // the summary -- see design/architecture.md §3 for the full
   // on-disk-offset <-> summary-offset table.
   // ==========================================================================
   pub let SBS_OFF_MAGIC          : u64 = 0     // on-disk [0,4)   magic
@@ -97,49 +181,273 @@ module PdxbSuperblock = structure {
   pub let SBS_OFF_SIG_KEY_HASH   : u64 = 144   // on-disk [128,160) sig_key_hash[32] -> 4 slots (144,152,160,168)
   pub let SB_SUMMARY_BYTES       : u64 = 176   // 22 * 8
 
-  // Number of 8-byte slots the zero-fill / (future) decode loop walks.
+  // Number of 8-byte slots the zero-fill / decode loop walks.
   pub let SB_SUMMARY_SLOTS       : u64 = 22
 
   // ==========================================================================
-  // pdxb_parse_superblock(buf_ptr, buf_len, out_ptr) -> PDXB_OK
+  // pdxb_parse_superblock(buf_ptr, buf_len, out_ptr) -> PDXB_OK | PDXB_ERR_*
+  //   rdi = buf_ptr   (>= 4096 readable bytes, on-disk superblock image)
+  //   rsi = buf_len    (caller-declared readable length at buf_ptr)
+  //   rdx = out_ptr    (176-byte PdxbSuperblockSummary write target)
   //
-  // M1 STUB. Zeroes the 176-byte PdxbSuperblockSummary at out_ptr and
-  // returns PDXB_OK (0) unconditionally. Does not read buf_ptr / check
-  // buf_len against PDXB_SB_BYTES. Real field-by-field decode (every
-  // offset in volume-fs-substrate.md §2.1, magic/reserved validation)
-  // lands at libpdx-volume.M2-001.
+  // Gate order: buf_len, magic, version, block_size (see module header
+  // for the full contract). On any gate failure, out_ptr is untouched
+  // and the corresponding PDXB_ERR_* code is returned. On success,
+  // every SBS_OFF_* slot is populated and PDXB_OK (0) is returned.
+  //
+  // Leaf function: no nested calls, no callee-save register touched
+  // (rax/rcx/rdx/r8/r9/r10/r11 only, all caller-save under SysV) -- no
+  // push/pop needed. rdi/rsi/rdx (the three SysV args) are read-only
+  // throughout except rdx, which is reused as the summary write
+  // pointer after the three gates pass (its original value, out_ptr,
+  // is exactly what it needs to be for every store). Register plan:
+  // rax = per-field scratch load, r8 = out_ptr copy used once rdx's
+  // gate role is done (kept for clarity even though rdx itself is
+  // never clobbered before the gates complete).
   // ==========================================================================
   pub let pdxb_parse_superblock : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (buf_ptr: u64) (buf_len: u64) (out_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-volume.M1-001: pdxb_parse_superblock scaffold stub. Zeroes SB_SUMMARY_SLOTS (22) consecutive u64 slots at out_ptr (rdx) via a bounded counting loop -- `mov [rdx + rcx*8], rax` with rax pre-zeroed once via xor, rcx the slot index, terminating on `cmp rcx, 22; jb`. Does not dereference buf_ptr (rdi) or buf_len (rsi) at all; both are accepted-but-unused at this landing (real decode lands at M2-001). No `add reg,[mem]` anywhere -- the loop only stores, never loads through an added memory operand. Label prefix `lpv_sbs_`. Effects `!{mem} @{}` -- pure .bss-adjacent write through a caller-supplied pointer, no syscall, no cap.",
+      justification: "libpdx-volume.M2-001 (#3): pdxb_parse_superblock real body. Four sequential gates, each an early return on failure with out_ptr left untouched: (1) cmp rsi,4096 (PDXB_SB_BYTES); jb too_short. (2) mov_d rax,[rdi+0] (zero-extended u32 magic load); cmp rax,0x42584450 (PDXB_MAGIC -- fits the imm32 sign-extend bound directly, not a KIND-tag constant so no r11 staging per the module-header encoder note); jne bad_magic. (3) mov_d rax,[rdi+4]; cmp rax,1 (PDXB_VERSION_V1); jne bad_version. (4) mov_d rax,[rdi+24]; cmp rax,4096 (PDXB_BLOCK_SIZE); jne bad_block_size. On all four gates passing, decode all 22 SBS_OFF_* slots: four mov_d-sourced u32 fields (magic, version, block_size, flags) each zero-extended into rax then stored via plain `mov [rdx+N],rax` (mov_d only needed on the LOAD side since paideia-as mov already zero-extends a dword load into the full register per SDM Vol 2A -- the STORE side always writes a full 8-byte summary slot), and sixteen plain-mov u64 fields (uuid_lo/hi, total_blocks, itable_lba/bcount, alloc_lba/bcount, journal_lba/bcount, data_lba/bcount, root_inode, mount_gen, snap_head, and four sig_key_hash words) each a direct `mov rax,[rdi+D]; mov [rdx+S],rax` pair at the on-disk offset D (PDXB_D_OFF_*) and summary offset S (SBS_OFF_*) documented in the module header table. No `add reg,[mem]` anywhere -- every operation is mov/mov_d/cmp against a register or immediate. No byte loads (nothing sub-4-byte). No `test`; every check is `cmp reg,imm`. Labels prefixed pdxb_ps_.",
       block: {
-        xor rax, rax;
-        xor rcx, rcx;
-      lpv_sbs_zero_loop:
-        mov [rdx + rcx * 8], rax;
-        add rcx, 1;
-        cmp rcx, 22;
-        jb  lpv_sbs_zero_loop;
+        // ---- Gate 1: buf_len must cover the full fixed-size block. ----
+        cmp rsi, 4096;
+        jb  pdxb_ps_too_short;
+
+        // ---- Gate 2: magic. ----
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x42584450;
+        jne pdxb_ps_bad_magic;
+
+        // ---- Gate 3: version. ----
+        mov_d rax, [rdi + 4];
+        cmp rax, 1;
+        jne pdxb_ps_bad_version;
+
+        // ---- Gate 4: block_size. ----
+        mov_d rax, [rdi + 24];
+        cmp rax, 4096;
+        jne pdxb_ps_bad_block_size;
+
+        // ---- Decode. All four gates passed; rdx is the out_ptr. ----
+
+        // magic -> +0
+        mov_d rax, [rdi + 0];
+        mov [rdx + 0], rax;
+
+        // version -> +8
+        mov_d rax, [rdi + 4];
+        mov [rdx + 8], rax;
+
+        // uuid_lo -> +16, uuid_hi -> +24
+        mov rax, [rdi + 8];
+        mov [rdx + 16], rax;
+        mov rax, [rdi + 16];
+        mov [rdx + 24], rax;
+
+        // block_size -> +32
+        mov_d rax, [rdi + 24];
+        mov [rdx + 32], rax;
+
+        // flags -> +40
+        mov_d rax, [rdi + 28];
+        mov [rdx + 40], rax;
+
+        // total_blocks -> +48
+        mov rax, [rdi + 32];
+        mov [rdx + 48], rax;
+
+        // itable_lba -> +56, itable_bcount -> +64
+        mov rax, [rdi + 40];
+        mov [rdx + 56], rax;
+        mov rax, [rdi + 48];
+        mov [rdx + 64], rax;
+
+        // alloc_lba -> +72, alloc_bcount -> +80
+        mov rax, [rdi + 56];
+        mov [rdx + 72], rax;
+        mov rax, [rdi + 64];
+        mov [rdx + 80], rax;
+
+        // journal_lba -> +88, journal_bcount -> +96
+        mov rax, [rdi + 72];
+        mov [rdx + 88], rax;
+        mov rax, [rdi + 80];
+        mov [rdx + 96], rax;
+
+        // data_lba -> +104, data_bcount -> +112
+        mov rax, [rdi + 88];
+        mov [rdx + 104], rax;
+        mov rax, [rdi + 96];
+        mov [rdx + 112], rax;
+
+        // root_inode -> +120
+        mov rax, [rdi + 104];
+        mov [rdx + 120], rax;
+
+        // mount_gen -> +128
+        mov rax, [rdi + 112];
+        mov [rdx + 128], rax;
+
+        // snap_head -> +136
+        mov rax, [rdi + 120];
+        mov [rdx + 136], rax;
+
+        // sig_key_hash[0..8)  -> +144
+        mov rax, [rdi + 128];
+        mov [rdx + 144], rax;
+        // sig_key_hash[8..16) -> +152
+        mov rax, [rdi + 136];
+        mov [rdx + 152], rax;
+        // sig_key_hash[16..24) -> +160
+        mov rax, [rdi + 144];
+        mov [rdx + 160], rax;
+        // sig_key_hash[24..32) -> +168
+        mov rax, [rdi + 152];
+        mov [rdx + 168], rax;
 
         xor rax, rax;                    // PDXB_OK
+        ret;
+
+      pdxb_ps_too_short:
+        mov rax, 1;                      // PDXB_ERR_BUF_TOO_SHORT
+        ret;
+
+      pdxb_ps_bad_magic:
+        mov rax, 2;                      // PDXB_ERR_BAD_MAGIC
+        ret;
+
+      pdxb_ps_bad_version:
+        mov rax, 3;                      // PDXB_ERR_BAD_VERSION
+        ret;
+
+      pdxb_ps_bad_block_size:
+        mov rax, 4;                      // PDXB_ERR_BAD_BLOCK_SIZE
         ret;
       }
     }
 
   // ==========================================================================
-  // pdxb_encode_superblock(sb_ptr, out_ptr, out_len) -> PDXB_OK
+  // pdxb_encode_superblock(sb_ptr, out_ptr, out_len) -> out_len | PDXB_ENC_ERR_BUF_TOO_SHORT
+  //   rdi = sb_ptr   (176-byte PdxbSuperblockSummary, SBS_OFF_* layout)
+  //   rsi = out_ptr  (>= 4096-byte writable on-disk buffer)
+  //   rdx = out_len  (caller-declared writable length at out_ptr)
   //
-  // M1 STUB. Writes nothing; returns PDXB_OK (0) unconditionally. Real
-  // body (inverse of the parser, canonical on-disk byte layout,
-  // out_len >= PDXB_SB_BYTES gate) lands at libpdx-volume.M2-002.
+  // Gate: out_len >= PDXB_SB_BYTES (4096), else returns
+  // PDXB_ENC_ERR_BUF_TOO_SHORT (0xFFFFFFFFFFFFFFFF) without touching
+  // out_ptr at all.
+  //
+  // Body: zero-fills the full 4096 bytes at out_ptr first (a bounded
+  // 512-iteration qword-store loop -- 4096 / 8 = 512), which makes
+  // `_reserved` [160,696) and `sig` [696,4096) deterministically zero
+  // without a second, narrower loop; then overlays the eighteen real
+  // fields (four u32 via mov_d, fourteen u64 via plain mov) at their
+  // PDXB_D_OFF_* on-disk offsets, reading each from sb_ptr's matching
+  // SBS_OFF_* slot. Returns out_len (the caller's original third
+  // argument, still live in rdx) on success.
+  //
+  // Leaf function: no nested calls. Register plan: rax = zero-fill
+  // value then per-field scratch, rcx = zero-fill loop counter,
+  // rdi/rsi/rdx = the three SysV args, read-only throughout (rdx is
+  // returned verbatim in rax at the end, never overwritten).
   // ==========================================================================
-  pub let pdxb_encode_superblock : (u64, u64, u64) -> u64 !{} @{} =
+  pub let pdxb_encode_superblock : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (sb_ptr: u64) (out_ptr: u64) (out_len: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-volume.M1-001: pdxb_encode_superblock scaffold stub. Touches none of sb_ptr/out_ptr/out_len; returns PDXB_OK (0) unconditionally. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Real body deferred to libpdx-volume.M2-002.",
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M2-002 (#4): pdxb_encode_superblock real body, the inverse of pdxb_parse_superblock. Gate: cmp rdx,4096 (PDXB_SB_BYTES); jb too_short -- returns PDXB_ENC_ERR_BUF_TOO_SHORT (0xFFFFFFFFFFFFFFFF, MOVABS load) without writing anything. Body: (1) zero-fill: xor rax,rax; xor rcx,rcx; loop `mov [rsi+rcx*8],rax; add rcx,1; cmp rcx,512; jb loop` -- 512*8=4096, covers the ENTIRE output buffer including `_reserved` and `sig`, which this function never stamps field-wise (matches the module-header rationale: one bounded loop is simpler and more obviously-correct than tracking two separate reserved-region bounds). (2) overlay eighteen real fields, each a `mov rax,[rdi+S]` load from the summary at SBS_OFF_* offset S followed by a store at the on-disk PDXB_D_OFF_* offset D -- `mov_d [rsi+D],rax` for the four u32 fields (magic, version, block_size, flags; mov_d truncates the store to 4 bytes per this codebase's G1 sized-store discipline, matching kind_blkdev.pdx's mov_d usage) and plain `mov [rsi+D],rax` for the fourteen u64 fields (uuid_lo/hi, total_blocks, itable_lba/bcount, alloc_lba/bcount, journal_lba/bcount, data_lba/bcount, root_inode, mount_gen, snap_head, four sig_key_hash words). (3) `mov rax,rdx; ret` -- returns out_len verbatim (rdx was never clobbered by the zero-fill loop, which only touches rax/rcx/rsi-indexed memory). No `add reg,[mem]` anywhere. No byte loads. No `test`; the only comparisons are the entry gate and the loop bound, both `cmp reg,imm`. Labels prefixed pdxb_es_.",
       block: {
+        // ---- Gate: out_len must be able to hold the full block. ----
+        cmp rdx, 4096;
+        jb  pdxb_es_too_short;
+
+        // ---- Zero-fill the entire 4096-byte output buffer. ----
         xor rax, rax;
+        xor rcx, rcx;
+      pdxb_es_zero_loop:
+        mov [rsi + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jb  pdxb_es_zero_loop;
+
+        // ---- Overlay real fields. ----
+
+        // magic <- +0
+        mov rax, [rdi + 0];
+        mov_d [rsi + 0], rax;
+
+        // version <- +8
+        mov rax, [rdi + 8];
+        mov_d [rsi + 4], rax;
+
+        // uuid_lo <- +16, uuid_hi <- +24
+        mov rax, [rdi + 16];
+        mov [rsi + 8], rax;
+        mov rax, [rdi + 24];
+        mov [rsi + 16], rax;
+
+        // block_size <- +32
+        mov rax, [rdi + 32];
+        mov_d [rsi + 24], rax;
+
+        // flags <- +40
+        mov rax, [rdi + 40];
+        mov_d [rsi + 28], rax;
+
+        // total_blocks <- +48
+        mov rax, [rdi + 48];
+        mov [rsi + 32], rax;
+
+        // itable_lba <- +56, itable_bcount <- +64
+        mov rax, [rdi + 56];
+        mov [rsi + 40], rax;
+        mov rax, [rdi + 64];
+        mov [rsi + 48], rax;
+
+        // alloc_lba <- +72, alloc_bcount <- +80
+        mov rax, [rdi + 72];
+        mov [rsi + 56], rax;
+        mov rax, [rdi + 80];
+        mov [rsi + 64], rax;
+
+        // journal_lba <- +88, journal_bcount <- +96
+        mov rax, [rdi + 88];
+        mov [rsi + 72], rax;
+        mov rax, [rdi + 96];
+        mov [rsi + 80], rax;
+
+        // data_lba <- +104, data_bcount <- +112
+        mov rax, [rdi + 104];
+        mov [rsi + 88], rax;
+        mov rax, [rdi + 112];
+        mov [rsi + 96], rax;
+
+        // root_inode <- +120
+        mov rax, [rdi + 120];
+        mov [rsi + 104], rax;
+
+        // mount_gen <- +128
+        mov rax, [rdi + 128];
+        mov [rsi + 112], rax;
+
+        // snap_head <- +136
+        mov rax, [rdi + 136];
+        mov [rsi + 120], rax;
+
+        // sig_key_hash words <- +144, +152, +160, +168
+        mov rax, [rdi + 144];
+        mov [rsi + 128], rax;
+        mov rax, [rdi + 152];
+        mov [rsi + 136], rax;
+        mov rax, [rdi + 160];
+        mov [rsi + 144], rax;
+        mov rax, [rdi + 168];
+        mov [rsi + 152], rax;
+
+        mov rax, rdx;                    // return out_len
+        ret;
+
+      pdxb_es_too_short:
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_ENC_ERR_BUF_TOO_SHORT
         ret;
       }
     }
