@@ -1,0 +1,146 @@
+// src/pdxb_superblock.pdx — libpdx-volume.M1-001
+// PdxbSuperblock: read-only parser + inverse encoder for the PDXB
+// v1 on-disk superblock (LBA 0, exactly 4096 bytes).
+//
+// Wire layout is frozen at design/filesystem/volume-fs-substrate.md
+// §2.1 in paideia-os (R52). That table is authoritative; the offset
+// constants below (SBS_OFF_*) are this library's OWN in-memory decoded
+// struct (`PdxbSuperblockSummary`), not the on-disk byte offsets --
+// see design/architecture.md §3 in this repo for the full field-by-
+// field mapping between the two.
+//
+// Two entry points:
+//
+//   pdxb_parse_superblock(buf_ptr, buf_len, out_ptr) -> u64
+//     Reads up to 4096 bytes at buf_ptr, decodes the fixed-field
+//     region (on-disk bytes [0, 160)) into a PdxbSuperblockSummary at
+//     out_ptr, returns PDXB_OK (0) or a future PDXB_ERR_* code.
+//     paideia-as functions return a single u64 register, so the
+//     "-> PdxbSuperblockSummary" shape design/tooling/volume-tooling-
+//     ux.md §2.4 sketches becomes an out-parameter + status-code pair
+//     here, matching the (row_ptr, out_ptr) -> u64 shape
+//     mount_table_row_parse (src/mount_table.pdx) already uses and the
+//     kernel's own kind_*.pdx row-accessor convention. Flagged for
+//     main to confirm in the M1-001 report.
+//
+//   pdxb_encode_superblock(sb_ptr, out_ptr, out_len) -> u64
+//     Inverse of the parser: encodes a PdxbSuperblockSummary at sb_ptr
+//     into a 4096-byte on-disk buffer at out_ptr (caller-checked
+//     out_len >= 4096). Signature matches the literal shape given in
+//     the M1 issue brief.
+//
+// ================================================================
+// M1 landing: BOTH functions are placeholder stubs.
+//
+//   pdxb_parse_superblock zeroes the 176-byte PdxbSuperblockSummary at
+//   out_ptr and returns PDXB_OK unconditionally -- it does not read
+//   buf_ptr at all yet. Real field-by-field decode (every offset in
+//   volume-fs-substrate.md §2.1) lands at libpdx-volume.M2-001.
+//
+//   pdxb_encode_superblock returns PDXB_OK (0) unconditionally and
+//   writes nothing to out_ptr. Real body (the inverse of the parser,
+//   canonical byte layout) lands at libpdx-volume.M2-002.
+//
+// Neither stub validates `magic` (0x42584450 "PDXB" vs 0x4C584450
+// "PDXL") -- that refusal-gate logic belongs to mkfs.pdxfs's own
+// non-blank-target check (design/tooling/volume-tooling-ux.md §3.3),
+// which calls this parser but owns the gate policy itself.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §2.4, §9.4;
+// design/filesystem/volume-fs-substrate.md §2.1 (both paideia-os).
+
+module PdxbSuperblock = structure {
+
+  // --- On-disk magic constants (volume-fs-substrate.md §2.1, §3.3). ---
+  pub let PDXB_MAGIC : u64 = 0x42584450   // "PDXB" -- PdxFS block-backed v1
+  pub let PDXL_MAGIC : u64 = 0x4C584450   // "PDXL" -- R25 lite-format (refuse + suggest --upgrade)
+
+  // --- Status codes. 0 = OK, matching every other module in this repo. ---
+  pub let PDXB_OK : u64 = 0
+
+  // --- On-disk superblock size (volume-fs-substrate.md §2.1 "Total"). ---
+  pub let PDXB_SB_BYTES : u64 = 4096
+
+  // ==========================================================================
+  // PdxbSuperblockSummary — in-memory decoded struct this library
+  // reads/writes via (out_ptr / sb_ptr) + these offset constants.
+  // 22 u64-aligned slots, 176 bytes. Field ORDER and WIDTH mirror
+  // volume-fs-substrate.md §2.1's on-disk table exactly (down to
+  // preserving each field's relative position) except that odd-sized
+  // on-disk fields (uuid[16], sig_key_hash[32]) are split into
+  // consecutive 8-byte slots (LO/HI, or four slots for the 32-byte
+  // hash) rather than packed sub-8-byte regions -- this is an
+  // in-memory convenience layout, NOT the wire format. The `_reserved`
+  // (536 B) and `sig` (3400 B) on-disk regions are NOT decoded into
+  // the summary; they carry no fields a consumer needs before M3
+  // signing support lands. See design/architecture.md §3 for the full
+  // on-disk-offset <-> summary-offset table.
+  // ==========================================================================
+  pub let SBS_OFF_MAGIC          : u64 = 0     // on-disk [0,4)   magic
+  pub let SBS_OFF_VERSION        : u64 = 8     // on-disk [4,8)   version
+  pub let SBS_OFF_UUID_LO        : u64 = 16    // on-disk [8,16)  uuid[0..8]
+  pub let SBS_OFF_UUID_HI        : u64 = 24    // on-disk [16,24) uuid[8..16]
+  pub let SBS_OFF_BLOCK_SIZE     : u64 = 32    // on-disk [24,28) block_size
+  pub let SBS_OFF_FLAGS          : u64 = 40    // on-disk [28,32) flags
+  pub let SBS_OFF_TOTAL_BLOCKS   : u64 = 48    // on-disk [32,40) total_blocks
+  pub let SBS_OFF_ITABLE_LBA     : u64 = 56    // on-disk [40,48) itable_lba
+  pub let SBS_OFF_ITABLE_BCOUNT  : u64 = 64    // on-disk [48,56) itable_bcount
+  pub let SBS_OFF_ALLOC_LBA      : u64 = 72    // on-disk [56,64) alloc_lba
+  pub let SBS_OFF_ALLOC_BCOUNT   : u64 = 80    // on-disk [64,72) alloc_bcount
+  pub let SBS_OFF_JOURNAL_LBA    : u64 = 88    // on-disk [72,80) journal_lba
+  pub let SBS_OFF_JOURNAL_BCOUNT : u64 = 96    // on-disk [80,88) journal_bcount
+  pub let SBS_OFF_DATA_LBA       : u64 = 104   // on-disk [88,96) data_lba
+  pub let SBS_OFF_DATA_BCOUNT    : u64 = 112   // on-disk [96,104) data_bcount
+  pub let SBS_OFF_ROOT_INODE     : u64 = 120   // on-disk [104,112) root_inode
+  pub let SBS_OFF_MOUNT_GEN      : u64 = 128   // on-disk [112,120) mount_gen
+  pub let SBS_OFF_SNAP_HEAD      : u64 = 136   // on-disk [120,128) snap_head
+  pub let SBS_OFF_SIG_KEY_HASH   : u64 = 144   // on-disk [128,160) sig_key_hash[32] -> 4 slots (144,152,160,168)
+  pub let SB_SUMMARY_BYTES       : u64 = 176   // 22 * 8
+
+  // Number of 8-byte slots the zero-fill / (future) decode loop walks.
+  pub let SB_SUMMARY_SLOTS       : u64 = 22
+
+  // ==========================================================================
+  // pdxb_parse_superblock(buf_ptr, buf_len, out_ptr) -> PDXB_OK
+  //
+  // M1 STUB. Zeroes the 176-byte PdxbSuperblockSummary at out_ptr and
+  // returns PDXB_OK (0) unconditionally. Does not read buf_ptr / check
+  // buf_len against PDXB_SB_BYTES. Real field-by-field decode (every
+  // offset in volume-fs-substrate.md §2.1, magic/reserved validation)
+  // lands at libpdx-volume.M2-001.
+  // ==========================================================================
+  pub let pdxb_parse_superblock : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (buf_len: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-001: pdxb_parse_superblock scaffold stub. Zeroes SB_SUMMARY_SLOTS (22) consecutive u64 slots at out_ptr (rdx) via a bounded counting loop -- `mov [rdx + rcx*8], rax` with rax pre-zeroed once via xor, rcx the slot index, terminating on `cmp rcx, 22; jb`. Does not dereference buf_ptr (rdi) or buf_len (rsi) at all; both are accepted-but-unused at this landing (real decode lands at M2-001). No `add reg,[mem]` anywhere -- the loop only stores, never loads through an added memory operand. Label prefix `lpv_sbs_`. Effects `!{mem} @{}` -- pure .bss-adjacent write through a caller-supplied pointer, no syscall, no cap.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+      lpv_sbs_zero_loop:
+        mov [rdx + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 22;
+        jb  lpv_sbs_zero_loop;
+
+        xor rax, rax;                    // PDXB_OK
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_encode_superblock(sb_ptr, out_ptr, out_len) -> PDXB_OK
+  //
+  // M1 STUB. Writes nothing; returns PDXB_OK (0) unconditionally. Real
+  // body (inverse of the parser, canonical on-disk byte layout,
+  // out_len >= PDXB_SB_BYTES gate) lands at libpdx-volume.M2-002.
+  // ==========================================================================
+  pub let pdxb_encode_superblock : (u64, u64, u64) -> u64 !{} @{} =
+    fn (sb_ptr: u64) (out_ptr: u64) (out_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M1-001: pdxb_encode_superblock scaffold stub. Touches none of sb_ptr/out_ptr/out_len; returns PDXB_OK (0) unconditionally. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Real body deferred to libpdx-volume.M2-002.",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+}

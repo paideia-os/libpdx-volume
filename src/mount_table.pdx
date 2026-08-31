@@ -1,0 +1,192 @@
+// src/mount_table.pdx — libpdx-volume.M1-002 (issue #2)
+// MountTable: client-side parser for the KIND_PDXFS_MOUNT_TABLE
+// 64-byte row layout.
+//
+// The row layout parsed here is the ONE frozen by R53-PREP-001 at
+// src/kernel/core/cap/kind_pdxfs_mount_table.pdx (paideia-os repo),
+// SECTION 1 "TAIL ENCODING". That file's own header explains what
+// this row IS: the kernel-owned VIEW capability row over the static
+// `_mount_table[]` array in core/fs/mount.pdx (8 slots x 8 bytes = 64
+// bytes total, one L1D cache line) -- KIND_PDXFS_MOUNT_TABLE is a
+// SINGLETON authority (row_id is always 0) whose row carries metadata
+// ABOUT that array (a pointer to it, plus a slot count), not the
+// per-mount entries themselves. Reproduced verbatim below because
+// design/tooling/volume-tooling-ux.md §2.2's `{mount_id, volume_uuid,
+// mount_point_id, backend_id, flags, mount_gen, invoker_user}` sketch
+// describes a DIFFERENT, not-yet-landed per-mount-entry record; this
+// parser matches what R53-PREP-001 actually shipped, per this issue's
+// explicit "grep the monorepo for the exact field offsets ... and
+// replicate them" instruction. See design/architecture.md §4 for the
+// discrepancy write-up and the confirmation main should make before
+// relying on this file.
+//
+// ---- Copied row layout (kind_pdxfs_mount_table.pdx SECTION 1) ------------
+//
+//   [+0]   header0: in_use[63:56] | flags[55:32] (24 bits) | gen[31:16] | kind[15:0]
+//   [+8]   header1: reserved_hi[63:32] | res[31:16] | mount_slot_count[15:0]
+//   [+16]  table_row_addr  (u64)   -- runtime address of _mount_table[]
+//   [+24]  reserved        (u64)
+//   [+32]  reserved        (u64)
+//   [+40]  reserved        (u64)
+//   [+48]  reserved        (u64)
+//   [+56]  reserved        (u64)
+//
+// Total: 64 bytes, eight u64 words. `kind` MUST equal
+// KIND_PDXFS_MOUNT_TABLE (0x1A5) on any row this parser is asked to
+// read; that field is this row-format's ONLY discriminator -- there is
+// no separate on-disk/in-memory "version" field distinct from `kind`
+// (unlike, say, the PDXB superblock's `magic` + `version` pair). A
+// future landing that needs an independent row-format version would
+// have to add one; until then, `mount_table_row_parse`'s "invalid
+// magic/version" contract (per this issue's brief) collapses to a
+// single `kind` check. Flagged in design/architecture.md §4 for main
+// to confirm this reading is correct.
+//
+// `mount_slot_count` is stamped at mint time as MOUNT_MAX (8, per
+// core/fs/mount.pdx) and is sanity-checked here only informationally
+// (copied into the summary, not validated) -- refusing on an
+// unexpected count would make this parser brittle against a future
+// widening of `_mount_table[]`, which kind_pdxfs_mount_table.pdx's own
+// SECTION 1 explicitly anticipates ("If a future landing widens the
+// _mount_table[] array, this constant ... must move").
+//
+// Encoder-gap note (kind_pdxfs_mount_table.pdx SECTION 4, reproduced):
+// the kind-tag constant 0x1A5 does not sign-extend cleanly from a
+// 32-bit immediate for `cmp reg, imm` forms; every compare against it
+// here stages through r11 first, matching the kernel file's own
+// discipline.
+//
+// This is NOT `mount_table_snapshot` (libpdx-volume.M2-003, which
+// walks the LIVE `_mount_table[]` array itself once a real LIST/
+// READ_ROW cap-invoke op exists) -- this file parses only the single
+// 64-byte KIND_PDXFS_MOUNT_TABLE metadata row.
+//
+// Upstream: design/architecture/next-wave-derived-kinds.md;
+// design/tooling/volume-tooling-ux.md §2.2, §9.4;
+// src/kernel/core/cap/kind_pdxfs_mount_table.pdx (all paideia-os).
+
+module MountTable = structure {
+
+  // KIND_PDXFS_MOUNT_TABLE = 0x1A5, per kind_pdxfs_mount_table.pdx
+  // (paideia-os) `pub let KIND_PDXFS_MOUNT_TABLE : u64 = 0x1A5`.
+  pub let KIND_PDXFS_MOUNT_TABLE : u64 = 0x1A5
+
+  // On-wire row size (kind_pdxfs_mount_table.pdx `PMT_ROW_BYTES : u64 = 64`).
+  pub let LPV_PMT_ROW_BYTES : u64 = 64
+
+  // --- mount_table_row_parse status codes. -----------------------------
+  pub let LPV_MTR_OK             : u64 = 0
+  pub let LPV_MTR_ERR_BAD_MAGIC  : u64 = 1   // header0 kind field != 0x1A5
+  pub let LPV_MTR_ERR_ROW_DEAD   : u64 = 2   // header0 in_use byte == 0
+
+  // ==========================================================================
+  // MountTableRow — in-memory decoded struct this parser writes to
+  // out_ptr. 7 u64-aligned slots, 56 bytes. Field order mirrors the
+  // on-wire row's own field order (see module header table) with the
+  // two header words' sub-fields unpacked into separate slots.
+  // ==========================================================================
+  pub let MTR_OFF_KIND             : u64 = 0    // header0[15:0]
+  pub let MTR_OFF_IN_USE           : u64 = 8    // header0[63:56]  (0 | 1)
+  pub let MTR_OFF_FLAGS            : u64 = 16   // header0[55:32]  (24 bits)
+  pub let MTR_OFF_GEN               : u64 = 24  // header0[31:16]
+  pub let MTR_OFF_MOUNT_SLOT_COUNT : u64 = 32   // header1[15:0]
+  pub let MTR_OFF_RESERVED_HI      : u64 = 40   // header1[63:32]
+  pub let MTR_OFF_TABLE_ROW_ADDR   : u64 = 48   // word 2, verbatim
+  pub let MTR_SUMMARY_BYTES        : u64 = 56   // 7 * 8
+
+  // ==========================================================================
+  // mount_table_row_parse(row_ptr, out_ptr) -> LPV_MTR_OK | LPV_MTR_ERR_*
+  //
+  // Reads the 64-byte KIND_PDXFS_MOUNT_TABLE row at row_ptr (rdi) and
+  // populates a MountTableRow struct at out_ptr (rsi) per the offsets
+  // above. Validation order: (1) header0 kind field must equal
+  // KIND_PDXFS_MOUNT_TABLE (0x1A5) -- else LPV_MTR_ERR_BAD_MAGIC; (2)
+  // header0 in_use byte must be nonzero -- else LPV_MTR_ERR_ROW_DEAD.
+  // On success, decodes both header words plus the verbatim
+  // table_row_addr word into out_ptr and returns LPV_MTR_OK (0).
+  //
+  // No nested call, no callee-save register touched (only rax/rcx/rdx
+  // and r11 for the encoder-gap staging, all caller-save under SysV) --
+  // no push/pop needed. No `add reg, [mem]` anywhere: every field
+  // extract is a register-only shift/and sequence after a single `mov`
+  // load. No byte loads (every field is decoded from a u64-word `mov`),
+  // so the mov_b zero-extend pattern does not apply here. No `test`
+  // instruction; every zero-check is `cmp reg, 0`. Label prefix `lpv_mtr_`.
+  // ==========================================================================
+  pub let mount_table_row_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-002 (#2): mount_table_row_parse entry point. Loads header0 = [rdi+0] into rax once. Gate 1: rcx = rax & 0xFFFF (kind field [15:0]); stage KIND_PDXFS_MOUNT_TABLE (0x1A5) through r11 per kind_pdxfs_mount_table.pdx SECTION 4's own encoder-gap note (0x1A5 does not sign-extend cleanly as a bare cmp-imm); cmp rcx, r11; jne lpv_mtr_bad_magic. Gate 2: rcx = rax >> 56 (in_use byte); cmp rcx, 0; je lpv_mtr_row_dead (0 and small immediates need no r11 staging). Decode: out.kind (rax & 0xFFFF) at out+0; out.in_use (rax >> 56) at out+8; out.flags ((rax >> 32) & 0xFFFFFF) at out+16; out.gen ((rax >> 16) & 0xFFFF) at out+24. Reload header1 = [rdi+8] into rax (header0 no longer needed past this point). out.mount_slot_count (rax & 0xFFFF) at out+32; out.reserved_hi (rax >> 32) at out+40. Reload table_row_addr = [rdi+16] into rax verbatim, store at out+48. Return LPV_MTR_OK (0). Every register used (rax, rcx, rdx, r11) is caller-save under SysV; no push/pop, no nested call. No `add reg,[mem]` -- every store is a plain `mov [rsi+N], reg`, every load a plain `mov reg, [rdi+N]`. No `test` mnemonic. Effects `!{mem} @{}` -- pure memory read/write through caller-supplied pointers, no syscall, no cap.",
+      block: {
+        mov rax, [rdi + 0];              // header0
+
+        // Gate 1: kind field must be KIND_PDXFS_MOUNT_TABLE (0x1A5).
+        mov rcx, rax;
+        mov rdx, 0xFFFF;
+        and rcx, rdx;
+        mov r11, 0x1A5;                  // staged per encoder-gap note above
+        cmp rcx, r11;
+        jne lpv_mtr_bad_magic;
+
+        // Gate 2: row must be live (in_use byte at header0[63:56]).
+        mov rcx, rax;
+        shr rcx, 56;
+        cmp rcx, 0;
+        je  lpv_mtr_row_dead;
+
+        // out.kind = header0[15:0]
+        mov rcx, rax;
+        mov rdx, 0xFFFF;
+        and rcx, rdx;
+        mov [rsi + 0], rcx;
+
+        // out.in_use = header0[63:56]
+        mov rcx, rax;
+        shr rcx, 56;
+        mov [rsi + 8], rcx;
+
+        // out.flags = header0[55:32] (24 bits)
+        mov rcx, rax;
+        shr rcx, 32;
+        mov rdx, 0xFFFFFF;
+        and rcx, rdx;
+        mov [rsi + 16], rcx;
+
+        // out.gen = header0[31:16]
+        mov rcx, rax;
+        shr rcx, 16;
+        mov rdx, 0xFFFF;
+        and rcx, rdx;
+        mov [rsi + 24], rcx;
+
+        // Reload header1.
+        mov rax, [rdi + 8];
+
+        // out.mount_slot_count = header1[15:0]
+        mov rcx, rax;
+        mov rdx, 0xFFFF;
+        and rcx, rdx;
+        mov [rsi + 32], rcx;
+
+        // out.reserved_hi = header1[63:32]
+        mov rcx, rax;
+        shr rcx, 32;
+        mov [rsi + 40], rcx;
+
+        // out.table_row_addr = word 2, verbatim.
+        mov rax, [rdi + 16];
+        mov [rsi + 48], rax;
+
+        xor rax, rax;                    // LPV_MTR_OK
+        ret;
+
+      lpv_mtr_bad_magic:
+        mov rax, 1;                      // LPV_MTR_ERR_BAD_MAGIC
+        ret;
+
+      lpv_mtr_row_dead:
+        mov rax, 2;                      // LPV_MTR_ERR_ROW_DEAD
+        ret;
+      }
+    }
+}

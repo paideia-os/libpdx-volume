@@ -1,0 +1,66 @@
+# libpdx-volume — caps.decl
+#
+# Wave: R53 (design/tooling/volume-tooling-ux.md §2.4 + §9.4, paideia-os
+# repo). libpdx-volume is a shared CLIENT-side library, not a standalone
+# tool: it performs no `sys_svc_lookup` of its own and binds no ambient
+# service at process start. Every public entry point takes a caller-
+# supplied capability slot or raw pointer as a plain `u64` argument and
+# operates against a KIND surface the CALLER already holds. This file
+# therefore declares the KIND surfaces this library's functions are
+# TYPED against (so `mkfs.pdxfs` / `mount.pdxfs` / `umount.pdxfs` know
+# what to grant themselves before calling in), not a runtime grant the
+# loader must satisfy before this library's own code can run.
+#
+# consumed_kinds (kernel-owned; paideia-os repo):
+#
+#   KIND_VOLUME            = 0x1A0  (R52, src/kernel/core/cap/kind_volume.pdx)
+#     -- vol_kind_mint(dev_cap), vol_kind_narrow(vol_cap, ops_mask).
+#        Rights band R_VOL_READ(0x001)/WRITE(0x002)/INVOKE(0x008)/
+#        REVOKE(0x010)/REFRESH(0x020)/OBSERVE(0x400), R_VOL_ALL=0x43B.
+#        vol_kind_narrow's `ops_mask` parameter is planned (per
+#        volume-tooling-ux.md §2.4) to narrow to {mount, query, flush,
+#        snapshot} -- none of those four op names exist on
+#        KIND_VOLUME's op table yet (kind_volume.pdx currently defines
+#        only VOL_OP_QUERY_* + VOL_OP_DEBUG_PRINT, ordinals 0..9); the
+#        "mount" op arrives with a future R53 KIND_VOLUME landing this
+#        library does not control. See design/architecture.md §5 for
+#        the M1 stub's placeholder posture on this gap.
+#
+#   KIND_PDXFS_MOUNT_TABLE = 0x1A5  (R53-PREP-001,
+#     src/kernel/core/cap/kind_pdxfs_mount_table.pdx)
+#     -- mount_table_row_parse(row_ptr, out_ptr) parses the raw 64-byte
+#        row layout SECTION 1 of that file defines. At R53-PREP-001 the
+#        KIND's own cap-invoke handler has no LIST/READ_ROW op wired
+#        (every op refuses INVOKE_UNSUPPORTED), so this library's
+#        parser operates on a caller-supplied raw pointer rather than
+#        going through a cap-invoke call -- the caller is expected to
+#        have already obtained `row_ptr` by some other route (today:
+#        none; this is scaffold-ahead-of-the-op-walker, matching the
+#        M-PREP posture the kind file itself documents in its SECTION 6
+#        header comment). (M2) mount_table_snapshot will need the real
+#        LIST op once a future R53 landing wires it.
+#
+#   KIND_SIG_KEY           = 0x1A3  (R52, per design/filesystem/
+#     volume-fs-substrate.md §2.1 sig_key_hash + design/tooling/
+#     volume-tooling-ux.md §2.1) -- (M3) pdxb_sign_superblock. Not
+#     referenced by any M1 function.
+#
+#   KIND_BLOCK_DEVICE      = 0x198..0x19F band (R51, osarch-owned) --
+#     (M2) vol_kind_mint's `dev_cap` argument narrows a probed
+#     KIND_BLOCK_DEVICE into a fresh KIND_VOLUME. Not dereferenced by
+#     the M1 stub.
+#
+# declares_output_schemas: none at M1. Schema registration
+# (PdxFsFormatRecord@0.1 / PdxFsMountRecord@0.1 / PdxFsUnmountRecord@0.1)
+# is owned by the three CLI tools per design/tooling/volume-tooling-ux.md
+# §7.4; this library supplies the field values those records carry
+# (PdxbSuperblockSummary, MountTableRow) but never emits a record onto a
+# semantic pipe itself.
+#
+# M1 landing status (see STATUS.md): every function listed above is a
+# scaffold STUB except mount_table_row_parse, which has a real body
+# (M1-002) because it operates on a fixed 64-byte layout already frozen
+# by R53-PREP-001 -- there is no "M2 real body" gap to defer for that
+# one function the way there is for the superblock codec and the
+# KIND_VOLUME helpers, which depend on KIND surfaces / wire layouts
+# this repo does not own and that have not landed kernel-side yet.

@@ -1,0 +1,97 @@
+// src/vol_kind.pdx — libpdx-volume.M1-001
+// VolKind: client-side KIND_VOLUME mint/narrow helpers.
+//
+// Two entry points, matching design/tooling/volume-tooling-ux.md §2.4:
+//
+//   vol_kind_mint(dev_cap)             -> Cap<KIND_VOLUME> | sentinel
+//   vol_kind_narrow(vol_cap, ops_mask) -> Cap<KIND_VOLUME> | sentinel
+//
+// `vol_kind_mint` is the client-side helper `mount.pdxfs` calls when a
+// probed KIND_BLOCK_DEVICE has a valid PDXB superblock but no
+// KIND_VOLUME was minted for it at boot (the hot-plug case). It calls
+// through to the kernel's own KIND_VOLUME mint primitive
+// (src/kernel/core/cap/kind_volume.pdx in paideia-os; that file's own
+// SECTION 0 documents the derivation gate: parent.kind == KIND_MEMORY
+// (4) AND rights carry RIGHT_MINT (0x200), mirrored by KIND_VOLUME's
+// own kind_volume_mint entry point, name not yet re-exported through a
+// syscall this library can reach).
+//
+// `vol_kind_narrow` narrows an already-held KIND_VOLUME cap to a
+// subset of ops before handing it to a syscall (`mount.pdxfs` narrows
+// to exactly `mount` + `query` before calling `sys_mount`, per
+// volume-tooling-ux.md §4.1 mental-model paragraph).
+//
+// ================================================================
+// M1 landing: BOTH functions are placeholder stubs. Neither
+// dereferences its argument nor issues a syscall. Real bodies land at
+// libpdx-volume.M2-004 (vol_kind_narrow) and a yet-unscheduled M2 slot
+// for vol_kind_mint (not itemised as its own M2 issue in
+// volume-tooling-ux.md §9.4 — flagged in design/architecture.md §5 as
+// a gap main should confirm before M2 opens).
+//
+// Blocking gap this stub inherits: KIND_VOLUME (kind_volume.pdx) has
+// no ring-3 mint surface today ("No cap-invoke op that reaches
+// kind_volume_mint" per that file's own SECTION 0) and its op table
+// (VOL_OP_QUERY_* + VOL_OP_DEBUG_PRINT, ordinals 0..9) has no `mount`,
+// `flush`, or `snapshot` op the design doc's `ops_mask` parameter
+// narrows against. Real implementations of both functions here are
+// blocked on whichever future R53 kernel landing adds those ops and
+// (for vol_kind_mint) exposes a syscall this library can call through
+// rather than only a kernel-internal primitive.
+//
+// Reserved-label discipline: no labels are needed in either stub body
+// (single straight-line block, no branch) but the file-wide prefix for
+// any future control flow is `lpv_vk_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §2.4, §9.4 (paideia-os).
+
+module VolKind = structure {
+
+  // KIND_VOLUME = 0x1A0, per src/kernel/core/cap/kind_volume.pdx
+  // (paideia-os) SECTION line `pub let KIND_VOLUME : u64 = 0x1A0`.
+  pub let KIND_VOLUME : u64 = 0x1A0
+
+  // Sentinel returned by every M1 stub in this module. Deliberately
+  // outside the valid cap-slot range ([0..255], per every kind_*.pdx
+  // mint's own parent-slot bounds check in the kernel tree) so a
+  // caller that forgets this is a stub sees an obviously-invalid slot
+  // rather than a value that could be mistaken for slot 0.
+  pub let LPV_STUB_NOT_IMPLEMENTED : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ============================================================================
+  // vol_kind_mint(dev_cap) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
+  //
+  // M1 STUB. Does not dereference dev_cap, does not call any syscall.
+  // Real body (M2, unscheduled issue — see design/architecture.md §5)
+  // narrows a probed KIND_BLOCK_DEVICE into a fresh KIND_VOLUME via the
+  // kernel's mint primitive once a ring-3-reachable syscall exists.
+  // ============================================================================
+  pub let vol_kind_mint : (u64) -> u64 !{} @{} =
+    fn (dev_cap: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M1-001: vol_kind_mint scaffold stub. Returns LPX_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, loaded via MOVABS -- outside the 0x7FFFFFFF cmp-imm bound but legal for a register load, never compared) without touching dev_cap. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Real body deferred to a future M2 landing once KIND_VOLUME exposes a ring-3-reachable mint syscall (see module header).",
+      block: {
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // vol_kind_narrow(vol_cap, ops_mask) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
+  //
+  // M1 STUB. Does not dereference vol_cap or ops_mask. Real body lands
+  // at libpdx-volume.M2-004 per design/tooling/volume-tooling-ux.md
+  // §9.4, gated on KIND_VOLUME's op catalog gaining the {mount, flush,
+  // snapshot} ops the design brief's `ops_mask` parameter narrows
+  // against (today's op catalog is query-only; see module header).
+  // ============================================================================
+  pub let vol_kind_narrow : (u64, u64) -> u64 !{} @{} =
+    fn (vol_cap: u64) (ops_mask: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M1-001: vol_kind_narrow scaffold stub. Returns LPV_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, MOVABS load, never compared) without touching vol_cap or ops_mask. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Real body deferred to libpdx-volume.M2-004 (matches R52 op catalog per volume-tooling-ux.md §9.4), itself gated on KIND_VOLUME growing the {mount, flush, snapshot} ops (see module header).",
+      block: {
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret;
+      }
+    }
+}
