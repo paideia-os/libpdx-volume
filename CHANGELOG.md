@@ -1,5 +1,44 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.4 — 2026-09-02 (Phase C: `--extra-archive` uniform-invocation contract)
+
+**Patch bump — additive, accepted-and-stored `tools/build.sh` flag;
+every existing invocation still works unchanged.** Part of the
+paideia-os#2226 satellite-runtime-shim Phase C landing that adds
+`--extra-archive PATH` to the four satellite `build.sh` scripts
+(mkfs.pdxfs, mount.pdxfs, umount.pdxfs, and this repo). This library
+ships no runnable ELF of its own (build.sh emits per-module
+`build-out/*.o` objects for downstream satellites to link against via
+`--extra-obj-dir`), so at this landing the flag is parsed-and-stored
+but not consumed inside this repo — it exists so a downstream invoker
+(a satellite build wrapper, or the `tests/smoke/consumer_e2e.sh`
+end-to-end runner) can pass the same argument vector to every
+satellite's `tools/build.sh` — including this one — without
+special-casing.
+
+### Added
+
+- **`--extra-archive PATH` (repeatable)** on `tools/build.sh`. Same
+  bounds-check discipline as the other three satellites (a bare
+  `--extra-archive` with no following PATH exits 2 with
+  `--extra-archive requires an argument`). Paths are appended to a
+  bash `EXTRA_ARCHIVES=()` array. Consumed by a future landing that
+  adds a link step here (e.g. a self-contained test-driver ELF); until
+  then the array is inert.
+
+### Invocation (uniform across all four satellites)
+
+```
+# Sibling satellites (mkfs/mount/umount) consume the archives at their
+# final ld link; this repo accepts the flag for invocation uniformity.
+bash tools/build.sh \
+  --extra-archive $HOME/Development/PaideiaOS/tools/paideia-as/target/release/libpaideia_satellite_runtime.a \
+  --extra-archive $HOME/tmp/libpdx-audit/build-out/libpdx-audit-satellite.a
+```
+
+References: paideia-os#2226, paideia-as#1348, libpdx-audit#19, design
+doc `design/infrastructure/satellite-runtime-shim.md` §4.1 + §5 Step 5.
+
 ## 1.1.3 — 2026-09-02 (patch: rename tests-*.o `run` symbols per-test)
 
 **Patch release** closing #35: build-out shipped 3 test objects each

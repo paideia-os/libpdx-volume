@@ -9,9 +9,40 @@
 #
 # Requires paideia-as >= 0.21.0. The 0.9.0 shipped in $PATH by default does not
 # accept the syntax used in this repo.
+#
+# Usage:
+#   tools/build.sh [--extra-archive PATH]...
+#
+# --extra-archive PATH may be repeated. This library ships no runnable
+# ELF of its own (build.sh emits per-module `build-out/*.o` objects for
+# downstream satellites to link against via `--extra-obj-dir`), so at
+# this landing the flag is accepted-and-stored but not consumed here;
+# it exists so a downstream invoker (a satellite build wrapper, or the
+# tests/smoke/consumer_e2e.sh end-to-end runner from paideia-os#2226)
+# can pass the same argument vector to every satellite's build.sh —
+# including this one — without special-casing (satellite-runtime-shim
+# design §4.1/§5, paideia-os#2226). Once a link step lands here (e.g.
+# for a self-contained test driver), the stored paths get appended to
+# its `ld` line the same way the ELF-emitting satellites already do.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+EXTRA_ARCHIVES=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --extra-archive)
+            [ "$#" -ge 2 ] || { echo "[build] FAIL: --extra-archive requires an argument" >&2; exit 2; }
+            EXTRA_ARCHIVES+=("$2")
+            shift 2
+            ;;
+        *)
+            echo "[build] FAIL: unrecognized argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 MIN_VERSION="0.21.0"
 
