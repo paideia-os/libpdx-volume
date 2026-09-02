@@ -1,4 +1,6 @@
 // src/pdxb_sign.pdx — libpdx-volume.M3-001 (#7) + M3-002 (#8)
+//                      + R91-XREPO.M1 Phase D (v1.1.5, satellite-runtime
+//                        NO_SIGNER surfacing per satellite-runtime-shim.md §3.2)
 // PdxbSign: ML-DSA-65 (FIPS 204) signing helpers for the PDXB codec
 // (superblock) and, ahead of a real consumer, the inode-tail shape a
 // future fsck.pdxfs will use.
@@ -8,6 +10,22 @@
 //   pdxb_sign_superblock(sb_ptr, seed_ptr, out_sig_ptr, out_sig_len) -> u64
 //   pdxb_sign_inode_tail(inode_ptr, tail_offset, tail_len, seed_ptr, out_sig_ptr) -> u64
 //   pdxb_verify_inode_tail(inode_ptr, tail_offset, tail_len, sig_ptr, sig_len, pub_key_slot) -> u64
+//
+// Both sign entry points return one of THREE distinct sentinels on
+// failure:
+//
+//   PDXB_SIGN_ERR_NO_SIGNER (0xFFFFFFFFFFFFFFFA, -6 as u64) --
+//     `paideia-satellite-runtime::mldsa65_sign_runtime_entry` (the
+//     fail-closed satellite-build FFI thunk) returned -6, meaning "no
+//     signer exists in this build". See PDXB_SIGN_ERR_NO_SIGNER decl
+//     below and design/infrastructure/satellite-runtime-shim.md §3.2.
+//     The banded equivalent for callers on the `LPV_E_*` idiom is
+//     LpvErrors::LPV_E_SIGN_NO_SIGNER (0x0503).
+//   PDXB_SIGN_ERR (0xFFFFFFFFFFFFFFFF) -- any other non-zero return
+//     from the intrinsic (kernel-build reject, invalid pointer, etc.),
+//     OR (pdxb_sign_superblock only) the caller's out_sig_len is <
+//     3309.
+//   3309 on success (bytes written to out_sig_ptr).
 //
 // ================================================================
 // Where `seed_ptr` comes from -- NOT a `sig_key_slot` cap, and why
@@ -267,6 +285,44 @@ module PdxbSign = structure {
   pub let PDXB_SIGN_ERR              : u64 = 0xFFFFFFFFFFFFFFFF
   pub let PDXB_VER_ERR_NOT_IMPLEMENTED : u64 = 0xFFFFFFFFFFFFFFFF
 
+  // --- Distinct fail-closed-signer sentinel (satellite-runtime-shim
+  // §3.2 + Step 6; R91-XREPO.M1 Phase D). ---
+  //
+  // `paideia-satellite-runtime::mldsa65_sign_runtime_entry` (the FFI
+  // thunk `MlDsa65::sign` lowers to in a satellite build) is a
+  // fail-closed stub that ALWAYS returns
+  // `PDX_MLDSA_ERR_NO_SIGNER = -6` -- a new error code the shim added
+  // deliberately outside the intrinsic's own preexisting `-1..-5` band
+  // so a caller can distinguish "there is no signer in this build" from
+  // "the intrinsic was called and rejected its inputs". In satellite
+  // ELFs (mkfs.pdxfs, mount.pdxfs, umount.pdxfs, and any future
+  // fsck.pdxfs that has not yet been retargeted at the full
+  // paideia-pq-sign staticlib) this is the ONLY value the intrinsic
+  // ever returns; in a kernel build it never returns this value.
+  //
+  // `pdxb_sign_superblock` and `pdxb_sign_inode_tail` translate this
+  // -6 upward into `PDXB_SIGN_ERR_NO_SIGNER` (below), a value
+  // BAND-DISTINCT from the generic `PDXB_SIGN_ERR` sentinel so the
+  // caller's own logging (or `LpvErrors::lpv_strerror` dispatch) can
+  // surface "sign: no signer in this build" specifically rather than
+  // misreading the fail-closed stub as an intrinsic crash. The u64
+  // value is -6's two's-complement bit pattern
+  // (`0xFFFFFFFFFFFFFFFA`), chosen so that a caller comparing the
+  // raw returned u64 against this constant sees the same low bits as
+  // the underlying -6 the runtime shim reports upward -- keeping the
+  // low-level and the library-level idioms legible without either
+  // needing to know the other's numeric form. Callers preferring the
+  // banded `LPV_E_*` namespace can use
+  // `LpvErrors::LPV_E_SIGN_NO_SIGNER` (0x0503) directly; the two
+  // constants coexist for backwards compatibility with the v1.1.4
+  // sentinel-comparison idiom.
+  //
+  // See design/infrastructure/satellite-runtime-shim.md §3.2
+  // ("Consequence for libpdx-volume") and its §5 Step 6, plus §8 R4
+  // ("fail-closed signer masquerading as success" -- the mitigation
+  // this constant is half of).
+  pub let PDXB_SIGN_ERR_NO_SIGNER : u64 = 0xFFFFFFFFFFFFFFFA
+
   // ==========================================================================
   // Local trait declaration for the paideia-as `MlDsa65::sign` stdlib
   // intrinsic (paideia-as#1330, landed v0.23.0). See module header
@@ -312,12 +368,20 @@ module PdxbSign = structure {
   //
   // Gate: out_sig_len >= MLDSA65_SIG_LEN (3309), else PDXB_SIGN_ERR
   // without calling the intrinsic or touching out_sig_ptr. On the
-  // intrinsic returning nonzero (NULL seed_ptr, per its own contract --
-  // this function does not null-check seed_ptr itself, matching this
+  // intrinsic returning nonzero, no partial output is produced (the
+  // intrinsic's own contract: "on any error the output buffer is not
+  // written"); the specific nonzero value is translated to one of two
+  // sentinels per the R91-XREPO.M1 Phase D discrimination (module
+  // header):
+  //   * -6 (PDX_MLDSA_ERR_NO_SIGNER, the fail-closed
+  //     paideia-satellite-runtime signer stub in a satellite build) ->
+  //     PDXB_SIGN_ERR_NO_SIGNER (0xFFFFFFFFFFFFFFFA).
+  //   * every other non-zero value (NULL seed_ptr per the intrinsic's
+  //     own contract, or a real kernel-build reject) -> the generic
+  //     PDXB_SIGN_ERR (0xFFFFFFFFFFFFFFFF).
+  // This function does not null-check seed_ptr itself, matching this
   // library's established "trust the caller-declared pointer" discipline
-  // for pdxb_parse_superblock/pdxb_encode_superblock), returns
-  // PDXB_SIGN_ERR without partial output (the intrinsic's own contract:
-  // "on any error the output buffer is not written"). On success,
+  // for pdxb_parse_superblock/pdxb_encode_superblock. On success,
   // returns MLDSA65_SIG_LEN (3309), the bytes written.
   //
   // No push/pop: nothing needs to survive across `call
@@ -328,7 +392,7 @@ module PdxbSign = structure {
   pub let pdxb_sign_superblock : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
     fn (sb_ptr: u64) (seed_ptr: u64) (out_sig_ptr: u64) (out_sig_len: u64) -> unsafe {
       effects: {crypto, mem}, capabilities: {paideia.crypto},
-      justification: "libpdx-volume.M3-001 (#7): pdxb_sign_superblock real body. Gate: cmp rcx,3309 (MLDSA65_SIG_LEN); jb too_short -- returns PDXB_SIGN_ERR without calling the intrinsic. Body: marshal SysV args for MlDsa65::sign(seed_ptr, msg_ptr, msg_len, sig_out_ptr) -- new rdi=seed_ptr (old rsi), new rsi=msg_ptr=sb_ptr (old rdi), new rdx=696 (PDXB_SIGN_MSG_LEN, the volume-fs-substrate.md sec2.1 signed range [0,696)), new rcx=sig_out_ptr (old rdx) -- staged through r10 (saved sb_ptr)/r11 (saved out_sig_ptr) since rdi and rdx's old values are each needed after their register slot is overwritten by the other's new value. call pdxb_sign_mldsa65_raw; cmp rax,0; jne fail (PDXB_SIGN_ERR); else mov rax,3309 (MLDSA65_SIG_LEN); ret. No push/pop -- nothing survives the call except rax. No add reg,[mem]. No byte loads. No test; every check is cmp. Labels prefixed pdxb_sign_ss_.",
+      justification: "libpdx-volume.M3-001 (#7) + R91-XREPO.M1 Phase D (satellite-runtime-shim §3.2 + Step 6): pdxb_sign_superblock. Gate: cmp rcx,3309 (MLDSA65_SIG_LEN); jb too_short -- returns PDXB_SIGN_ERR without calling the intrinsic. Body: marshal SysV args for MlDsa65::sign(seed_ptr, msg_ptr, msg_len, sig_out_ptr) -- new rdi=seed_ptr (old rsi), new rsi=msg_ptr=sb_ptr (old rdi), new rdx=696 (PDXB_SIGN_MSG_LEN, the volume-fs-substrate.md sec2.1 signed range [0,696)), new rcx=sig_out_ptr (old rdx) -- staged through r10 (saved sb_ptr)/r11 (saved out_sig_ptr) since rdi and rdx's old values are each needed after their register slot is overwritten by the other's new value. call pdxb_sign_mldsa65_raw; cmp rax,0; je ok (rax=3309, ret). Non-zero return path: check for PDX_MLDSA_ERR_NO_SIGNER (i64 -6 = 0xFFFFFFFFFFFFFFFA, the fail-closed satellite-runtime-shim signer stub -- see the PDXB_SIGN_ERR_NO_SIGNER decl in the module header) first, staged into r10 via MOVABS then compared register-to-register (matches pdxb_crypto.pdx::pdxb_dek_unwrap's own -3 tag-mismatch discrimination pattern); je no_signer path returns PDXB_SIGN_ERR_NO_SIGNER (0xFFFFFFFFFFFFFFFA) unchanged. Any other non-zero: return the generic PDXB_SIGN_ERR (0xFFFFFFFFFFFFFFFF). This surfacing is the §3.2 R4 mitigation (no fail-closed signer masquerading as success). No push/pop -- nothing survives the call except rax. No add reg,[mem]. No byte loads. No test; every check is cmp. Labels prefixed pdxb_sign_ss_.",
       block: {
         cmp rcx, 3309;
         jb  pdxb_sign_ss_too_short;
@@ -345,16 +409,29 @@ module PdxbSign = structure {
         call pdxb_sign_mldsa65_raw;
 
         cmp rax, 0;
-        jne pdxb_sign_ss_fail;
+        jne pdxb_sign_ss_nonzero;
 
         mov rax, 3309;                   // MLDSA65_SIG_LEN: bytes written
         ret;
 
-      pdxb_sign_ss_too_short:
-        mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_SIGN_ERR
+      pdxb_sign_ss_nonzero:
+        // Distinguish the fail-closed satellite-runtime signer stub
+        // (PDX_MLDSA_ERR_NO_SIGNER = -6 as u64 = 0xFFFFFFFFFFFFFFFA)
+        // from every other non-zero intrinsic return. See the
+        // PDXB_SIGN_ERR_NO_SIGNER decl in this module's header and
+        // design/infrastructure/satellite-runtime-shim.md §3.2 + §8 R4.
+        mov r10, 0xFFFFFFFFFFFFFFFA;     // PDX_MLDSA_ERR_NO_SIGNER as u64
+        cmp rax, r10;
+        je  pdxb_sign_ss_no_signer;
+
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_SIGN_ERR (generic)
         ret;
 
-      pdxb_sign_ss_fail:
+      pdxb_sign_ss_no_signer:
+        mov rax, 0xFFFFFFFFFFFFFFFA;     // PDXB_SIGN_ERR_NO_SIGNER
+        ret;
+
+      pdxb_sign_ss_too_short:
         mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_SIGN_ERR
         ret;
       }
@@ -372,14 +449,16 @@ module PdxbSign = structure {
   //
   // Deferred consumer (fsck.pdxfs does not exist yet; libpdx-volume#8).
   // No length gate on out_sig_ptr (matches the issue's literal 5-arg
-  // signature -- flagged in the module header). On the intrinsic
-  // returning nonzero, returns PDXB_SIGN_ERR without partial output. On
-  // success, returns MLDSA65_SIG_LEN (3309).
+  // signature -- flagged in the module header). Failure sentinels match
+  // pdxb_sign_superblock's Phase D three-return-value contract (module
+  // header): -6 -> PDXB_SIGN_ERR_NO_SIGNER (0xFFFFFFFFFFFFFFFA), any
+  // other non-zero -> the generic PDXB_SIGN_ERR (0xFFFFFFFFFFFFFFFF).
+  // On success, returns MLDSA65_SIG_LEN (3309).
   // ==========================================================================
   pub let pdxb_sign_inode_tail : (u64, u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
     fn (inode_ptr: u64) (tail_offset: u64) (tail_len: u64) (seed_ptr: u64) (out_sig_ptr: u64) -> unsafe {
       effects: {crypto, mem}, capabilities: {paideia.crypto},
-      justification: "libpdx-volume.M3-002 (#8): pdxb_sign_inode_tail real body, deferred-consumer helper for a future fsck.pdxfs. msg_ptr = inode_ptr + tail_offset via mov r9,rdi; add r9,rsi (register+register pointer arithmetic, never lea reg,[regA+regB] -- matches pdxfs_lite/inode.pdx's get_inode precedent). Marshal SysV args for MlDsa65::sign(seed_ptr, msg_ptr, msg_len, sig_out_ptr): new rdi=seed_ptr (old rcx), new rsi=msg_ptr (r9), new rdx=msg_len=tail_len (old rdx, unchanged -- already in the right slot), new rcx=sig_out_ptr (old r8). call pdxb_sign_mldsa65_raw; cmp rax,0; jne fail (PDXB_SIGN_ERR); else mov rax,3309 (MLDSA65_SIG_LEN); ret. No push/pop. No add reg,[mem] beyond the one register+register add computing msg_ptr (not a memory operand). No byte loads. No test; every check is cmp. Labels prefixed pdxb_sign_it_.",
+      justification: "libpdx-volume.M3-002 (#8) + R91-XREPO.M1 Phase D (satellite-runtime-shim §3.2 + Step 6): pdxb_sign_inode_tail, deferred-consumer helper for a future fsck.pdxfs. msg_ptr = inode_ptr + tail_offset via mov r9,rdi; add r9,rsi (register+register pointer arithmetic, never lea reg,[regA+regB] -- matches pdxfs_lite/inode.pdx's get_inode precedent). Marshal SysV args for MlDsa65::sign(seed_ptr, msg_ptr, msg_len, sig_out_ptr): new rdi=seed_ptr (old rcx), new rsi=msg_ptr (r9), new rdx=msg_len=tail_len (old rdx, unchanged -- already in the right slot), new rcx=sig_out_ptr (old r8). call pdxb_sign_mldsa65_raw; cmp rax,0; je ok (rax=3309, ret). Non-zero return path mirrors pdxb_sign_superblock's Phase D discrimination: check for PDX_MLDSA_ERR_NO_SIGNER (i64 -6 = 0xFFFFFFFFFFFFFFFA, the fail-closed satellite-runtime-shim signer stub) first, staged into r10 via MOVABS then compared register-to-register (matches pdxb_crypto.pdx::pdxb_dek_unwrap's own -3 tag-mismatch discrimination pattern); je no_signer path returns PDXB_SIGN_ERR_NO_SIGNER (0xFFFFFFFFFFFFFFFA) unchanged. Any other non-zero: return the generic PDXB_SIGN_ERR (0xFFFFFFFFFFFFFFFF). No push/pop. No add reg,[mem] beyond the one register+register add computing msg_ptr (not a memory operand). No byte loads. No test; every check is cmp. Labels prefixed pdxb_sign_it_.",
       block: {
         // msg_ptr = inode_ptr + tail_offset.
         mov r9, rdi;                     // r9 = inode_ptr
@@ -393,13 +472,26 @@ module PdxbSign = structure {
         call pdxb_sign_mldsa65_raw;
 
         cmp rax, 0;
-        jne pdxb_sign_it_fail;
+        jne pdxb_sign_it_nonzero;
 
         mov rax, 3309;                   // MLDSA65_SIG_LEN: bytes written
         ret;
 
-      pdxb_sign_it_fail:
-        mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_SIGN_ERR
+      pdxb_sign_it_nonzero:
+        // Distinguish the fail-closed satellite-runtime signer stub
+        // (PDX_MLDSA_ERR_NO_SIGNER = -6 as u64 = 0xFFFFFFFFFFFFFFFA)
+        // from every other non-zero intrinsic return. See the
+        // PDXB_SIGN_ERR_NO_SIGNER decl in this module's header and
+        // design/infrastructure/satellite-runtime-shim.md §3.2 + §8 R4.
+        mov r10, 0xFFFFFFFFFFFFFFFA;     // PDX_MLDSA_ERR_NO_SIGNER as u64
+        cmp rax, r10;
+        je  pdxb_sign_it_no_signer;
+
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_SIGN_ERR (generic)
+        ret;
+
+      pdxb_sign_it_no_signer:
+        mov rax, 0xFFFFFFFFFFFFFFFA;     // PDXB_SIGN_ERR_NO_SIGNER
         ret;
       }
     }
@@ -487,6 +579,16 @@ module PdxbSign = structure {
   // Follow-up filed as paideia-os/libpdx-audit issue for the
   // build-tree wiring (this ticket lands the outer contract; audit
   // link is the last-mile step).
+  //
+  // Phase D (v1.1.5): the passthrough arm calls `pdxb_sign_superblock`
+  // and returns its rax verbatim, so the Phase D three-sentinel
+  // contract (module header) -- including
+  // `PDXB_SIGN_ERR_NO_SIGNER` on the satellite-runtime fail-closed
+  // stub -- surfaces through this entry point automatically. The
+  // audit-stub arm still returns 0xFFFFFFFFFFFFFFFF (== the generic
+  // `PDXB_SIGN_ERR`) since libpdx-audit is not yet linked; this is a
+  // preexisting collision with the generic sign sentinel that this
+  // ticket does not attempt to disambiguate.
   //
   // Registers: rdi..r9 hold the six SysV args on entry. rax = return.
   // ==========================================================================

@@ -1,5 +1,80 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.5 — 2026-09-02 (R91-XREPO.M1 Phase D: surface satellite-runtime NO_SIGNER upward)
+
+**Patch bump — additive error-sentinel surfacing; every v1.1.4 API
+surface remains byte-for-byte compatible for callers using the
+`!= 0` failure idiom.** Closes R91-XREPO.M1 Phase D per
+`design/infrastructure/satellite-runtime-shim.md` §3.2 + §5 Step 6
++ §8 R4 in the paideia-os repo.
+
+### Fixed
+
+- **`src/pdxb_sign.pdx`** — `pdxb_sign_superblock` and
+  `pdxb_sign_inode_tail` previously mapped ANY non-zero return from
+  the `MlDsa65::sign` intrinsic to a single generic
+  `PDXB_SIGN_ERR` sentinel (`0xFFFFFFFFFFFFFFFF`). In a satellite
+  build the sign FFI thunk is
+  `paideia-satellite-runtime::mldsa65_sign_runtime_entry`, a
+  fail-closed stub that ALWAYS returns
+  `PDX_MLDSA_ERR_NO_SIGNER = -6` (added deliberately outside the
+  intrinsic's preexisting `-1..-5` band). Swallowing that specific
+  return code inside the generic `PDXB_SIGN_ERR` translation defeated
+  its whole purpose — a caller could not tell "there is no signer in
+  this build" from "the intrinsic was called and rejected its
+  inputs" (§8 R4: "fail-closed signer masquerading as success"). Both
+  entry points now discriminate `-6` first (`mov r10,
+  0xFFFFFFFFFFFFFFFA; cmp rax, r10; je no_signer`), returning a new
+  distinct `PDXB_SIGN_ERR_NO_SIGNER` sentinel with the same numeric
+  value (0xFFFFFFFFFFFFFFFA = -6 as u64); any other non-zero return
+  continues to translate to `PDXB_SIGN_ERR`. The discrimination pattern
+  mirrors `pdxb_crypto.pdx::pdxb_dek_unwrap`'s own `-3` tag-mismatch
+  discrimination (v1.1.0).
+
+### Added
+
+- **`src/pdxb_sign.pdx`** — `PDXB_SIGN_ERR_NO_SIGNER : u64 =
+  0xFFFFFFFFFFFFFFFA` public sentinel constant + expanded module
+  header documenting the three-return-value contract (success 3309,
+  `PDXB_SIGN_ERR_NO_SIGNER`, `PDXB_SIGN_ERR`) both sign entry points
+  now honour.
+- **`src/lpv_errors.pdx`** — `LPV_E_SIGN_NO_SIGNER : u64 = 0x0503`
+  (in the existing 0x0500..0x05FF signing band) as the banded
+  companion to `PDXB_SIGN_ERR_NO_SIGNER` for callers using the
+  `LPV_E_*` idiom, plus `lpv_msg_sign_no_signer : [u8; 17] = "sign:
+  no signer\0\0"` for a future `lpv_strerror` table entry.
+- **`doc/libpdx-volume.pdxdoc`** — SYNOPSIS names both
+  `PDXB_SIGN_ERR` and `PDXB_SIGN_ERR_NO_SIGNER`; API section for the
+  two sign entry points documents the new three-sentinel return
+  contract explicitly and cross-references
+  `LpvErrors::LPV_E_SIGN_NO_SIGNER`.
+
+### Consumer impact at this landing
+
+None. No satellite tool currently uses signing at runtime —
+`mkfs.pdxfs`, `mount.pdxfs`, and `umount.pdxfs` all default to the
+PUBLIC key path (used only to compute `sig_key_hash` via BLAKE3);
+`pdxb_sign_superblock` is defined here but never called from any
+existing satellite. The surfacing exists so the moment a signing
+consumer lands (e.g. a future `fsck.pdxfs` or `pkg.paideia-os`
+manifest signer targeting a satellite build), it sees the distinct
+sentinel rather than a generic error.
+
+### Compatibility
+
+Additive-only. A caller checking `!= 0` for failure sees the same
+failure verdict; only the specific sentinel value changes from
+`0xFFFFFFFFFFFFFFFF` to `0xFFFFFFFFFFFFFFFA` on the NO_SIGNER path.
+`pdxb_sign_superblock_traced` passes through its untraced
+counterpart's `rax` unchanged, so the new sentinel surfaces through
+that entry point automatically. The `pdxb_verify_*` functions are
+unaffected (still fail-closed stubs returning
+`PDXB_VER_ERR_NOT_IMPLEMENTED`).
+
+References: R91-XREPO.M1 Phase D; paideia-as#1348;
+`design/infrastructure/satellite-runtime-shim.md` §3.2, §5 Step 6,
+§8 R4 (paideia-os).
+
 ## 1.1.4 — 2026-09-02 (Phase C: `--extra-archive` uniform-invocation contract)
 
 **Patch bump — additive, accepted-and-stored `tools/build.sh` flag;

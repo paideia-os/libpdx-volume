@@ -34,6 +34,8 @@ mount-table view for paideia-os volume tooling.
       pub let pdxb_sign_superblock   : (u64, u64, u64, u64) -> u64 !{mem, crypto} @{paideia.crypto}
       pub let pdxb_sign_inode_tail   : (u64, u64, u64, u64, u64) -> u64 !{mem, crypto} @{paideia.crypto}
       pub let pdxb_verify_inode_tail : (u64, u64, u64, u64, u64, u64) -> u64 !{} @{}
+      pub let PDXB_SIGN_ERR              : u64  // 0xFFFFFFFFFFFFFFFF
+      pub let PDXB_SIGN_ERR_NO_SIGNER    : u64  // 0xFFFFFFFFFFFFFFFA (-6), satellite-runtime fail-closed stub (v1.1.5)
     }
 
 ==== DESCRIPTION
@@ -132,17 +134,27 @@ Signs `sb_ptr[0, 696)` (the wire format's documented signed range,
 using the 32-byte seed at `seed_ptr`, and writes the 3309-byte
 signature to `out_sig_ptr`. Pass `out_sig_ptr = sb_ptr + 696` to sign
 in place, matching the on-disk `sig` field's own offset. Returns
-`3309` on success, `PDXB_SIGN_ERR` if the intrinsic call fails. Takes a
-raw `seed_ptr` rather than a `KIND_SIG_KEY` cap slot — see
-[[cref: LIMITATIONS]].
+`3309` on success, `PDXB_SIGN_ERR_NO_SIGNER` (0xFFFFFFFFFFFFFFFA, -6
+as u64) when the intrinsic is the fail-closed
+`paideia-satellite-runtime` stub (satellite build; see
+[[cref: LIMITATIONS]] and the shim design at
+`design/infrastructure/satellite-runtime-shim.md` §3.2), or the
+generic `PDXB_SIGN_ERR` (0xFFFFFFFFFFFFFFFF) for any other non-zero
+intrinsic return or when `out_sig_len < 3309`. Takes a raw `seed_ptr`
+rather than a `KIND_SIG_KEY` cap slot — see [[cref: LIMITATIONS]].
+Banded companion sentinel for callers on the `LPV_E_*` idiom:
+`LpvErrors::LPV_E_SIGN_NO_SIGNER` (0x0503).
 
 ---- pdxb_sign_inode_tail(inode_ptr, tail_offset, tail_len, seed_ptr, out_sig_ptr) -> written_or_err
 Same signing path as `pdxb_sign_superblock`, over an arbitrary
 `inode_ptr[tail_offset, tail_offset + tail_len)` byte range instead of
-a fixed superblock prefix. Deferred consumer — no `fsck.pdxfs` exists
-yet to call this. The caller MUST guarantee `out_sig_ptr` has at least
-3309 writable bytes; there is no `out_sig_len` argument to gate on
-(unlike `pdxb_sign_superblock`).
+a fixed superblock prefix. Same three-sentinel return contract
+(success = 3309, `PDXB_SIGN_ERR_NO_SIGNER` on the satellite-runtime
+fail-closed stub, `PDXB_SIGN_ERR` on any other non-zero return).
+Deferred consumer — no `fsck.pdxfs` exists yet to call this. The
+caller MUST guarantee `out_sig_ptr` has at least 3309 writable bytes;
+there is no `out_sig_len` argument to gate on (unlike
+`pdxb_sign_superblock`).
 
 ---- pdxb_verify_inode_tail(inode_ptr, tail_offset, tail_len, sig_ptr, sig_len, pub_key_slot) -> err
 **STUB — fail-closed by construction.** Always returns
@@ -269,6 +281,45 @@ test contracts: `tests/README.md`. Release workflow:
 `release/RELEASE-1.0.0.md`.
 
 ==== VERSION
+libpdx-volume 1.1.5 (patch on v1.1.4: R91-XREPO.M1 Phase D — surface
+`paideia-satellite-runtime`'s fail-closed signer sentinel upward).
+`pdxb_sign_superblock` and `pdxb_sign_inode_tail` now translate a
+`PDX_MLDSA_ERR_NO_SIGNER = -6` (`0xFFFFFFFFFFFFFFFA` as u64) return
+from the `MlDsa65::sign` intrinsic into a distinct
+`PDXB_SIGN_ERR_NO_SIGNER` sentinel with the same numeric value, rather
+than mapping it to the generic `PDXB_SIGN_ERR` (`0xFFFFFFFFFFFFFFFF`)
+as v1.1.4 did. `LpvErrors::LPV_E_SIGN_NO_SIGNER` (0x0503) is the
+banded companion for callers on the `LPV_E_*` idiom, with matching
+`lpv_msg_sign_no_signer` string. This is the §3.2 "Consequence for
+libpdx-volume" cleanup that pairs with the shim's fail-closed stub;
+it is the §8 R4 mitigation ("fail-closed signer masquerading as
+success"). Additive source-only change; every v1.1.4 API surface
+remains byte-for-byte compatible (a caller checking `!= 0` for
+failure sees the same failure verdict — only the specific sentinel
+value changes from `0xFFFFFFFFFFFFFFFF` to `0xFFFFFFFFFFFFFFFA` on
+the NO_SIGNER path). No satellite tool currently uses signing at
+runtime (mkfs/mount/umount.pdxfs all default to the PUBLIC key for
+`sig_key_hash` computation), so no consumer behaviour changes at
+this landing — the surfacing exists for the moment a signing
+consumer lands. See `design/infrastructure/satellite-runtime-shim.md`
+§3.2 + §5 Step 6 + §8 R4 in the paideia-os repo.
+
+libpdx-volume 1.1.4 (patch on v1.1.3: additive `--extra-archive PATH`
+flag on `tools/build.sh` for R91-XREPO.M1 satellite-runtime-shim
+Phase C uniform-invocation contract). Parsed-and-stored only in this
+repo (no runnable ELF here); paths are appended to a bash
+`EXTRA_ARCHIVES=()` array a future link step would consume. No source
+API surface changes.
+
+libpdx-volume 1.1.3 (patch on v1.1.2: closes issue #35 — the three
+`tests/test_*.pdx` files each defined an unnamespaced top-level `run`
+symbol, causing satellite tools that link against `libpdx-volume` via
+`--extra-obj-dir` to hit `multiple definition of 'run'` at final ld.
+Source-only rename to `test_pdxb_roundtrip_run` /
+`test_pdxb_sigverify_run` / `test_mount_table_snapshot_run` matching
+the reserved-label prefix discipline every non-test module already
+follows).
+
 libpdx-volume 1.1.2 (patch on v1.1.1: additive superblock setter
 accessors). Closes issue #34 (six new write accessors symmetric to
 the existing read accessors on `PdxbSuperblockSummary` in

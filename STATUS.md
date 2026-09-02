@@ -5,11 +5,18 @@
 setter accessors) — landed. LV.M7 (v1.1.1 patch — quota
 input-contract + arithmetic-wrap guard) landed. LV.M6 (multivol
 ordering) landed (partial) at v1.1.0.
-**Version:** 1.1.3 (patch on v1.1.2: closes issue #35 — test-`run` symbol rename)
-**Version history:** 1.1.2 (patch on v1.1.1: closes issue #34 in
-`src/pdxb_superblock.pdx`; release manifest scaffolded; dual-sign +
-mirror push deferred — see `release/RELEASE-1.0.0.md` §3, still
-applicable at 1.1.2)
+**Version:** 1.1.5 (patch on v1.1.4: R91-XREPO.M1 Phase D — surface
+`paideia-satellite-runtime`'s `PDX_MLDSA_ERR_NO_SIGNER = -6`
+fail-closed sentinel upward through `pdxb_sign_superblock` /
+`pdxb_sign_inode_tail` as a distinct `PDXB_SIGN_ERR_NO_SIGNER`
+sentinel rather than swallowing it into the generic `PDXB_SIGN_ERR`).
+**Version history:** 1.1.4 (patch on v1.1.3: additive
+`--extra-archive PATH` flag on `tools/build.sh` for
+R91-XREPO.M1 Phase C uniform-invocation contract); 1.1.3 (patch on
+v1.1.2: closes issue #35 — test-`run` symbol rename); 1.1.2 (patch
+on v1.1.1: closes issue #34 in `src/pdxb_superblock.pdx`; release
+manifest scaffolded; dual-sign + mirror push deferred — see
+`release/RELEASE-1.0.0.md` §3, still applicable at 1.1.5)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the

@@ -94,6 +94,14 @@ module LpvErrors = structure {
   // Signing (band 0x0500)
   pub let LPV_E_SIGN_FAIL      : u64 = 0x0501
   pub let LPV_E_SIGN_TOO_SHORT : u64 = 0x0502
+  // Banded companion to PdxbSign::PDXB_SIGN_ERR_NO_SIGNER
+  // (0xFFFFFFFFFFFFFFFA, -6 as u64). Added at v1.1.5 (R91-XREPO.M1
+  // Phase D) so callers on the LPV_E_* idiom can log "sign: no signer
+  // in this build" specifically when a satellite ELF runs the
+  // fail-closed paideia-satellite-runtime signer stub instead of a
+  // real MlDsa65::sign body. See
+  // design/infrastructure/satellite-runtime-shim.md §3.2.
+  pub let LPV_E_SIGN_NO_SIGNER : u64 = 0x0503
 
   // Verify (band 0x0600)
   pub let LPV_E_VER_NOT_IMPLEMENTED : u64 = 0x0601
@@ -151,6 +159,7 @@ module LpvErrors = structure {
   pub let lpv_msg_pdxb_crc_bad     : [u8; 20] = "pdxb: crc mismatch\0\0"
   pub let lpv_msg_sign_fail        : [u8; 12] = "sign: fail\0\0"
   pub let lpv_msg_sign_too_short   : [u8; 17] = "sign: buf short\0\0"
+  pub let lpv_msg_sign_no_signer   : [u8; 17] = "sign: no signer\0\0"
   pub let lpv_msg_ver_not_impl     : [u8; 15] = "ver: not impl\0\0"
   pub let lpv_msg_ver_tampered     : [u8; 15] = "ver: tampered\0\0"
   pub let lpv_msg_ver_no_pubkey    : [u8; 16] = "ver: no pubkey\0\0"
