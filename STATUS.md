@@ -1,13 +1,15 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** LV.M7 (v1.1.1 patch — quota input-contract +
-arithmetic-wrap guard) — landed. LV.M6 (multivol ordering) landed
-(partial) at v1.1.0.
-**Version:** 1.1.1 (patch on v1.1.0: closes issues #32 + #33 in
-`src/pdxb_quota.pdx`; release manifest scaffolded; dual-sign + mirror
-push deferred — see `release/RELEASE-1.0.0.md` §3, still applicable at
-1.1.1)
+**Current milestone:** LV.M8 (v1.1.2 patch — additive superblock
+setter accessors) — landed. LV.M7 (v1.1.1 patch — quota
+input-contract + arithmetic-wrap guard) landed. LV.M6 (multivol
+ordering) landed (partial) at v1.1.0.
+**Version:** 1.1.3 (patch on v1.1.2: closes issue #35 — test-`run` symbol rename)
+**Version history:** 1.1.2 (patch on v1.1.1: closes issue #34 in
+`src/pdxb_superblock.pdx`; release manifest scaffolded; dual-sign +
+mirror push deferred — see `release/RELEASE-1.0.0.md` §3, still
+applicable at 1.1.2)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -250,6 +252,24 @@ Source-only changes; ABI byte-identical to v1.1.0. Full breakdown in
       `blocks_used + block_delta` via `add; jb lpv_qc_overflow_refuse`
       returning `LPV_QUOTA_HARD_EXCEEDED`. Sibling
       `pdxb_quota_commit`'s existing underflow clamp is unchanged.
+
+### LV.M8 — Phase-2 patch (v1.1.2, landed)
+
+Accessor-parity finding closed against v1.1.1's superblock accessor
+surface. Source-only additive changes; ABI byte-identical to v1.1.1.
+Full breakdown in `CHANGELOG.md`'s v1.1.2 stanza.
+
+- [x] **#34** — six write accessors added to `src/pdxb_superblock.pdx`
+      symmetric to the existing read accessors on
+      `PdxbSuperblockSummary`: `pdxb_sb_set_itable_lba`,
+      `pdxb_sb_set_itable_bcount`, `pdxb_sb_set_alloc_lba`,
+      `pdxb_sb_set_alloc_bcount`, `pdxb_sb_set_journal_lba`,
+      `pdxb_sb_set_journal_bcount`. 1-store leaves mirroring the
+      shape of the existing `pdxb_sb_set_total_blocks` /
+      `pdxb_sb_set_root_inode` siblings. Flagged to main: three
+      further getters (`data_lba`, `data_bcount`,
+      `sig_key_hash_word`) still lack setter siblings; out of scope
+      for #34, a follow-up ticket may close the remaining gap.
 
 ## Next milestone
 

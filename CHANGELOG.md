@@ -1,5 +1,59 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.3 — 2026-09-02 (patch: rename tests-*.o `run` symbols per-test)
+
+**Patch release** closing #35: build-out shipped 3 test objects each
+defining an unnamespaced top-level `run` symbol, causing satellite
+tools that link against libpdx-volume via `--extra-obj-dir` to hit
+`multiple definition of 'run'` at final ld. Source-only rename; no
+library API surface affected.
+
+### Fixed
+
+- **#35** — renamed `run` in `tests/test_pdxb_roundtrip.pdx`,
+  `tests/test_pdxb_sigverify.pdx`, `tests/test_mount_table_snapshot.pdx`
+  to `test_pdxb_roundtrip_run` / `test_pdxb_sigverify_run` /
+  `test_mount_table_snapshot_run` respectively (matches the
+  reserved-label prefix discipline every non-test module already
+  follows). Test-runner callers were already invoking via external
+  driver, so no in-tree caller updates needed. Build-out's
+  `tests-*.o` regenerated with the new symbol names; satellites
+  linking against `build-out/` no longer collide.
+
+## 1.1.2 — 2026-09-02 (patch: additive superblock setter accessors)
+
+**Patch release** closing one Phase-2 accessor-coverage finding against
+the v1.1.1 superblock accessor surface. Source-only, additive
+changes; every v1.1.1 API surface remains byte-for-byte compatible.
+
+### Added
+
+- **#34** `src/pdxb_superblock.pdx` — six new write accessors
+  symmetric to the existing read accessors on `PdxbSuperblockSummary`
+  (176-byte decoded layout), closing an accessor-parity gap where
+  the getters exist but the setter siblings did not:
+  - `pdxb_sb_set_itable_lba`      (SBS_OFF_ITABLE_LBA,     +56)
+  - `pdxb_sb_set_itable_bcount`   (SBS_OFF_ITABLE_BCOUNT,  +64)
+  - `pdxb_sb_set_alloc_lba`       (SBS_OFF_ALLOC_LBA,      +72)
+  - `pdxb_sb_set_alloc_bcount`    (SBS_OFF_ALLOC_BCOUNT,   +80)
+  - `pdxb_sb_set_journal_lba`     (SBS_OFF_JOURNAL_LBA,    +88)
+  - `pdxb_sb_set_journal_bcount`  (SBS_OFF_JOURNAL_BCOUNT, +96)
+  Each is a 1-store leaf mirroring the shape of the existing
+  `pdxb_sb_set_total_blocks` / `pdxb_sb_set_root_inode` siblings:
+  `mov [rdi + SBS_OFF_*], rsi; xor rax, rax; ret;`. Signature
+  `(u64, u64) -> u64 !{mem} @{}` matches the other setters (return
+  slot cleared to 0). Inserted between `pdxb_sb_set_total_blocks`
+  (+48) and `pdxb_sb_set_root_inode` (+120) to preserve on-disk
+  offset ordering in the setter section.
+
+### Deferred
+
+- `pdxb_sb_set_data_lba` (+104), `pdxb_sb_set_data_bcount` (+112),
+  and `pdxb_sb_set_sig_key_hash_word` are still missing setter
+  siblings for existing getters. Not in the scope of #34 (which
+  enumerated only the itable/alloc/journal six); flagged to main for
+  a follow-up ticket if full accessor parity is desired.
+
 ## 1.1.1 — 2026-09-02 (patch: quota input-contract + arithmetic-wrap guard)
 
 **Patch release** closing two Phase-2 audit findings against the v1.1.0

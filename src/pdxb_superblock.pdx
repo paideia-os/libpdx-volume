@@ -698,6 +698,48 @@ module PdxbSuperblock = structure {
       block: { mov [rdi + 48], rsi; xor rax, rax; ret; }
     }
 
+  pub let pdxb_sb_set_itable_lba : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18) + v1.1.2 (#34): setter for SBS_OFF_ITABLE_LBA (+56). Symmetric to pdxb_sb_get_itable_lba; 1-store leaf mirroring the sibling set_* accessors above.",
+      block: { mov [rdi + 56], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_itable_bcount : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18) + v1.1.2 (#34): setter for SBS_OFF_ITABLE_BCOUNT (+64). Symmetric to pdxb_sb_get_itable_bcount.",
+      block: { mov [rdi + 64], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_alloc_lba : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18) + v1.1.2 (#34): setter for SBS_OFF_ALLOC_LBA (+72). Symmetric to pdxb_sb_get_alloc_lba.",
+      block: { mov [rdi + 72], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_alloc_bcount : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18) + v1.1.2 (#34): setter for SBS_OFF_ALLOC_BCOUNT (+80). Symmetric to pdxb_sb_get_alloc_bcount.",
+      block: { mov [rdi + 80], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_journal_lba : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18) + v1.1.2 (#34): setter for SBS_OFF_JOURNAL_LBA (+88). Symmetric to pdxb_sb_get_journal_lba.",
+      block: { mov [rdi + 88], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_journal_bcount : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18) + v1.1.2 (#34): setter for SBS_OFF_JOURNAL_BCOUNT (+96). Symmetric to pdxb_sb_get_journal_bcount.",
+      block: { mov [rdi + 96], rsi; xor rax, rax; ret; }
+    }
+
   pub let pdxb_sb_set_root_inode : (u64, u64) -> u64 !{mem} @{} =
     fn (sb_ptr: u64) (value: u64) -> unsafe {
       effects: {mem}, capabilities: {},

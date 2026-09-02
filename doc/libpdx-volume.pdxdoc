@@ -269,6 +269,15 @@ test contracts: `tests/README.md`. Release workflow:
 `release/RELEASE-1.0.0.md`.
 
 ==== VERSION
+libpdx-volume 1.1.2 (patch on v1.1.1: additive superblock setter
+accessors). Closes issue #34 (six new write accessors symmetric to
+the existing read accessors on `PdxbSuperblockSummary` in
+`src/pdxb_superblock.pdx`: `pdxb_sb_set_itable_lba`,
+`pdxb_sb_set_itable_bcount`, `pdxb_sb_set_alloc_lba`,
+`pdxb_sb_set_alloc_bcount`, `pdxb_sb_set_journal_lba`,
+`pdxb_sb_set_journal_bcount`). Additive source-only change; every
+v1.1.1 API surface remains byte-for-byte compatible.
+
 libpdx-volume 1.1.1 (patch on v1.1.0: quota input-contract
 clarification + arithmetic-wrap refusal). Closes issues #32 (parameter
 rename `quota_row_ptr` → `quota_summary_ptr` on `pdxb_quota_check` /
