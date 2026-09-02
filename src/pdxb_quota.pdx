@@ -54,6 +54,12 @@
 //     both directions. The underflow clamp uses cmp-then-branch (not
 //     SETcc) to stay within the encoder-conservative discipline.
 //   - No add reg,[mem]; no test; only cmp reg,imm/reg.
+//   - Overflow-refuse (v1.1.1, issue #33): pdxb_quota_check uses
+//     `add; jb` to detect u64 wrap on `blocks_used + block_delta`
+//     and jumps to `lpv_qc_overflow_refuse` (returns HARD_EXCEEDED)
+//     rather than let a wrapped value fool the cmp-vs-hard branch.
+//     `jb` == jump-if-carry per the paideia-as encoder discipline
+//     (precedent: kernel/core/syscall/ptr_check.pdx:56).
 //   - Label prefixes: `lpv_qp_` (parse), `lpv_qe_` (encode),
 //     `lpv_ql_` (lookup), `lpv_qc_` (check), `lpv_qm_` (commit).
 //
@@ -323,10 +329,45 @@ module PdxbQuota = structure {
     }
 
   // ==========================================================================
-  // pdxb_quota_check(quota_row_ptr, block_delta, inode_delta, grace_expired)
-  //   -> u64
+  // INPUT-CONTRACT (pdxb_quota_check + pdxb_quota_commit) -- v1.1.1
+  // --------------------------------------------------------------------------
+  // Both `pdxb_quota_check` and `pdxb_quota_commit` operate on the
+  // DECODED 64-byte summary layout (11 u64 slots, PDXQ_SUMMARY_BYTES = 88)
+  // that `pdxb_quota_row_parse` writes -- NOT on the raw on-disk 64-byte
+  // row itself. The field offsets loaded through `rdi` inside both
+  // bodies (`+40` blocks_used, `+48` blocks_soft, `+56` blocks_hard,
+  // `+0` magic) are the PDXQ_OFF_* summary offsets, distinct from the
+  // packed on-disk PDXQ_D_OFF_* offsets (e.g. blocks_used lives at
+  // on-disk +24 vs summary +40).
   //
-  // libpdx-volume.M4-002 (#28). Reads the row's magic/blocks_soft/
+  // Callers MUST parse the raw row first:
+  //
+  //     let mut sum : [u64; 11]
+  //     let rc = pdxb_quota_row_parse(raw_row_ptr, &sum);
+  //     if rc != 0 { return rc; }
+  //     let check_rc = pdxb_quota_check(&sum, block_delta,
+  //                                     inode_delta, grace_expired);
+  //     ...
+  //     pdxb_quota_commit(&sum, block_delta, inode_delta);
+  //
+  // Passing the raw on-disk row directly is a wire-format-vs-summary
+  // layout mismatch: fields will be read from the wrong offsets and
+  // the magic gate (mov_d = u32 load at +0) still
+  // observe PDXQ_MAGIC by accident, so the mismatch fails silently
+  // rather than at a gate. The parameter is therefore named
+  // `quota_summary_ptr` (not `quota_row_ptr`) to make the layout
+  // expected at call sites unambiguous.
+  //
+  // See doc/libpdx-volume.pdxdoc SectionQuotas and
+  // design/architecture.md Section11.9 for the same distinction from
+  // the consumer's angle.
+  // ==========================================================================
+
+  // ==========================================================================
+  // pdxb_quota_check(quota_summary_ptr, block_delta, inode_delta,
+  //                  grace_expired) -> u64
+  //
+  // libpdx-volume.M4-002 (#28). Reads the summary's magic/blocks_soft/
   // blocks_hard/blocks_used slots (via the M4-001 summary layout,
   // interpreted through PDXQ_OFF_*) and gates the caller's delta.
   //
@@ -334,17 +375,29 @@ module PdxbQuota = structure {
   //   0 (LPV_QUOTA_OK)                  - fits within soft
   //   0x0801 (LPV_QUOTA_SOFT_EXCEEDED)  - over soft, under hard, grace ok
   //   0x0802 (LPV_QUOTA_SOFT_GRACE_EXPIRED) - over soft, grace expired
-  //   0x0803 (LPV_QUOTA_HARD_EXCEEDED)  - over hard, always deny
+  //   0x0803 (LPV_QUOTA_HARD_EXCEEDED)  - over hard OR arithmetic wrap
+  //                                       on blocks_used + block_delta
+  //                                       (v1.1.1 -- issue #33)
   //   0x0804 (LPV_QUOTA_ERR_BAD_ROW)    - magic mismatch
   //
   // Semantics for `0 = no limit`:
   //   - blocks_soft == 0 -> never trip SOFT_EXCEEDED
   //   - blocks_hard == 0 -> never trip HARD_EXCEEDED
   //
+  // Overflow guard (v1.1.1, issue #33): `add r10, rsi` (blocks_used +
+  // block_delta) is followed by `jb lpv_qc_overflow_refuse` -- any
+  // unsigned wrap past 2^64 is treated as a hard-limit refusal rather
+  // than allowed to produce a wrong-branch verdict against
+  // blocks_hard / blocks_soft. This is the same defensive posture
+  // ptr_check.pdx (paideia-os) applies to `va + len` overflow.
+  //
   // Signed block_delta: negative deltas (freeing blocks) MUST NOT
   // underflow blocks_used. Underflow is silently clamped at 0 by the
   // COMMIT function; the CHECK function permits any delta whose target
-  // is <= hard (or unlimited).
+  // is <= hard (or unlimited). Note that the overflow guard above
+  // observes only true 2^64 wrap; the encoded "huge unsigned" form of
+  // a valid negative delta whose add doesn't span 2^64 remains
+  // permitted, and the subsequent cmp-vs-hard branch handles it.
   //
   // NOTE: inode_delta is accepted in the signature per the M4-002
   // brief but this v1.1.0 landing checks the BLOCK path only; inode
@@ -354,9 +407,9 @@ module PdxbQuota = structure {
   // valid inode_delta; the argument is checked-and-ignored here.
   // ==========================================================================
   pub let pdxb_quota_check : (u64, u64, u64, u64) -> u64 !{mem} @{} =
-    fn (quota_row_ptr: u64) (block_delta: u64) (inode_delta: u64) (grace_expired: u64) -> unsafe {
+    fn (quota_summary_ptr: u64) (block_delta: u64) (inode_delta: u64) (grace_expired: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-volume.M4-002 (#28): pdxb_quota_check real body. Magic gate: mov_d rax,[rdi+0] (PDXQ_OFF_MAGIC); cmp rax,0x50445851; jne bad_row. Compute new blocks_used: mov r10,[rdi+40] (PDXQ_OFF_BLOCKS_USED, u64); add r10,rsi (block_delta -- two's-complement add works for signed since we treat rsi as a raw i64 in a register). Check hard: mov r11,[rdi+56] (PDXQ_OFF_BLOCKS_HARD); cmp r11,0; je skip_hard; cmp r10,r11; ja hard_exceeded. skip_hard: mov r11,[rdi+48] (PDXQ_OFF_BLOCKS_SOFT); cmp r11,0; je ok; cmp r10,r11; jbe ok. Soft branch: cmp rcx,0 (grace_expired); je soft_ok; mov rax,0x0802 (SOFT_GRACE_EXPIRED); ret. soft_ok: mov rax,0x0801 (SOFT_EXCEEDED); ret. ok: xor rax,rax; ret. hard_exceeded: mov rax,0x0803; ret. bad_row: mov rax,0x0804; ret. All small imms; no add reg,[mem]; no test; only cmp reg,imm/reg. Labels prefixed lpv_qc_.",
+      justification: "libpdx-volume.M4-002 (#28) + v1.1.1 (#33): pdxb_quota_check real body. Magic gate: mov_d rax,[rdi+0] (PDXQ_OFF_MAGIC); cmp rax,0x50445851; jne bad_row. Compute new blocks_used: mov r10,[rdi+40] (PDXQ_OFF_BLOCKS_USED, u64); add r10,rsi (block_delta -- two's-complement add works for signed since we treat rsi as a raw i64 in a register); jb lpv_qc_overflow_refuse (issue #33: any raw 2^64 wrap on the add is refused as hard-exceeded rather than allowed to fool the cmp-vs-hard branches -- `jb` is the paideia-as encoder-preferred spelling of jump-if-carry, precedent in kernel/core/syscall/ptr_check.pdx:56). Check hard: mov r11,[rdi+56] (PDXQ_OFF_BLOCKS_HARD); cmp r11,0; je skip_hard; cmp r10,r11; ja hard_exceeded. skip_hard: mov r11,[rdi+48] (PDXQ_OFF_BLOCKS_SOFT); cmp r11,0; je ok; cmp r10,r11; jbe ok. Soft branch: cmp rcx,0 (grace_expired); je soft_ok; mov rax,0x0802 (SOFT_GRACE_EXPIRED); ret. soft_ok: mov rax,0x0801 (SOFT_EXCEEDED); ret. ok: xor rax,rax; ret. hard_exceeded / overflow_refuse: mov rax,0x0803; ret. bad_row: mov rax,0x0804; ret. All small imms; no add reg,[mem]; no test; only cmp reg,imm/reg. Labels prefixed lpv_qc_. Frame prologue implicit.",
       block: {
         // Magic gate.
         mov_d rax, [rdi + 0];
@@ -364,8 +417,14 @@ module PdxbQuota = structure {
         jne lpv_qc_bad_row;
 
         // new_blocks_used = blocks_used + block_delta
+        // Overflow guard (issue #33): if the add wraps past 2^64,
+        // refuse as hard-exceeded rather than let a wrapped r10 fool
+        // the cmp-vs-hard / cmp-vs-soft branches below. `jb` is the
+        // paideia-as encoder-preferred spelling of jump-if-carry
+        // (precedent: kernel/core/syscall/ptr_check.pdx:56).
         mov r10, [rdi + 40];
         add r10, rsi;
+        jb  lpv_qc_overflow_refuse;
 
         // Hard limit check.
         mov r11, [rdi + 56];
@@ -400,6 +459,16 @@ module PdxbQuota = structure {
         mov rax, 0x0803;                 // HARD_EXCEEDED
         ret;
 
+      lpv_qc_overflow_refuse:
+        // Issue #33: raw arithmetic wrap on blocks_used + block_delta.
+        // Treated as the same sentinel a normal hard-limit refusal
+        // returns -- the caller's remediation is identical (deny the
+        // write) and adding a distinct code would grow the public
+        // return surface for a corner case a well-behaved caller
+        // never hits.
+        mov rax, 0x0803;                 // HARD_EXCEEDED
+        ret;
+
       lpv_qc_bad_row:
         mov rax, 0x0804;                 // BAD_ROW
         ret;
@@ -407,12 +476,15 @@ module PdxbQuota = structure {
     }
 
   // ==========================================================================
-  // pdxb_quota_commit(quota_row_ptr, block_delta, inode_delta) -> u64
+  // pdxb_quota_commit(quota_summary_ptr, block_delta, inode_delta) -> u64
   //
-  // Atomically applies (block_delta, inode_delta) to the row's used
-  // counters. Underflow (negative delta pushing used below 0) is
-  // clamped to 0 -- soft failure, not fatal, since quota drift is
-  // recoverable via fsck.pdxfs's future recompute-blocks-used pass.
+  // Atomically applies (block_delta, inode_delta) to the summary's
+  // blocks_used slot (PDXQ_OFF_BLOCKS_USED, +40 into the 88-byte
+  // decoded summary -- NOT the raw on-disk +24 offset; see the
+  // INPUT-CONTRACT block above `pdxb_quota_check`). Underflow
+  // (negative delta pushing used below 0) is clamped to 0 -- soft
+  // failure, not fatal, since quota drift is recoverable via
+  // fsck.pdxfs's future recompute-blocks-used pass.
   //
   // Returns LPV_QUOTA_OK (0) always in this landing; a future
   // extension might return a distinct code on clamp so a fsck-style
@@ -422,7 +494,7 @@ module PdxbQuota = structure {
   // landing (block-only for v1.1.0). Follow-up covers inode.
   // ==========================================================================
   pub let pdxb_quota_commit : (u64, u64, u64) -> u64 !{mem} @{} =
-    fn (quota_row_ptr: u64) (block_delta: u64) (inode_delta: u64) -> unsafe {
+    fn (quota_summary_ptr: u64) (block_delta: u64) (inode_delta: u64) -> unsafe {
       effects: {mem}, capabilities: {},
       justification: "libpdx-volume.M4-002 (#28): pdxb_quota_commit real body. Load blocks_used: mov r10,[rdi+40]. new = r10 + rsi (add treats rsi as i64 -- two's-complement wraps). Underflow check: if block_delta is negative (bit 63 set) AND magnitude > r10, the add wraps past 0 into the high range. Detect via: if rsi's high bit is set (negative delta) AND new > r10 (wrapped), clamp to 0. Encoder-friendly form: mov r11,rsi; shr r11,63; cmp r11,0; je no_neg; cmp r10,r10_old... simpler: mov r11,r10 (old); add r10,rsi; if r10 < r11 AND rsi high bit set, clamp -- do it with mov r12,rsi; shr r12,63; cmp r12,0; je store; cmp r10,r11; ja clamp. Store: mov [rdi+40],r10. Return 0. Labels prefixed lpv_qm_. Uses r10/r11/r12 (caller-save). No add reg,[mem]; only cmp.",
       block: {

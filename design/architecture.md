@@ -903,3 +903,87 @@ The short list of external blockers:
 - `mount_table_sort_by_deps` full Kahn's body (#31)
 - Inode-quota enforcement (#28)
 - Full `lpv_strerror` dispatch table (#19)
+
+### 11.9 Quota check/commit input contract (v1.1.1 clarification)
+
+The v1.1.0 quota subsystem exposes **two** on-wire layouts for the
+same per-subject record, and the enforcement helpers
+(`pdxb_quota_check` / `pdxb_quota_commit`) accept only one of them.
+This subsection makes the split explicit; the v1.1.1 patch (issues
+#32, #33) hardens the interface against the two failure modes the
+Phase-2 audit surfaced.
+
+**Two offset families, two layouts.**
+
+- **Raw on-disk row** (64 bytes, packed) — the wire format the
+  quota-table blocks hold and `pdxb_quota_row_parse` /
+  `pdxb_quota_row_encode` translate. Field offsets are the
+  `PDXQ_D_OFF_*` family (`_D_` = disk): `magic` at `+0` (u32),
+  `blocks_used` at `+24`, `blocks_soft` at `+32`, `blocks_hard` at
+  `+40`, `inodes_soft_hard` packed at `+56`.
+- **Decoded summary** (88 bytes, 11 aligned u64 slots,
+  `PDXQ_SUMMARY_BYTES = 88`) — the in-memory form
+  `pdxb_quota_row_parse` writes to its `out_ptr`. Field offsets are
+  the `PDXQ_OFF_*` family: `magic` at `+0` (u64 slot, but the gate
+  reads it via `mov_d` = 32-bit load — see failure-mode below),
+  `blocks_used` at `+40`,
+  `blocks_soft` at `+48`, `blocks_hard` at `+56`, `inodes_soft` and
+  `inodes_hard` separated into their own `+72` / `+80` slots. This
+  matches the u64-slot-per-field discipline every other summary
+  struct in this library follows (§3 for the superblock, §4.1 for
+  the mount-table row).
+
+The layouts share NO non-magic offset. `blocks_used` sits at +24 on
+disk and +40 in the summary; `blocks_hard` sits at +40 on disk (the
+same byte offset that the summary uses for `blocks_used`) and at
++56 in the summary. A caller who passes a raw on-disk row directly
+to `pdxb_quota_check` triggers a silent-mismatch bug:
+
+1. The magic gate at `+0` still observes `PDXQ_MAGIC` — the gate
+   reads via `mov_d` (32-bit load), and both layouts store the
+   identical 4-byte magic at their own offset 0, so a 32-bit gate
+   cannot distinguish them — BAD_ROW does NOT fire. (A future
+   widening of the gate to a u64 read would catch the mismatch on
+   most realistic rows because bytes 4-7 of the on-disk row carry
+   non-zero version/subject_kind fields; that hardening is deferred.)
+2. The helper then reads `blocks_used` from the packed
+   `inodes_used`/`inodes_soft_hard` region, `blocks_hard` from the
+   packed row's own `inodes_used`, and emits a hard/soft verdict
+   against garbage.
+
+**v1.1.1 fix (issue #32).** Both helpers' first parameter is renamed
+to `quota_summary_ptr`. Source-only rename: no ABI shift, no offset
+change, no consumer update required — existing v1.1.0 callers keep
+compiling. The rename plus the header block above the two functions
+in `src/pdxb_quota.pdx` make the input contract unambiguous at
+grep-time.
+
+**Arithmetic-wrap guard (issue #33).** `pdxb_quota_check` computes
+`new_used = blocks_used + block_delta` via a raw `add r10, rsi` that
+does not distinguish signed from unsigned. A caller passing a
+`block_delta` large enough to wrap `blocks_used` past 2^64 (either
+huge positive, or the encoded form of a negative delta whose add
+happens to span 2^64) would let a wrapped `r10` fool the subsequent
+cmp-vs-hard / cmp-vs-soft branches into the wrong verdict. v1.1.1
+adds `jb lpv_qc_overflow_refuse` immediately after the add: any raw
+wrap is treated as `LPV_QUOTA_HARD_EXCEEDED` (the same sentinel a
+normal hard-limit refusal returns; growing the public return
+surface for a corner case a well-behaved caller never hits was not
+judged worth it).
+
+`jb` (jump if below, same as jump-if-carry) is the paideia-as
+encoder-preferred spelling — precedent in the paideia-os kernel at
+`src/kernel/core/syscall/ptr_check.pdx:56`, where the same
+`va + len` wrap is caught by `add; jb`.
+
+**Underflow clamp (unchanged from v1.1.0).** `pdxb_quota_commit`
+already handles negative deltas whose magnitude exceeds `blocks_used`
+by clamping the result to 0 (see `src/pdxb_quota.pdx`, `lpv_qm_*`
+labels). No change at v1.1.1.
+
+**Doc pointers.** `doc/libpdx-volume.pdxdoc` §QUOTAS carries the
+full call-site walk (parse → check → commit → re-encode) and the
+side-by-side offset table. `src/pdxb_quota.pdx`'s per-function
+headers repeat the contract at the code, on the discipline that a
+caller reading the source shouldn't have to open a .pdxdoc file to
+see which layout the helper expects.

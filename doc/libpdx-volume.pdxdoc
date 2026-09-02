@@ -269,6 +269,14 @@ test contracts: `tests/README.md`. Release workflow:
 `release/RELEASE-1.0.0.md`.
 
 ==== VERSION
+libpdx-volume 1.1.1 (patch on v1.1.0: quota input-contract
+clarification + arithmetic-wrap refusal). Closes issues #32 (parameter
+rename `quota_row_ptr` → `quota_summary_ptr` on `pdxb_quota_check` /
+`pdxb_quota_commit`, plus [[cref: QUOTAS]] documenting the raw-row vs
+decoded-summary distinction) and #33 (overflow guard on
+`blocks_used + block_delta` inside `pdxb_quota_check`). Source-only
+change; ABI byte-identical to v1.1.0.
+
 libpdx-volume 1.1.0 (LV.M1..LV.M6 audit-driven follow-up over the
 v1.0.0 R53 wave). Additive minor release closing 16 tickets
 (#16..#31); every v1.0.0 API surface is preserved byte-for-byte. See
@@ -300,7 +308,8 @@ Full contracts in each module's own header + `design/architecture.md`
   documented; `pdxb_quota_row_parse` / `_row_encode` / `_table_lookup`
   real bodies; `pdxb_quota_check` (4 return codes + BAD_ROW);
   `pdxb_quota_commit` with underflow clamp. Block path fully wired;
-  inode path is a follow-up.
+  inode path is a follow-up. See [[cref: QUOTAS]] for the layout
+  contract shared by `_check` / `_commit`.
 - **`src/pdxb_crypto.pdx`** — `KIND_KEK = 0x1A2`; `pdxb_kek_derive`
   (Argon2id RFC 9106 profile); `pdxb_dek_wrap` / `_unwrap` (ChaCha20-
   Poly1305); `pdxb_block_encrypt` / `_decrypt` stubs pending
@@ -324,3 +333,85 @@ Full contracts in each module's own header + `design/architecture.md`
 - **`src/vol_kind.pdx`** additions: `vol_kind_mint_elevate(dev_cap,
   elevate_channel_slot, out_slot)` — 3-arg elevate-aware form; body
   stubs pending kernel-side mint syscall + libpdx-elevate link.
+
+==== QUOTAS
+The quota subsystem exposes two on-wire layouts that a caller MUST
+NOT confuse. Both `pdxb_quota_check` and `pdxb_quota_commit` (v1.1.1,
+issue #32) operate on the DECODED summary layout, not on the raw
+on-disk row; their first parameter is named `quota_summary_ptr` to
+make this unambiguous at every call site.
+
+---- Two layouts, two offset families
+
+**Raw on-disk row** (64 bytes, packed) — the wire format `mkfs.pdxfs`
+writes to the quota-table blocks and `pdxb_quota_row_parse` /
+`pdxb_quota_row_encode` read/write. Field offsets are the
+`PDXQ_D_OFF_*` family:
+
+    [+0]   magic         (u32,  PDXQ_D_OFF_MAGIC           = 0)
+    [+4]   version       (u16,  PDXQ_D_OFF_VERSION         = 4)
+    [+6]   subject_kind  (u8,   PDXQ_D_OFF_SUBJECT_KIND    = 6)
+    [+8]   subject_id_lo (u64,  PDXQ_D_OFF_SUBJECT_ID_LO   = 8)
+    [+16]  subject_id_hi (u64,  PDXQ_D_OFF_SUBJECT_ID_HI   = 16)
+    [+24]  blocks_used   (u64,  PDXQ_D_OFF_BLOCKS_USED     = 24)
+    [+32]  blocks_soft   (u64,  PDXQ_D_OFF_BLOCKS_SOFT     = 32)
+    [+40]  blocks_hard   (u64,  PDXQ_D_OFF_BLOCKS_HARD     = 40)
+    [+48]  inodes_used   (u64,  PDXQ_D_OFF_INODES_USED     = 48)
+    [+56]  inodes_soft_hard  (packed u64,
+                              PDXQ_D_OFF_INODES_SOFT_HARD  = 56)
+
+**Decoded summary** (88 bytes, 11 aligned u64 slots) — the in-memory
+form `pdxb_quota_row_parse` writes to `out_ptr` and every enforcement
+helper reads. Field offsets are the `PDXQ_OFF_*` family:
+
+    [+0]   magic         (PDXQ_OFF_MAGIC          = 0)
+    [+8]   version       (PDXQ_OFF_VERSION        = 8)
+    [+16]  subject_kind  (PDXQ_OFF_SUBJECT_KIND   = 16)
+    [+24]  subject_id_lo (PDXQ_OFF_SUBJECT_ID_LO  = 24)
+    [+32]  subject_id_hi (PDXQ_OFF_SUBJECT_ID_HI  = 32)
+    [+40]  blocks_used   (PDXQ_OFF_BLOCKS_USED    = 40)
+    [+48]  blocks_soft   (PDXQ_OFF_BLOCKS_SOFT    = 48)
+    [+56]  blocks_hard   (PDXQ_OFF_BLOCKS_HARD    = 56)
+    [+64]  inodes_used   (PDXQ_OFF_INODES_USED    = 64)
+    [+72]  inodes_soft   (PDXQ_OFF_INODES_SOFT    = 72,
+                          decoded high half of inodes_soft_hard)
+    [+80]  inodes_hard   (PDXQ_OFF_INODES_HARD    = 80,
+                          decoded low half of inodes_soft_hard)
+
+The layouts share none of their non-magic offsets. `blocks_used`, for
+example, is at +24 on disk and +40 in the summary. Passing a raw
+on-disk row directly to `pdxb_quota_check` or `pdxb_quota_commit` is a
+silent-mismatch bug: the `mov_d` (u32) magic gate at `+0` still observes
+`PDXQ_MAGIC` by accident, so the BAD_ROW gate does NOT fire; the
+helper then reads blocks_used from what is really the packed
+inodes_used/inodes_soft_hard region and emits a nonsense verdict.
+
+---- Compose parse → check → commit
+
+    // Raw on-disk row (64 bytes) came from a block read.
+    let mut summary : [u8; 88]   // PDXQ_SUMMARY_BYTES
+    let rc = pdxb_quota_row_parse(raw_row_ptr, &summary)
+    if rc != 0 { return rc }     // BAD_ROW etc.
+
+    // Enforcement helpers take the DECODED summary, not the raw row.
+    let check_rc = pdxb_quota_check(&summary,
+                                    block_delta,
+                                    inode_delta,
+                                    grace_expired)
+    if check_rc == LPV_QUOTA_HARD_EXCEEDED
+       || check_rc == LPV_QUOTA_SOFT_GRACE_EXPIRED { return check_rc }
+
+    // Apply the delta (underflow clamped, arithmetic wrap refused
+    // upstream in _check).
+    pdxb_quota_commit(&summary, block_delta, inode_delta)
+
+    // To persist, re-encode the mutated summary back to the on-disk
+    // row and write it through the block device.
+    pdxb_quota_row_encode(&summary, raw_row_ptr)
+
+The v1.1.1 rename from `quota_row_ptr` to `quota_summary_ptr` is
+source-only: no ABI or offset shift, and existing v1.1.0 callers keep
+compiling. `pdxb_quota_check` additionally refuses raw-arithmetic
+wrap on `blocks_used + block_delta` with `LPV_QUOTA_HARD_EXCEEDED`
+(issue #33), matching the defensive posture
+`kernel/core/syscall/ptr_check.pdx` uses for `va + len` overflow.

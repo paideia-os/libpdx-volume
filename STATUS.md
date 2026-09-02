@@ -1,10 +1,13 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** LV.M6 (multivol ordering) — landed (partial)
-**Version:** 1.1.0 (release manifest scaffolded; dual-sign + mirror
+**Current milestone:** LV.M7 (v1.1.1 patch — quota input-contract +
+arithmetic-wrap guard) — landed. LV.M6 (multivol ordering) landed
+(partial) at v1.1.0.
+**Version:** 1.1.1 (patch on v1.1.0: closes issues #32 + #33 in
+`src/pdxb_quota.pdx`; release manifest scaffolded; dual-sign + mirror
 push deferred — see `release/RELEASE-1.0.0.md` §3, still applicable at
-1.1.0)
+1.1.1)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -230,14 +233,33 @@ section; per-ticket landing state:
         mountall.pdxfs input-shape agreement). New file
         `src/mount_deps.pdx`.
 
+### LV.M7 — Phase-2 patch (v1.1.1, landed)
+
+Two audit findings closed against v1.1.0's quota subsystem.
+Source-only changes; ABI byte-identical to v1.1.0. Full breakdown in
+`CHANGELOG.md`'s v1.1.1 stanza; two-layout distinction documented in
+`design/architecture.md` §11.9 and `doc/libpdx-volume.pdxdoc`
+§QUOTAS.
+
+- [x] **#32** — `pdxb_quota_check` / `pdxb_quota_commit` parameter
+      renamed from `quota_row_ptr` to `quota_summary_ptr` in
+      `src/pdxb_quota.pdx` to reflect that the helpers operate on the
+      decoded 88-byte summary layout (offsets `PDXQ_OFF_*`), not the
+      raw 64-byte on-disk row (offsets `PDXQ_D_OFF_*`).
+- [x] **#33** — `pdxb_quota_check` overflow guard on
+      `blocks_used + block_delta` via `add; jb lpv_qc_overflow_refuse`
+      returning `LPV_QUOTA_HARD_EXCEEDED`. Sibling
+      `pdxb_quota_commit`'s existing underflow clamp is unchanged.
+
 ## Next milestone
 
 All 16 v1.1.0 tickets accounted for; four (#21, #22 partial, #23
 partial, #24 partial) have external blockers documented above. The
-next tempo tick is either (a) close the external blockers as their
-substrates land, or (b) file a follow-up wave once mkfs.pdxfs /
-mount.pdxfs / umount.pdxfs start landing in the paideia-os tree so
-the smoke witness (#24) can run for real.
+v1.1.1 patch (LV.M7 above) closed #32 + #33 against the quota
+subsystem. The next tempo tick is either (a) close the external
+blockers as their substrates land, or (b) file a follow-up wave once
+mkfs.pdxfs / mount.pdxfs / umount.pdxfs start landing in the
+paideia-os tree so the smoke witness (#24) can run for real.
 
 Deferred to a future patch/minor release (see `CHANGELOG.md`'s semver
 policy):

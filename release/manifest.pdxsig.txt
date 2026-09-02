@@ -1,4 +1,4 @@
-# libpdx-volume v1.1.0 — release manifest (source form)
+# libpdx-volume v1.1.1 — release manifest (source form)
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
@@ -34,12 +34,12 @@
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        libpdx-volume
-package-version:     1.1.0
-package-release:     LV.M1-M6 (v1.1.0 minor -- audit-driven follow-up)
+package-version:     1.1.1
+package-release:     LV.M7 (v1.1.1 patch -- quota input-contract + wrap guard)
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/libpdx-volume
-source-commit:       <TAG-v1.1.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.1.0
+source-commit:       <TAG-v1.1.1-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.1.1
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash

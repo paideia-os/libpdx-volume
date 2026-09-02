@@ -1,5 +1,72 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.1 — 2026-09-02 (patch: quota input-contract + arithmetic-wrap guard)
+
+**Patch release** closing two Phase-2 audit findings against the v1.1.0
+quota subsystem. Source-only changes; every v1.1.0 API surface remains
+byte-for-byte compatible. Both `pdxb_quota_check` and `pdxb_quota_commit`
+keep their `(u64, u64, u64, u64) -> u64` / `(u64, u64, u64) -> u64`
+signatures unchanged — only the first parameter's spelling and the
+enforcement helper's overflow behaviour move.
+
+### Fixed
+
+- **#32** `pdxb_quota_check` / `pdxb_quota_commit` — parameter renamed
+  from `quota_row_ptr` to `quota_summary_ptr` (source-only; ABI
+  unchanged). The name previously suggested the raw on-disk 64-byte
+  row, but both helpers actually operate on the decoded 88-byte
+  summary layout produced by `pdxb_quota_row_parse` (the field
+  offsets loaded inside the bodies are the `PDXQ_OFF_*` summary
+  family, not `PDXQ_D_OFF_*`). Passing a raw on-disk row silently
+  misread `blocks_used` / `blocks_hard` from the wrong offsets while
+  the mov_d (u32) magic gate at +0 still accidentally observed `PDXQ_MAGIC`
+because both layouts store the identical 4-byte magic at their own +0.
+  Fix: parameter rename + a shared `INPUT-CONTRACT` header block
+  above the two functions + a new `==== QUOTAS` section in
+  `doc/libpdx-volume.pdxdoc` + a new `§11.9` in
+  `design/architecture.md` documenting the two-layout distinction and
+  a worked parse → check → commit → re-encode call example.
+- **#33** `pdxb_quota_check` — overflow guard on
+  `blocks_used + block_delta`. The pre-fix body added `rsi` into
+  `r10` and fell straight through to `cmp r10, blocks_hard`; a
+  `block_delta` large enough to wrap `r10` past 2^64 would let a
+  wrapped value pass or fail the cmp incorrectly. v1.1.1 inserts
+  `jb lpv_qc_overflow_refuse` immediately after the `add`, and the
+  new label returns `LPV_QUOTA_HARD_EXCEEDED` (the same sentinel a
+  normal hard-limit refusal returns; a distinct code was not
+  introduced because caller remediation is identical). `jb` is the
+  paideia-as encoder-preferred spelling of jump-if-carry, mirroring
+  `kernel/core/syscall/ptr_check.pdx:56`'s `va + len` wrap guard.
+- Sibling `pdxb_quota_commit` already handled the negative-delta
+  underflow case via a shift + cmp + xor clamp (v1.1.0 landing;
+  unchanged at v1.1.1).
+
+### Documentation
+
+- `doc/libpdx-volume.pdxdoc` — new `==== QUOTAS` section with the
+  side-by-side raw-row-vs-summary offset tables and a worked
+  parse → check → commit → re-encode composition example; VERSION
+  block bumped and prefixed with the v1.1.1 changelog stanza.
+- `design/architecture.md` — new `§11.9 Quota check/commit input
+  contract (v1.1.1 clarification)` covering the two offset families,
+  the silent-mismatch failure mode, the source-only rename, the
+  arithmetic-wrap guard, and the encoder-preferred `jb` spelling
+  precedent.
+- `src/pdxb_quota.pdx` — new `INPUT-CONTRACT` block above the two
+  helpers plus updated per-function headers pointing at the new
+  `.pdxdoc` and architecture-doc sections; module header's
+  paideia-as encoder-notes list a bullet for the `jb`/overflow-refuse
+  pattern.
+
+### Release manifest
+
+- `release/manifest.pdxsig.txt` — `package-version` 1.1.0 → 1.1.1;
+  `package-release` LV.M1-M6 → LV.M7; `source-tag` v1.1.0 → v1.1.1.
+  Every `<BLAKE3-*>` slot stays a placeholder; the dual-sign +
+  mirror-push external gates (paideia-as toolchain in CI,
+  `pkgs.paideia-os` endpoint, release-line ML-DSA-65 seed key
+  custody) are unchanged from v1.1.0.
+
 ## 1.1.0 — 2026-09-02 (audit-driven follow-up: issues #16..#31)
 
 **Additive minor release** closing the 16-ticket Phase-2 AISSUE audit
