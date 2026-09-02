@@ -423,4 +423,88 @@ module PdxbSign = structure {
         ret;
       }
     }
+
+  // ==========================================================================
+  // pdxb_verify_superblock(sb_ptr, sig_ptr, sig_len, pub_key_slot) -> u64
+  //
+  // libpdx-volume.M1-001 (#16). Symmetric counterpart to
+  // pdxb_sign_superblock: verifies an ML-DSA-65 signature over
+  // sb_ptr[0, PDXB_SIGN_MSG_LEN=696) against a pub_key_slot resolved
+  // by (or provided to) the caller.
+  //
+  // STUB at this landing -- fail-closed, matches pdxb_verify_inode_tail's
+  // discipline above and for the same reason: no mldsa65_verify
+  // intrinsic exists on the MlDsa65 trait in paideia-as v0.28.0
+  // (grepped tools/paideia-as/crates/paideia-stdlib/pdx/mldsa.pdx; only
+  // `sign` is declared). Dereferences NONE of its four arguments.
+  // Always returns PDXB_VER_ERR_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF).
+  //
+  // The stub deliberately exists so downstream mount.pdxfs / fsck.pdxfs
+  // can code against the final signature today and get a fail-closed
+  // (never fail-open) result until the real body lands. Once
+  // mldsa65_verify arrives on the MlDsa65 trait, this becomes a
+  // straight port of pdxb_verify_inode_tail's real-body pattern:
+  // marshal (sig_ptr, sig_len, msg_ptr=sb_ptr, msg_len=696,
+  // pub_key_bytes_ptr) into the new intrinsic's registers and forward
+  // its return code. `pub_key_slot` becomes cap-invoke-resolvable at
+  // that point since KIND_SIG_KEY's landed shape is exactly the
+  // public-key handle a verify path needs (design/architecture.md §8.4).
+  //
+  // Follow-up filed as paideia-os/paideia-as issue for the missing
+  // mldsa65_verify intrinsic (tracked at the paideia-as-encoder issue
+  // list; the M3-002 landing already documents the gap, and this M1-001
+  // scaffold extends it to the superblock path).
+  // ==========================================================================
+  pub let pdxb_verify_superblock : (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (sb_ptr: u64) (sig_ptr: u64) (sig_len: u64) (pub_key_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M1-001 (#16): pdxb_verify_superblock STUB. No mldsa65_verify intrinsic exists on the MlDsa65 trait in paideia-as v0.28.0 (grepped tools/paideia-as/crates/paideia-stdlib/pdx/mldsa.pdx -- only `sign` is declared) -- see module header 'mldsa65_verify -- does not exist' section (already documented at M3-002 landing for pdxb_verify_inode_tail). Dereferences NONE of its four arguments (sb_ptr, sig_ptr, sig_len, pub_key_slot); unconditionally returns PDXB_VER_ERR_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, a nonzero sentinel via MOVABS since the value exceeds the 32-bit imm bound) so a caller checking `return == 0 means valid` never mistakes the stub for a real pass -- fail-closed by construction, matching pdxb_verify_inode_tail's discipline. No labels; single-path body. Real body will land once mldsa65_verify exists as a straight port of pdxb_verify_inode_tail's shape.",
+      block: {
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_VER_ERR_NOT_IMPLEMENTED
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_sign_superblock_traced(sb_ptr, seed_ptr, out_sig_ptr,
+  //                             out_sig_len, audit_client_slot,
+  //                             audit_record_kind) -> u64
+  //
+  // libpdx-volume.M2-002 (#22). Strict superset of pdxb_sign_superblock
+  // that ALSO posts an audit record (INTENT before the sign, RESULT
+  // after) via libpdx-audit's `audit_client_emit` when
+  // `audit_client_slot != 0`. When `audit_client_slot == 0`, this
+  // function is byte-for-byte equivalent to pdxb_sign_superblock -- no
+  // cap-invoke is issued at all.
+  //
+  // At this landing the audit-emit branch is a STUB: libpdx-audit is
+  // not yet linked into this repo's build (its `audit_client_emit`
+  // extern symbol would be an unresolved reference at consumer link
+  // time). Once libpdx-audit lands as a build-tree sibling, the two
+  // stub arms below become ordinary cross-module calls following the
+  // same convention pdxb_sign_ss_* uses for pdxb_sign_mldsa65_raw.
+  //
+  // Follow-up filed as paideia-os/libpdx-audit issue for the
+  // build-tree wiring (this ticket lands the outer contract; audit
+  // link is the last-mile step).
+  //
+  // Registers: rdi..r9 hold the six SysV args on entry. rax = return.
+  // ==========================================================================
+  pub let pdxb_sign_superblock_traced : (u64, u64, u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (sb_ptr: u64) (seed_ptr: u64) (out_sig_ptr: u64) (out_sig_len: u64) (audit_client_slot: u64) (audit_record_kind: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-volume.M2-002 (#22): pdxb_sign_superblock_traced. If audit_client_slot (r8) is 0, forward straight to pdxb_sign_superblock(rdi,rsi,rdx,rcx). Else this is currently a stub-arm (libpdx-audit is not yet linked into this repo's build tree; the extern audit_client_emit symbol would be an unresolved reference at consumer link time). At libpdx-audit-link landing, both arms of this dispatch become ordinary cross-module `call audit_client_emit` sequences bracketing the sign call. Gate: cmp r8,0; je passthrough (drops through to pdxb_sign_superblock's 4-arg call using rdi/rsi/rdx/rcx as-is). Else: mov rax,0xFFFFFFFFFFFFFFFF (LPV_STUB / not-yet-linked sentinel); ret. Passthrough branch: `call pdxb_sign_superblock;` and let its return flow through in rax. No push/pop needed (r8/r9 are caller-save under SysV; the callee doesn't need or clobber the audit args). No add reg,[mem]; only cmp reg,imm. Labels prefixed pdxb_sign_st_.",
+      block: {
+        cmp r8, 0;
+        jne pdxb_sign_st_audit_stub;
+
+        // audit_client_slot == 0: passthrough to the untraced helper.
+        call pdxb_sign_superblock;
+        ret;
+
+      pdxb_sign_st_audit_stub:
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // LPV_STUB / audit-link pending
+        ret;
+      }
+    }
 }

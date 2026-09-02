@@ -1,9 +1,10 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M5 (signed release) — landed
-**Version:** 1.0.0 (release manifest scaffolded; dual-sign + mirror
-push deferred — see `release/RELEASE-1.0.0.md` §3)
+**Current milestone:** LV.M6 (multivol ordering) — landed (partial)
+**Version:** 1.1.0 (release manifest scaffolded; dual-sign + mirror
+push deferred — see `release/RELEASE-1.0.0.md` §3, still applicable at
+1.1.0)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -162,14 +163,81 @@ syscalls anywhere in its own call graph, by established discipline).
       actual signed cut. `CHANGELOG.md` (new file) closes with a
       `## 1.0.0` entry summarising M1..M5.
 
+### LV.M1..LV.M6 — Phase-2 AISSUE audit (v1.1.0, landed)
+
+Sixteen tickets (#16..#31) closing gaps identified by a Phase-1 audit
+of the v1.0.0 surface. Full breakdown in `CHANGELOG.md`'s v1.1.0
+section; per-ticket landing state:
+
+- **LV.M1 polish (#16..#20)**
+  - [x] **#16** — `pdxb_verify_superblock` fail-closed stub (blocked on
+        `mldsa65_verify` intrinsic).
+  - [x] **#17** — `pdxb_superblock_checksum` + `pdxb_verify_checksum`
+        real bodies (CRC32C, 256-entry table). New file
+        `src/pdxb_checksum.pdx`.
+  - [x] **#18** — Field accessors across `PdxbSuperblockSummary` /
+        `MountTableRow` / `MountTableEntry` (22 + 7 + 5 = 34 getters,
+        10 setters).
+  - [x] **#19** — `LPV_E_*` banded namespace + `lpv_strerror`
+        scaffold. New file `src/lpv_errors.pdx`. Dispatch table itself
+        is a v1.1.x follow-up (all bindings landed).
+  - [x] **#20** — `PDXB_ONDISK_BYTES` / `MTE_BYTES` public aliases
+        (v1.0.0 already had `SB_SUMMARY_BYTES` / `MTR_SUMMARY_BYTES` /
+        `MTE_SUMMARY_BYTES` as `pub let`; this ticket adds the alias
+        names the issue brief specified).
+- **LV.M2 hardening (#21..#24)**
+  - [ ] **#21** — Dual-sign + mirror-push run. Still deferred (three
+        external gates: paideia-as toolchain in CI, `pkgs.paideia-os`
+        endpoint, release-line ML-DSA-65 seed key).
+  - [x] **#22** — `pdxb_sign_superblock_traced` (partial: `audit_
+        client_slot == 0` fast-path works; audit-on branch stubs
+        until libpdx-audit is link-resolvable).
+  - [x] **#23** — `vol_kind_mint_elevate` 3-arg signature landed;
+        body stubs until both external blockers (kernel-side mint
+        syscall, libpdx-elevate link) close.
+  - [x] **#24** — `tests/smoke/consumer_e2e.sh` scaffold with SKIP
+        gates for missing consumer tools (mkfs.pdxfs / mount.pdxfs /
+        umount.pdxfs don't yet exist as runnable executables).
+- **LV.M3 snapshots (#25..#26)**
+  - [x] **#25** — `KIND_VOLUME_SNAPSHOT = 0x1A1` typed; `vol_snapshot
+        _narrow` real body (validate + passthrough); `vol_snapshot_
+        mint` / `pdxb_snap_create` stubs (blocked on kernel-side
+        landing).
+  - [x] **#26** — `snap_record_parse` real body (96-byte record decode);
+        `snap_chain_walk` stub (blocked on block-read authority
+        scaffolding). New file `src/vol_snapshot.pdx`.
+- **LV.M4 quotas (#27..#28)**
+  - [x] **#27** — Per-subject quota row wire format + `pdxb_quota_
+        row_parse` / `_row_encode` / `_table_lookup` real bodies.
+        New file `src/pdxb_quota.pdx`.
+  - [x] **#28** — `pdxb_quota_check` (all four codes: SOFT_EXCEEDED /
+        SOFT_GRACE_EXPIRED / HARD_EXCEEDED / OK) + `pdxb_quota_
+        commit` (underflow-clamped). Block path only; inode path is
+        a v1.1.x follow-up.
+- **LV.M5 encryption (#29..#30)**
+  - [x] **#29** — `pdxb_kek_derive` / `pdxb_dek_wrap` / `pdxb_dek_
+        unwrap` real bodies via Argon2id + ChaCha20-Poly1305
+        intrinsics (paideia-as v0.28.0 stdlib crypto.pdx). `pdxb_
+        block_encrypt` / `_decrypt` stubs pending paired-block
+        metadata layout agreement. New file `src/pdxb_crypto.pdx`.
+  - [x] **#30** — PDXB v2 wire format: parser accepts v1 or v2;
+        wrapped-DEK / KDF-salt / wrap-nonce accessors real bodies
+        over `_reserved[+192, +268)`.
+- **LV.M6 multivol ordering (#31)**
+  - [x] **#31** — `mount_deps_parse` real body (128-byte per-dep
+        entry decode); `mount_table_sort_by_deps` stub with
+        distinct `LPV_ORDER_ERR_NOT_IMPL` sentinel (blocked on
+        mountall.pdxfs input-shape agreement). New file
+        `src/mount_deps.pdx`.
+
 ## Next milestone
 
-All milestones M1..M5 landed at v1.0.0 (release manifest scaffolded;
-signing deferred). No M6 is scoped in `design/tooling/volume-tooling-
-ux.md` §9.4 — the library is feature-complete for its declared M1..M5
-scope. Downstream work continues in the three consumer repos this
-library targets (`mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`, per
-`README.md`'s "Callers" section), none of which exist yet.
+All 16 v1.1.0 tickets accounted for; four (#21, #22 partial, #23
+partial, #24 partial) have external blockers documented above. The
+next tempo tick is either (a) close the external blockers as their
+substrates land, or (b) file a follow-up wave once mkfs.pdxfs /
+mount.pdxfs / umount.pdxfs start landing in the paideia-os tree so
+the smoke witness (#24) can run for real.
 
 Deferred to a future patch/minor release (see `CHANGELOG.md`'s semver
 policy):

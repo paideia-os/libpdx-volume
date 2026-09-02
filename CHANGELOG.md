@@ -1,5 +1,129 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.0 — 2026-09-02 (audit-driven follow-up: issues #16..#31)
+
+**Additive minor release** closing the 16-ticket Phase-2 AISSUE audit
+loop against v1.0.0. Every v1.0.0 API surface is preserved
+byte-for-byte; new modules and new public symbols are additive only.
+Downstream consumers built against v1.0.0 continue to compile and
+behave identically.
+
+Six milestones lined up under the LV.M1..LV.M6 axis
+(design/tooling/volume-tooling-ux.md §9.4 addendum + the M6
+mount-ordering scope):
+
+- **LV.M1 polish (#16..#20)** — surface completeness. `pdxb_verify_
+  superblock` scaffolded (fail-closed stub, matches `pdxb_verify_
+  inode_tail`); `pdxb_superblock_checksum` + `pdxb_verify_checksum`
+  (CRC32C over the [0, 696) signed range, table-driven); complete
+  field-accessor family across `PdxbSuperblockSummary` (22 getters +
+  10 setters), `MountTableRow` (7 getters), and `MountTableEntry`
+  (5 getters); banded `LPV_E_*` error namespace + `lpv_strerror`
+  scaffold; `PDXB_ONDISK_BYTES` and `MTE_BYTES` public aliases so
+  every documented size constant is reachable by its issue-brief name.
+- **LV.M2 hardening (#21..#24)** — surface hardening around the
+  release/audit/elevate boundary. Dual-sign + mirror-push run remains
+  deferred (external key custody + mirror endpoint). Audit-tracing
+  hook (`pdxb_sign_superblock_traced`) landed with `audit_client_slot
+  == 0` fast-path fully working; audit-on branch STUB until
+  libpdx-audit link-resolvable. `vol_kind_mint_elevate` 3-arg
+  signature landed; body STUB until kernel-side mint syscall lands.
+  Downstream-consumer smoke witness (`tests/smoke/consumer_e2e.sh`)
+  scaffolded; SKIP-gates cleanly when consumer tools are missing.
+- **LV.M3 snapshots (#25..#26)** — new `src/vol_snapshot.pdx` module.
+  `KIND_VOLUME_SNAPSHOT = 0x1A1` typed. `vol_snapshot_narrow` real
+  body (validate + passthrough); `vol_snapshot_mint` / `pdxb_snap_
+  create` / `snap_chain_walk` fail-closed stubs. `snap_record_parse`
+  real body decoding the 96-byte on-disk snap-metadata record.
+- **LV.M4 quotas (#27..#28)** — new `src/pdxb_quota.pdx` module.
+  Wire format (superblock quota anchor + 64-byte per-subject row +
+  `PDXB_FLAG_HAS_QUOTA` bit); `pdxb_quota_row_parse` /
+  `pdxb_quota_row_encode` / `pdxb_quota_table_lookup` real bodies;
+  `pdxb_quota_check` covering all four (SOFT / SOFT_GRACE / HARD / OK)
+  return codes; `pdxb_quota_commit` with underflow clamp. Inode
+  enforcement is scheduled as a v1.1.x follow-up; block path is
+  complete.
+- **LV.M5 encryption (#29..#30)** — new `src/pdxb_crypto.pdx` module.
+  `KIND_KEK = 0x1A2` typed. `pdxb_kek_derive` real body over the
+  paideia-as Argon2id intrinsic (RFC 9106 recommended profile);
+  `pdxb_dek_wrap` / `pdxb_dek_unwrap` real bodies over ChaCha20-
+  Poly1305; `pdxb_block_encrypt` / `_decrypt` STUBS pending paired-
+  block metadata layout agreement. PDXB v2 wire format: parser now
+  accepts version 1 OR 2, encoder writes v2 iff `PDXB_FLAG_ENCRYPTED`;
+  `pdxb_sb_get/set_wrapped_dek` / `pdxb_sb_get/set_kdf_salt` /
+  `pdxb_sb_is_encrypted` accessors over the new
+  `_reserved[+192, +268)` region (all inside the signed range).
+- **LV.M6 multivol ordering (#31)** — new `src/mount_deps.pdx` module.
+  Wire format for the dep-list block (magic `'PDDP'`, 128-byte
+  per-dep entry with mount-before / mount-after / mount-requires
+  kinds); `mount_deps_parse` real body; `mount_table_sort_by_deps`
+  STUB pending mountall.pdxfs input-shape agreement (returns a
+  distinct `LPV_ORDER_ERR_NOT_IMPL` sentinel so callers can tell
+  "algorithm pending" from "real cycle detected").
+
+### Added
+
+- `src/pdxb_checksum.pdx` — CRC32C helpers + 256-entry table (#17).
+- `src/lpv_errors.pdx` — banded `LPV_E_*` namespace + `lpv_strerror`
+  scaffold (#19).
+- `src/vol_snapshot.pdx` — KIND_VOLUME_SNAPSHOT client helpers + snap-
+  metadata parser (#25, #26).
+- `src/pdxb_quota.pdx` — quota wire format + codec + enforcement
+  helpers (#27, #28).
+- `src/pdxb_crypto.pdx` — Argon2id KDF + ChaCha20-Poly1305 AEAD
+  wrappers (#29).
+- `src/mount_deps.pdx` — mount-dependency wire format + parser + topo
+  sort scaffold (#31).
+- `src/pdxb_sign.pdx` — new public entry points `pdxb_verify_
+  superblock` (#16) and `pdxb_sign_superblock_traced` (#22).
+- `src/pdxb_superblock.pdx` — 22 getters + 10 setters over
+  `PdxbSuperblockSummary` (#18); `PDXB_ONDISK_BYTES` /
+  `PDXB_VERSION_V2` / `PDXB_FLAG_HAS_QUOTA` / `PDXB_FLAG_ENCRYPTED`
+  constants; PDXB v2 wrapped-DEK/salt/nonce accessors (#30); parser
+  accepts v1 OR v2.
+- `src/mount_table.pdx` — 7 `MountTableRow` field accessors (#18).
+- `src/mount_table_snapshot.pdx` — 5 `MountTableEntry` field
+  accessors + `MTE_BYTES` alias (#18, #20).
+- `src/vol_kind.pdx` — `vol_kind_mint_elevate` 3-arg elevate-aware
+  form (#23).
+- `tests/smoke/consumer_e2e.sh` — end-to-end mkfs/mount/snapshot
+  scaffold script (#24).
+
+### Deferred substrate (v1.1.x)
+
+- **Kernel-side `KIND_VOLUME_SNAPSHOT`** — landing needed in
+  paideia-os. Follow-up filed. Client helpers stub with distinct
+  `LPV_SNAP_ERR_NOT_IMPLEMENTED` sentinel until then.
+- **Kernel-side `KIND_KEK`** — landing needed in paideia-os. Client
+  helpers take raw KEK pointers (design/architecture.md §8.2
+  precedent); a KIND_KEK-aware wrapper is a future landing.
+- **`mldsa65_verify` intrinsic** — same blocker as v1.0.0. Both
+  `pdxb_verify_inode_tail` and the new `pdxb_verify_superblock` stay
+  fail-closed stubs until it lands on the `MlDsa65` trait.
+- **libpdx-audit / libpdx-elevate link-availability** — the two
+  audit- and elevate-branch stubs in `pdxb_sign_superblock_traced` +
+  `vol_kind_mint_elevate` become real cross-module calls once those
+  siblings are in the build tree.
+- **Kernel-side ring-3 `KIND_VOLUME` mint syscall** — `vol_kind_
+  mint_elevate`'s body stays a stub until landed.
+- **`pdxb_block_encrypt` / `_decrypt`** — pending paired-block
+  metadata layout agreement across mkfs.pdxfs + mount.pdxfs
+  (design/architecture.md §11).
+- **`mount_table_sort_by_deps` full Kahn's-algorithm body** —
+  pending mountall.pdxfs input-shape agreement.
+- **Full `lpv_strerror` dispatch table** — scaffold returns 0
+  (unknown code) for every input at this landing; the LPV_E_* and
+  message-string bindings above are the load-bearing part of the
+  v1.1.0 change, and the dispatch is a straightforward cmp/jne chain
+  to fill in once the code set stabilises.
+- **Inode-quota enforcement** — `pdxb_quota_check` / `pdxb_quota_
+  commit` cover the block path fully; inode enforcement is a
+  duplicate of the same shape against `inodes_used` / `inodes_soft`
+  / `inodes_hard` slots and is scheduled as a v1.1.x follow-up.
+- **Dual-sign + mirror-push run** — same three gates as v1.0.0
+  (paideia-as CI, `pkgs.paideia-os` endpoint, release-line key
+  custody). No repo-side action possible at v1.1.0.
+
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5-001)
 
 **First release.** Manifest scaffolded for a future dual-signed

@@ -1,4 +1,4 @@
-# libpdx-volume v1.0.0 — release manifest (source form)
+# libpdx-volume v1.1.0 — release manifest (source form)
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
@@ -34,12 +34,12 @@
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        libpdx-volume
-package-version:     1.0.0
-package-release:     R53-M5
+package-version:     1.1.0
+package-release:     LV.M1-M6 (v1.1.0 minor -- audit-driven follow-up)
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/libpdx-volume
-source-commit:       <TAG-v1.0.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.0.0
+source-commit:       <TAG-v1.1.0-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.1.0
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash
@@ -52,17 +52,24 @@ source-tag:          v1.0.0
 
 [artifacts.source]
 caps.decl                          blake3-256 = <BLAKE3-caps.decl>
+src/lpv_errors.pdx                 blake3-256 = <BLAKE3-lpv_errors.pdx>
+src/mount_deps.pdx                 blake3-256 = <BLAKE3-mount_deps.pdx>
 src/mount_table.pdx                blake3-256 = <BLAKE3-mount_table.pdx>
 src/mount_table_snapshot.pdx       blake3-256 = <BLAKE3-mount_table_snapshot.pdx>
+src/pdxb_checksum.pdx              blake3-256 = <BLAKE3-pdxb_checksum.pdx>
+src/pdxb_crypto.pdx                blake3-256 = <BLAKE3-pdxb_crypto.pdx>
+src/pdxb_quota.pdx                 blake3-256 = <BLAKE3-pdxb_quota.pdx>
 src/pdxb_sign.pdx                  blake3-256 = <BLAKE3-pdxb_sign.pdx>
 src/pdxb_superblock.pdx            blake3-256 = <BLAKE3-pdxb_superblock.pdx>
 src/vol_kind.pdx                   blake3-256 = <BLAKE3-vol_kind.pdx>
+src/vol_snapshot.pdx               blake3-256 = <BLAKE3-vol_snapshot.pdx>
 
 [artifacts.doc]
 doc/libpdx-volume.pdxdoc           blake3-256 = <BLAKE3-libpdx-volume.pdxdoc>
 
 [artifacts.tests]
 tests/README.md                    blake3-256 = <BLAKE3-tests-README.md>
+tests/smoke/consumer_e2e.sh       blake3-256 = <BLAKE3-consumer_e2e.sh>
 tests/test_mount_table_snapshot.pdx blake3-256 = <BLAKE3-test_mount_table_snapshot.pdx>
 tests/test_pdxb_roundtrip.pdx      blake3-256 = <BLAKE3-test_pdxb_roundtrip.pdx>
 tests/test_pdxb_sigverify.pdx      blake3-256 = <BLAKE3-test_pdxb_sigverify.pdx>
@@ -100,13 +107,30 @@ CHANGELOG.md                       blake3-256 = <BLAKE3-CHANGELOG.md>
 # ---------------------------------------------------------------
 
 [substrate]
-paideia-as-toolchain    >= 0.24.0-mldsa65-sign
+paideia-as-toolchain    >= 0.28.0-crypto-kdf   # v1.1.0 adds Argon2id +
+                                                 # ChaCha20-Poly1305 use
 kernel-cap-kind         = KIND_VOLUME (0x1A0)              # R52
 kernel-cap-kind         = KIND_PDXFS_MOUNT_TABLE (0x1A5)   # R53-PREP-001
 kernel-cap-kind         = KIND_SIG_KEY (0x1A3)             # R52 (typed
                           against by pdxb_verify_inode_tail's
                           pub_key_slot argument only; not resolved by
                           any cap-invoke call at this landing)
+
+# --- v1.1.0 additions -- KIND surfaces TYPED against, not INVOKED
+# against. Each is either kernel-side pending (KIND_VOLUME_SNAPSHOT,
+# KIND_KEK) or optional/link-pending (KIND_AUDIT_CHANNEL,
+# KIND_ELEVATE_CHANNEL). See caps.decl for the full contract. ---
+kernel-cap-kind         = KIND_VOLUME_SNAPSHOT (0x1A1)     # M3-001 #25
+                          (typed by src/vol_snapshot.pdx; kernel-side
+                          landing PENDING -- follow-up filed against
+                          paideia-os monorepo).
+kernel-cap-kind         = KIND_KEK (0x1A2)                 # M5-001 #29
+                          (typed by src/pdxb_crypto.pdx; kernel-side
+                          landing PENDING -- follow-up filed. Client
+                          helpers take raw KEK pointers today per the
+                          design/architecture.md §8.2 discipline).
+kernel-cap-kind-optional = KIND_AUDIT_CHANNEL              # M2-002 #22
+kernel-cap-kind-optional = KIND_ELEVATE_CHANNEL            # M2-003 #23
 
 # ---------------------------------------------------------------
 # Signature block — dual-signed per design/02-development-environment.md

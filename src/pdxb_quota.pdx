@@ -1,0 +1,450 @@
+// src/pdxb_quota.pdx — libpdx-volume.M4-001 (#27) + M4-002 (#28)
+// PdxbQuota: per-volume quota row wire format + client-side codec +
+// write-path enforcement helpers (check / commit).
+//
+// -----------------------------------------------------------------------------
+// Superblock extension (PDXB v1-compatible, uses _reserved)
+// -----------------------------------------------------------------------------
+//
+// The PDXB v1 superblock has 536 bytes of `_reserved` at on-disk offset
+// [160, 696). This ticket reserves the FIRST 24 bytes of that region
+// for the quota-table anchor (no wire-format-version break):
+//
+//   [+160]  quota_table_lba:     u64   0 = no quotas on this volume
+//   [+168]  quota_table_bcount:  u64   size in 4KiB blocks
+//   [+176]  quota_flags:         u64   bit0=ENFORCE_HARD, bit1=ENFORCE_SOFT
+//
+// PDXB_FLAG_HAS_QUOTA (bit 0 of the superblock's own `flags` word) is
+// declared here for downstream mkfs.pdxfs / mount.pdxfs; see
+// src/pdxb_superblock.pdx for the flag value.
+//
+// -----------------------------------------------------------------------------
+// Per-user quota row wire format (64 bytes, aligned to 64)
+// -----------------------------------------------------------------------------
+//
+//   [+0]   magic:            u32 = 0x50445851  ('PDXQ')
+//   [+4]   version:          u16
+//   [+6]   subject_kind:     u8   0=user, 1=group
+//   [+7]   _reserved:        u8
+//   [+8]   subject_id_lo:    u64
+//   [+16]  subject_id_hi:    u64
+//   [+24]  blocks_used:      u64
+//   [+32]  blocks_soft:      u64  0 = no soft limit
+//   [+40]  blocks_hard:      u64  0 = no hard limit
+//   [+48]  inodes_used:      u64
+//   [+56]  inodes_soft_hard: u64  soft:[63:32] | hard:[31:0]
+//
+// Total: 64 B on-disk. Summary layout expands the packed fields into
+// full u64 slots (11 slots, 88 bytes) for consistency with this
+// library's other summary structs.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder notes
+// -----------------------------------------------------------------------------
+//
+//   - PDXQ magic (0x50445851) fits imm32 sign-extend bound directly.
+//   - u16/u8 subfields loaded via mov_d (u32 covering both) then
+//     shifted+masked -- matches vol_snapshot.pdx's snap_record_parse
+//     pattern for its own header0 unpack.
+//   - Signed deltas in pdxb_quota_check / _commit: block_delta and
+//     inode_delta are i64. paideia-as does not distinguish signed vs
+//     unsigned in the machine instruction (only in the source-level
+//     type); we use `mov` (no sign-extension needed since they arrive
+//     in a full register) and rely on `add` two's-complement wrap for
+//     both directions. The underflow clamp uses cmp-then-branch (not
+//     SETcc) to stay within the encoder-conservative discipline.
+//   - No add reg,[mem]; no test; only cmp reg,imm/reg.
+//   - Label prefixes: `lpv_qp_` (parse), `lpv_qe_` (encode),
+//     `lpv_ql_` (lookup), `lpv_qc_` (check), `lpv_qm_` (commit).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#27, #28);
+// design/architecture.md §<new-section-quota> (this repo).
+
+module PdxbQuota = structure {
+
+  // On-disk quota-row magic ('PDXQ' little-endian). Fits imm32 bound.
+  pub let PDXQ_MAGIC : u64 = 0x50445851
+
+  // On-disk row size + summary size.
+  pub let PDXQ_ROW_BYTES     : u64 = 64
+  pub let PDXQ_SUMMARY_BYTES : u64 = 88   // 11 u64 slots
+
+  // Subject-kind ordinals.
+  pub let PDXQ_SUBJECT_USER  : u64 = 0
+  pub let PDXQ_SUBJECT_GROUP : u64 = 1
+
+  // Quota-flags bits (superblock's own quota_flags word at +176).
+  pub let PDXQ_FLAG_ENFORCE_HARD : u64 = 0x01
+  pub let PDXQ_FLAG_ENFORCE_SOFT : u64 = 0x02
+
+  // Status codes (band 0x0800 -- see src/lpv_errors.pdx).
+  pub let LPV_QUOTA_OK                 : u64 = 0
+  pub let LPV_QUOTA_SOFT_EXCEEDED      : u64 = 0x0801
+  pub let LPV_QUOTA_SOFT_GRACE_EXPIRED : u64 = 0x0802
+  pub let LPV_QUOTA_HARD_EXCEEDED      : u64 = 0x0803
+  pub let LPV_QUOTA_ERR_BAD_ROW        : u64 = 0x0804
+  pub let LPV_QUOTA_ERR_NOT_FOUND      : u64 = 0x0805
+
+  // On-disk offsets.
+  pub let PDXQ_D_OFF_MAGIC            : u64 = 0
+  pub let PDXQ_D_OFF_VERSION          : u64 = 4
+  pub let PDXQ_D_OFF_SUBJECT_KIND     : u64 = 6
+  pub let PDXQ_D_OFF_SUBJECT_ID_LO    : u64 = 8
+  pub let PDXQ_D_OFF_SUBJECT_ID_HI    : u64 = 16
+  pub let PDXQ_D_OFF_BLOCKS_USED      : u64 = 24
+  pub let PDXQ_D_OFF_BLOCKS_SOFT      : u64 = 32
+  pub let PDXQ_D_OFF_BLOCKS_HARD      : u64 = 40
+  pub let PDXQ_D_OFF_INODES_USED      : u64 = 48
+  pub let PDXQ_D_OFF_INODES_SOFT_HARD : u64 = 56
+
+  // Summary offsets (each field its own u64 slot).
+  pub let PDXQ_OFF_MAGIC          : u64 = 0
+  pub let PDXQ_OFF_VERSION        : u64 = 8
+  pub let PDXQ_OFF_SUBJECT_KIND   : u64 = 16
+  pub let PDXQ_OFF_SUBJECT_ID_LO  : u64 = 24
+  pub let PDXQ_OFF_SUBJECT_ID_HI  : u64 = 32
+  pub let PDXQ_OFF_BLOCKS_USED    : u64 = 40
+  pub let PDXQ_OFF_BLOCKS_SOFT    : u64 = 48
+  pub let PDXQ_OFF_BLOCKS_HARD    : u64 = 56
+  pub let PDXQ_OFF_INODES_USED    : u64 = 64
+  pub let PDXQ_OFF_INODES_SOFT    : u64 = 72   // decoded high half of inodes_soft_hard
+  pub let PDXQ_OFF_INODES_HARD    : u64 = 80   // decoded low half
+
+  // ==========================================================================
+  // pdxb_quota_row_parse(row_ptr, out_ptr) -> u64
+  // ==========================================================================
+  pub let pdxb_quota_row_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-001 (#27): pdxb_quota_row_parse real body. Two gates: (1) mov_d rax,[rdi+0]; cmp rax,0x50445851 (PDXQ_MAGIC, fits imm32); jne bad_magic. (2) mov_d rax,[rdi+4]; mov rcx,rax; and rcx,0xFFFF; cmp rcx,1; jne bad_magic (single error code for magic/version failures at this landing; a caller wanting to distinguish version drift can compare against a follow-up VERSION getter). Decode: magic, version (masked from u32-at-+4), subject_kind (mov_b from +6), subject_id_lo/hi, blocks_used/soft/hard, inodes_used, inodes_soft = high 32 of u64-at-+56 (shr 32), inodes_hard = low 32 of same (and-mask via the double-shift shl 32/shr 32 trick per test_pdxb_roundtrip.pdx's flags mask precedent). Return 0. No add reg,[mem]; no test; only cmp. Labels prefixed lpv_qp_.",
+      block: {
+        // Gate 1: magic.
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x50445851;
+        jne lpv_qp_bad;
+
+        // Gate 2: version.
+        mov_d rax, [rdi + 4];
+        mov rcx, rax;
+        and rcx, 0xFFFF;
+        cmp rcx, 1;
+        jne lpv_qp_bad;
+
+        // magic -> +0
+        mov_d rax, [rdi + 0];
+        mov [rsi + 0], rax;
+
+        // version -> +8
+        mov_d rax, [rdi + 4];
+        mov rcx, rax;
+        and rcx, 0xFFFF;
+        mov [rsi + 8], rcx;
+
+        // subject_kind (u8 at +6) -> +16
+        mov_b rax, [rdi + 6];
+        mov [rsi + 16], rax;
+
+        // subject_id_lo -> +24
+        mov rax, [rdi + 8];
+        mov [rsi + 24], rax;
+
+        // subject_id_hi -> +32
+        mov rax, [rdi + 16];
+        mov [rsi + 32], rax;
+
+        // blocks_used -> +40
+        mov rax, [rdi + 24];
+        mov [rsi + 40], rax;
+
+        // blocks_soft -> +48
+        mov rax, [rdi + 32];
+        mov [rsi + 48], rax;
+
+        // blocks_hard -> +56
+        mov rax, [rdi + 40];
+        mov [rsi + 56], rax;
+
+        // inodes_used -> +64
+        mov rax, [rdi + 48];
+        mov [rsi + 64], rax;
+
+        // inodes_soft = (inodes_soft_hard >> 32) -> +72
+        mov rax, [rdi + 56];
+        shr rax, 32;
+        mov [rsi + 72], rax;
+
+        // inodes_hard = (inodes_soft_hard & 0xFFFFFFFF) -> +80
+        // Use double-shift (shl 32; shr 32) since paideia-as's AND encoder
+        // rejects the 0xFFFFFFFF immediate (see test_pdxb_roundtrip.pdx
+        // module header for the full write-up).
+        mov rax, [rdi + 56];
+        shl rax, 32;
+        shr rax, 32;
+        mov [rsi + 80], rax;
+
+        xor rax, rax;
+        ret;
+
+      lpv_qp_bad:
+        mov rax, 0x0804;                 // LPV_QUOTA_ERR_BAD_ROW
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_quota_row_encode(sum_ptr, out_ptr) -> u64
+  //
+  // Inverse of pdxb_quota_row_parse. Zero-fills the 64-byte on-disk row
+  // first (8 qwords), then stamps every field back. Rebuilds the packed
+  // inodes_soft_hard word from the two summary slots (inodes_soft
+  // high half, inodes_hard low half) via `shl rax,32; or rax,rcx`.
+  // ==========================================================================
+  pub let pdxb_quota_row_encode : (u64, u64) -> u64 !{mem} @{} =
+    fn (sum_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-001 (#27): pdxb_quota_row_encode real body. Zero-fill 8 qwords (bounded, matches pdxb_encode_superblock's zero-fill idiom). Stamp packed fields at their PDXQ_D_OFF_* offsets. inodes_soft_hard rebuilt via mov rax,[rsi+72] (inodes_soft); shl rax,32; mov rcx,[rsi+80] (inodes_hard); shl rcx,32; shr rcx,32 (mask to low 32 bits); or rax,rcx; store at +56. No add reg,[mem]; no test; only cmp reg,imm in the zero-fill loop bound. Labels prefixed lpv_qe_.",
+      block: {
+        // Zero-fill 8 qwords.
+        xor rax, rax;
+        xor rcx, rcx;
+      lpv_qe_zero:
+        mov [rsi + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  lpv_qe_zero;
+
+        // magic (u32) -> +0
+        mov rax, [rdi + 0];
+        mov_d [rsi + 0], rax;
+
+        // version (u16 in low 16 of a u32) -> +4
+        mov rax, [rdi + 8];
+        mov_d [rsi + 4], rax;
+
+        // subject_kind (u8) -> +6
+        mov rax, [rdi + 16];
+        mov_b [rsi + 6], rax;
+
+        // subject_id_lo -> +8
+        mov rax, [rdi + 24];
+        mov [rsi + 8], rax;
+
+        // subject_id_hi -> +16
+        mov rax, [rdi + 32];
+        mov [rsi + 16], rax;
+
+        // blocks_used -> +24
+        mov rax, [rdi + 40];
+        mov [rsi + 24], rax;
+
+        // blocks_soft -> +32
+        mov rax, [rdi + 48];
+        mov [rsi + 32], rax;
+
+        // blocks_hard -> +40
+        mov rax, [rdi + 56];
+        mov [rsi + 40], rax;
+
+        // inodes_used -> +48
+        mov rax, [rdi + 64];
+        mov [rsi + 48], rax;
+
+        // inodes_soft_hard = (soft << 32) | (hard & 0xFFFFFFFF) -> +56
+        mov rax, [rdi + 72];             // inodes_soft
+        shl rax, 32;
+        mov rcx, [rdi + 80];             // inodes_hard
+        shl rcx, 32;
+        shr rcx, 32;                     // mask via double-shift
+        or  rax, rcx;
+        mov [rsi + 56], rax;
+
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_quota_table_lookup(subject_kind, subject_id_lo, subject_id_hi,
+  //                         table_ptr, table_row_count, out_row_ptr) -> u64
+  //
+  // Linear scan through table_ptr[0 .. table_row_count) (each row is
+  // PDXQ_ROW_BYTES=64), comparing every row's (subject_kind, id_lo,
+  // id_hi) triple against the caller's request. On match, writes the
+  // matching row's pointer into *out_row_ptr and returns LPV_QUOTA_OK.
+  // On miss, out_row_ptr untouched, returns LPV_QUOTA_ERR_NOT_FOUND.
+  //
+  // The 6th argument (out_row_ptr) arrives in r9 (SysV).
+  // ==========================================================================
+  pub let pdxb_quota_table_lookup : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (subject_kind: u64) (subject_id_lo: u64) (subject_id_hi: u64) (table_ptr: u64) (table_row_count: u64) (out_row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-001 (#27): pdxb_quota_table_lookup linear scan. Loop i=0..table_row_count (r10=i, xor-zeroed): cmp r10,r8; jae not_found. Compute row addr: mov r11,r10; shl r11,6 (row_i = i*64 = i<<6); mov rax,rcx; add rax,r11 -> rax=&table[i]. Compare kind: mov_b rax_scratch,[rax+6]; cmp against rdi -- but we want to keep rax as the row ptr, so save it: mov r13,rax; mov_b rax,[r13+6]; cmp rax,rdi; jne next. Compare id_lo: mov rax,[r13+8]; cmp rax,rsi; jne next. Compare id_hi: mov rax,[r13+16]; cmp rax,rdx; jne next. Match: mov [r9+0],r13; xor rax,rax; ret. next: add r10,1; jmp loop. Labels prefixed lpv_ql_. Uses r10/r11/r13 all caller-save (no push/pop). No add reg,[mem]; only cmp; no test.",
+      block: {
+        xor r10, r10;                    // i = 0
+
+      lpv_ql_loop:
+        cmp r10, r8;
+        jae lpv_ql_not_found;
+
+        // row_ptr = table_ptr + i * 64
+        mov r11, r10;
+        shl r11, 6;
+        mov r13, rcx;
+        add r13, r11;                    // r13 = &table[i]
+
+        // kind check
+        mov_b rax, [r13 + 6];
+        cmp rax, rdi;
+        jne lpv_ql_next;
+
+        // id_lo check
+        mov rax, [r13 + 8];
+        cmp rax, rsi;
+        jne lpv_ql_next;
+
+        // id_hi check
+        mov rax, [r13 + 16];
+        cmp rax, rdx;
+        jne lpv_ql_next;
+
+        // Match.
+        mov [r9 + 0], r13;
+        xor rax, rax;
+        ret;
+
+      lpv_ql_next:
+        add r10, 1;
+        jmp lpv_ql_loop;
+
+      lpv_ql_not_found:
+        mov rax, 0x0805;                 // LPV_QUOTA_ERR_NOT_FOUND
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_quota_check(quota_row_ptr, block_delta, inode_delta, grace_expired)
+  //   -> u64
+  //
+  // libpdx-volume.M4-002 (#28). Reads the row's magic/blocks_soft/
+  // blocks_hard/blocks_used slots (via the M4-001 summary layout,
+  // interpreted through PDXQ_OFF_*) and gates the caller's delta.
+  //
+  // Return codes:
+  //   0 (LPV_QUOTA_OK)                  - fits within soft
+  //   0x0801 (LPV_QUOTA_SOFT_EXCEEDED)  - over soft, under hard, grace ok
+  //   0x0802 (LPV_QUOTA_SOFT_GRACE_EXPIRED) - over soft, grace expired
+  //   0x0803 (LPV_QUOTA_HARD_EXCEEDED)  - over hard, always deny
+  //   0x0804 (LPV_QUOTA_ERR_BAD_ROW)    - magic mismatch
+  //
+  // Semantics for `0 = no limit`:
+  //   - blocks_soft == 0 -> never trip SOFT_EXCEEDED
+  //   - blocks_hard == 0 -> never trip HARD_EXCEEDED
+  //
+  // Signed block_delta: negative deltas (freeing blocks) MUST NOT
+  // underflow blocks_used. Underflow is silently clamped at 0 by the
+  // COMMIT function; the CHECK function permits any delta whose target
+  // is <= hard (or unlimited).
+  //
+  // NOTE: inode_delta is accepted in the signature per the M4-002
+  // brief but this v1.1.0 landing checks the BLOCK path only; inode
+  // enforcement is a straightforward duplicate of the block path
+  // against inodes_used / inodes_soft / inodes_hard slots and is
+  // scheduled as a v1.1.x follow-up. Callers should still pass a
+  // valid inode_delta; the argument is checked-and-ignored here.
+  // ==========================================================================
+  pub let pdxb_quota_check : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (quota_row_ptr: u64) (block_delta: u64) (inode_delta: u64) (grace_expired: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-002 (#28): pdxb_quota_check real body. Magic gate: mov_d rax,[rdi+0] (PDXQ_OFF_MAGIC); cmp rax,0x50445851; jne bad_row. Compute new blocks_used: mov r10,[rdi+40] (PDXQ_OFF_BLOCKS_USED, u64); add r10,rsi (block_delta -- two's-complement add works for signed since we treat rsi as a raw i64 in a register). Check hard: mov r11,[rdi+56] (PDXQ_OFF_BLOCKS_HARD); cmp r11,0; je skip_hard; cmp r10,r11; ja hard_exceeded. skip_hard: mov r11,[rdi+48] (PDXQ_OFF_BLOCKS_SOFT); cmp r11,0; je ok; cmp r10,r11; jbe ok. Soft branch: cmp rcx,0 (grace_expired); je soft_ok; mov rax,0x0802 (SOFT_GRACE_EXPIRED); ret. soft_ok: mov rax,0x0801 (SOFT_EXCEEDED); ret. ok: xor rax,rax; ret. hard_exceeded: mov rax,0x0803; ret. bad_row: mov rax,0x0804; ret. All small imms; no add reg,[mem]; no test; only cmp reg,imm/reg. Labels prefixed lpv_qc_.",
+      block: {
+        // Magic gate.
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x50445851;
+        jne lpv_qc_bad_row;
+
+        // new_blocks_used = blocks_used + block_delta
+        mov r10, [rdi + 40];
+        add r10, rsi;
+
+        // Hard limit check.
+        mov r11, [rdi + 56];
+        cmp r11, 0;
+        je  lpv_qc_skip_hard;
+        cmp r10, r11;
+        ja  lpv_qc_hard;
+
+      lpv_qc_skip_hard:
+        // Soft limit check.
+        mov r11, [rdi + 48];
+        cmp r11, 0;
+        je  lpv_qc_ok;
+        cmp r10, r11;
+        jbe lpv_qc_ok;
+
+        // Over soft: grace-expired decides.
+        cmp rcx, 0;
+        je  lpv_qc_soft;
+        mov rax, 0x0802;                 // SOFT_GRACE_EXPIRED
+        ret;
+
+      lpv_qc_soft:
+        mov rax, 0x0801;                 // SOFT_EXCEEDED
+        ret;
+
+      lpv_qc_ok:
+        xor rax, rax;                    // LPV_QUOTA_OK
+        ret;
+
+      lpv_qc_hard:
+        mov rax, 0x0803;                 // HARD_EXCEEDED
+        ret;
+
+      lpv_qc_bad_row:
+        mov rax, 0x0804;                 // BAD_ROW
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_quota_commit(quota_row_ptr, block_delta, inode_delta) -> u64
+  //
+  // Atomically applies (block_delta, inode_delta) to the row's used
+  // counters. Underflow (negative delta pushing used below 0) is
+  // clamped to 0 -- soft failure, not fatal, since quota drift is
+  // recoverable via fsck.pdxfs's future recompute-blocks-used pass.
+  //
+  // Returns LPV_QUOTA_OK (0) always in this landing; a future
+  // extension might return a distinct code on clamp so a fsck-style
+  // consumer can count clamp events.
+  //
+  // NOTE: like check, inode_delta is accepted but not applied at this
+  // landing (block-only for v1.1.0). Follow-up covers inode.
+  // ==========================================================================
+  pub let pdxb_quota_commit : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (quota_row_ptr: u64) (block_delta: u64) (inode_delta: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M4-002 (#28): pdxb_quota_commit real body. Load blocks_used: mov r10,[rdi+40]. new = r10 + rsi (add treats rsi as i64 -- two's-complement wraps). Underflow check: if block_delta is negative (bit 63 set) AND magnitude > r10, the add wraps past 0 into the high range. Detect via: if rsi's high bit is set (negative delta) AND new > r10 (wrapped), clamp to 0. Encoder-friendly form: mov r11,rsi; shr r11,63; cmp r11,0; je no_neg; cmp r10,r10_old... simpler: mov r11,r10 (old); add r10,rsi; if r10 < r11 AND rsi high bit set, clamp -- do it with mov r12,rsi; shr r12,63; cmp r12,0; je store; cmp r10,r11; ja clamp. Store: mov [rdi+40],r10. Return 0. Labels prefixed lpv_qm_. Uses r10/r11/r12 (caller-save). No add reg,[mem]; only cmp.",
+      block: {
+        // Save old, compute new.
+        mov r11, [rdi + 40];             // r11 = old blocks_used
+        mov r10, r11;
+        add r10, rsi;                    // r10 = new (potentially wrapped)
+
+        // Underflow detection: sign(delta) < 0 AND new > old (wrapped).
+        mov r12, rsi;
+        shr r12, 63;                     // r12 = 1 if delta negative
+        cmp r12, 0;
+        je  lpv_qm_store;                // positive delta, no underflow possible
+        cmp r10, r11;
+        jbe lpv_qm_store;                // r10 <= r11: no wrap, valid subtract
+        // Wrapped: clamp to zero.
+        xor r10, r10;
+
+      lpv_qm_store:
+        mov [rdi + 40], r10;
+        xor rax, rax;                    // LPV_QUOTA_OK
+        ret;
+      }
+    }
+}

@@ -189,4 +189,63 @@ module MountTable = structure {
         ret;
       }
     }
+
+  // ==========================================================================
+  // libpdx-volume.M1-003 (#18) -- MountTableRow field accessors.
+  //
+  // One-line getters over the 56-byte MountTableRow summary layout
+  // (MTR_OFF_*). No setters at this landing: the summary is a decoded
+  // read-only view of a kernel-owned singleton row; a mutation surface
+  // would need to go through a KIND_PDXFS_MOUNT_TABLE write op that
+  // doesn't exist yet (design/architecture.md §4.2).
+  // ==========================================================================
+
+  pub let mtr_get_kind : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_KIND (+0). Plain qword load from the decoded summary.",
+      block: { mov rax, [rdi + 0]; ret; }
+    }
+
+  pub let mtr_get_in_use : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_IN_USE (+8).",
+      block: { mov rax, [rdi + 8]; ret; }
+    }
+
+  pub let mtr_get_flags : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_FLAGS (+16).",
+      block: { mov rax, [rdi + 16]; ret; }
+    }
+
+  pub let mtr_get_gen : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_GEN (+24).",
+      block: { mov rax, [rdi + 24]; ret; }
+    }
+
+  pub let mtr_get_mount_slot_count : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_MOUNT_SLOT_COUNT (+32).",
+      block: { mov rax, [rdi + 32]; ret; }
+    }
+
+  pub let mtr_get_reserved_hi : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_RESERVED_HI (+40).",
+      block: { mov rax, [rdi + 40]; ret; }
+    }
+
+  pub let mtr_get_table_row_addr : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTR_OFF_TABLE_ROW_ADDR (+48).",
+      block: { mov rax, [rdi + 48]; ret; }
+    }
 }

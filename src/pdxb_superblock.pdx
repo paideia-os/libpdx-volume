@@ -121,6 +121,23 @@ module PdxbSuperblock = structure {
   // --- On-disk superblock size (volume-fs-substrate.md §2.1 "Total"). ---
   pub let PDXB_SB_BYTES : u64 = 4096
 
+  // --- Public alias (libpdx-volume.M1-005 #20). PDXB_SB_BYTES has been
+  // callable as the on-disk block size since M2-001; `PDXB_ONDISK_BYTES`
+  // is the name the M1-005 issue brief specifies for the same value.
+  // Kept as its own `pub let` binding so a consumer can reference
+  // either name without cross-symbol resolution. ---
+  pub let PDXB_ONDISK_BYTES : u64 = 4096
+
+  // --- v2 wire-format additions (libpdx-volume.M5-002 #30). See the
+  // "PDXB v2 encryption" section below the summary layout for the full
+  // rationale. `PDXB_VERSION_V2` is written iff PDXB_FLAG_ENCRYPTED
+  // (superblock flags bit 1) is set; the parser now accepts version 1
+  // OR version 2 to support both plaintext (v1) and encrypted (v2)
+  // images transparently. ---
+  pub let PDXB_VERSION_V2      : u64 = 2
+  pub let PDXB_FLAG_HAS_QUOTA  : u64 = 0x01   // superblock flags bit 0 (M4-001)
+  pub let PDXB_FLAG_ENCRYPTED  : u64 = 0x02   // superblock flags bit 1 (M5-002)
+
   // --- On-disk byte offsets (volume-fs-substrate.md §2.1). All widths
   // in bytes; u32 fields use `mov_d`, u64 fields use plain `mov`. ---
   pub let PDXB_D_OFF_MAGIC          : u64 = 0     // u32
@@ -219,10 +236,17 @@ module PdxbSuperblock = structure {
         cmp rax, 0x42584450;
         jne pdxb_ps_bad_magic;
 
-        // ---- Gate 3: version. ----
+        // ---- Gate 3: version. Accepts v1 or v2 (v2 = encrypted, per
+        // libpdx-volume.M5-002 #30). Two sequential equality gates
+        // rather than a single range check keeps the encoder-conservative
+        // discipline: `cmp reg,imm` both times, no `test`, no branchless
+        // trick that would need SETcc or CMOVcc. ----
         mov_d rax, [rdi + 4];
         cmp rax, 1;
+        je  pdxb_ps_version_ok;
+        cmp rax, 2;
         jne pdxb_ps_bad_version;
+      pdxb_ps_version_ok:
 
         // ---- Gate 4: block_size. ----
         mov_d rax, [rdi + 24];
@@ -448,6 +472,361 @@ module PdxbSuperblock = structure {
 
       pdxb_es_too_short:
         mov rax, 0xFFFFFFFFFFFFFFFF;     // PDXB_ENC_ERR_BUF_TOO_SHORT
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // libpdx-volume.M1-003 (#18) -- field accessors.
+  //
+  // Every field in the PdxbSuperblockSummary layout (SBS_OFF_*) gets a
+  // one-line `_get` accessor here; writable fields also get a `_set`.
+  // Each accessor is a leaf function that computes `sb_ptr + SBS_OFF_X`
+  // and does a plain `mov` load/store. Consumers that previously
+  // hand-crafted the offset arithmetic (mkfs.pdxfs, mount.pdxfs) can
+  // adopt these one call at a time without a coordinated flag day --
+  // adding this many one-line functions is a byte-neutral change for
+  // any caller not using them.
+  //
+  // Encoder discipline: every function below is a pure `mov` load or
+  // store with a small imm offset (all offsets <= 168, well within the
+  // imm8 sign-extend bound). No shift/mask, no branch, no push/pop.
+  // Bodies are structurally identical -- the justification comments
+  // are trimmed where the pattern is obvious.
+  // ==========================================================================
+
+  // --- u32 fields (loaded via mov_d, zero-extended). Stored via full
+  //     `mov [rdi+N], rsi` at the summary slot's u64-wide position. ---
+
+  pub let pdxb_sb_get_magic : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_MAGIC (+0). mov rax,[rdi+0]; ret. The stored slot is already the u32 zero-extended by pdxb_parse_superblock; a plain qword load reads the full 8-byte summary slot.",
+      block: { mov rax, [rdi + 0]; ret; }
+    }
+
+  pub let pdxb_sb_get_version : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_VERSION (+8). Plain qword load.",
+      block: { mov rax, [rdi + 8]; ret; }
+    }
+
+  pub let pdxb_sb_get_uuid_lo : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_UUID_LO (+16).",
+      block: { mov rax, [rdi + 16]; ret; }
+    }
+
+  pub let pdxb_sb_get_uuid_hi : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_UUID_HI (+24).",
+      block: { mov rax, [rdi + 24]; ret; }
+    }
+
+  pub let pdxb_sb_get_block_size : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_BLOCK_SIZE (+32).",
+      block: { mov rax, [rdi + 32]; ret; }
+    }
+
+  pub let pdxb_sb_get_flags : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_FLAGS (+40).",
+      block: { mov rax, [rdi + 40]; ret; }
+    }
+
+  pub let pdxb_sb_get_total_blocks : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_TOTAL_BLOCKS (+48).",
+      block: { mov rax, [rdi + 48]; ret; }
+    }
+
+  pub let pdxb_sb_get_itable_lba : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_ITABLE_LBA (+56).",
+      block: { mov rax, [rdi + 56]; ret; }
+    }
+
+  pub let pdxb_sb_get_itable_bcount : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_ITABLE_BCOUNT (+64).",
+      block: { mov rax, [rdi + 64]; ret; }
+    }
+
+  pub let pdxb_sb_get_alloc_lba : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_ALLOC_LBA (+72).",
+      block: { mov rax, [rdi + 72]; ret; }
+    }
+
+  pub let pdxb_sb_get_alloc_bcount : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_ALLOC_BCOUNT (+80).",
+      block: { mov rax, [rdi + 80]; ret; }
+    }
+
+  pub let pdxb_sb_get_journal_lba : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_JOURNAL_LBA (+88).",
+      block: { mov rax, [rdi + 88]; ret; }
+    }
+
+  pub let pdxb_sb_get_journal_bcount : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_JOURNAL_BCOUNT (+96).",
+      block: { mov rax, [rdi + 96]; ret; }
+    }
+
+  pub let pdxb_sb_get_data_lba : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_DATA_LBA (+104).",
+      block: { mov rax, [rdi + 104]; ret; }
+    }
+
+  pub let pdxb_sb_get_data_bcount : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_DATA_BCOUNT (+112).",
+      block: { mov rax, [rdi + 112]; ret; }
+    }
+
+  pub let pdxb_sb_get_root_inode : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_ROOT_INODE (+120).",
+      block: { mov rax, [rdi + 120]; ret; }
+    }
+
+  pub let pdxb_sb_get_mount_gen : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_MOUNT_GEN (+128).",
+      block: { mov rax, [rdi + 128]; ret; }
+    }
+
+  pub let pdxb_sb_get_snap_head : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for SBS_OFF_SNAP_HEAD (+136).",
+      block: { mov rax, [rdi + 136]; ret; }
+    }
+
+  // --- sig_key_hash: four consecutive u64 slots at +144, +152, +160, +168.
+  // Accessor takes word_idx in [0..3]; caller-checked. Out-of-range
+  // reads whatever is at sb_ptr + 144 + word_idx*8 without a gate,
+  // matching this library's "trust the caller" discipline elsewhere. ---
+  pub let pdxb_sb_get_sig_key_hash_word : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (word_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): sig_key_hash word accessor. Base = sb_ptr + 144 (SBS_OFF_SIG_KEY_HASH); index = word_idx*8. mov rcx,rsi; shl rcx,3 (index bytes); mov rax,rdi; add rax,rcx (base + index, register-register, never lea reg,[regA+regB]); mov rax,[rax+144]; ret. No `add reg,[mem]`; register-only arithmetic. No shift-count issue (3 is a small unsigned immediate).",
+      block: {
+        mov rcx, rsi;
+        shl rcx, 3;
+        mov rax, rdi;
+        add rax, rcx;
+        mov rax, [rax + 144];
+        ret;
+      }
+    }
+
+  // --- Setters for every writable field mkfs.pdxfs needs. Same shape:
+  //     rdi = sb_ptr, rsi = value; return void (rax not written).
+  //     Constants like PDXB_MAGIC / PDXB_VERSION_V1 / PDXB_BLOCK_SIZE
+  //     also get setters even though a real mkfs writes them once at
+  //     format time, so the setter set is complete for a fuzzer that
+  //     wants to mutate every slot. ---
+
+  pub let pdxb_sb_set_magic : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_MAGIC (+0). mov [rdi+0],rsi; xor rax,rax; ret.",
+      block: { mov [rdi + 0], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_version : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_VERSION (+8).",
+      block: { mov [rdi + 8], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_uuid_lo : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_UUID_LO (+16).",
+      block: { mov [rdi + 16], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_uuid_hi : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_UUID_HI (+24).",
+      block: { mov [rdi + 24], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_block_size : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_BLOCK_SIZE (+32).",
+      block: { mov [rdi + 32], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_flags : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_FLAGS (+40).",
+      block: { mov [rdi + 40], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_total_blocks : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_TOTAL_BLOCKS (+48).",
+      block: { mov [rdi + 48], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_root_inode : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_ROOT_INODE (+120).",
+      block: { mov [rdi + 120], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_mount_gen : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_MOUNT_GEN (+128).",
+      block: { mov [rdi + 128], rsi; xor rax, rax; ret; }
+    }
+
+  pub let pdxb_sb_set_snap_head : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): setter for SBS_OFF_SNAP_HEAD (+136).",
+      block: { mov [rdi + 136], rsi; xor rax, rax; ret; }
+    }
+
+  // ==========================================================================
+  // libpdx-volume.M5-002 (#30) -- PDXB v2 wrapped-DEK / KDF-salt / nonce
+  // accessors.
+  //
+  // Slot layout in the superblock's on-disk _reserved region (v2 only):
+  //
+  //   [+192, +240)  wrapped_dek   32 B ciphertext || 16 B tag = 48 B
+  //   [+240, +256)  kdf_salt      16 B
+  //   [+256, +268)  wrap_nonce    12 B
+  //
+  // The signed range is [0, 696), so all three slots fall inside it --
+  // tampering with them fails pdxb_verify_superblock's signature check.
+  //
+  // These accessors operate on the RAW on-disk 4096-byte superblock
+  // buffer (the same shape pdxb_parse/encode_superblock take), NOT on
+  // the 176-byte PdxbSuperblockSummary -- the summary intentionally
+  // does not decode _reserved and would not have slots for these fields
+  // anyway. `pdxb_sb_is_encrypted` reads the summary's flags slot
+  // (SBS_OFF_FLAGS +40); the wrapped-DEK/salt/nonce accessors read the
+  // on-disk buffer's _reserved offsets (192/240/256).
+  //
+  // Layout choice rationale (from the issue brief's own trade-off
+  // request): this landing picks the **paired-block scheme** for per-
+  // block AEAD metadata (data_lba is ciphertext; a per-16-block
+  // metadata block at data_lba + N*16 holds 16x(12B nonce + 16B tag) =
+  // 448 bytes) over the inline-trailer scheme (4124-byte on-disk unit)
+  // because paideia-os block devices are frozen at 4KiB units and the
+  // inline trailer would require every block device to expose a
+  // 4KiB+28B addressable unit (which none does today). The 2x metadata
+  // read overhead is bounded and cacheable; the addressability change
+  // would cascade across every existing block driver. This trade-off
+  // is documented in this file and in design/architecture.md §11.
+  // ==========================================================================
+
+  pub let PDXB_D_OFF_WRAPPED_DEK : u64 = 192   // 48 B (32 ct + 16 tag)
+  pub let PDXB_D_OFF_KDF_SALT    : u64 = 240   // 16 B
+  pub let PDXB_D_OFF_WRAP_NONCE  : u64 = 256   // 12 B
+  pub let PDXB_WRAPPED_DEK_BYTES : u64 = 48
+  pub let PDXB_KDF_SALT_BYTES    : u64 = 16
+  pub let PDXB_WRAP_NONCE_BYTES  : u64 = 12
+
+  // pdxb_sb_get_wrapped_dek(sb_ptr, out_ptr): copies 48 bytes from
+  // sb_ptr + 192 to out_ptr. Six qword copies (48 / 8 = 6, exact).
+  pub let pdxb_sb_get_wrapped_dek : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M5-002 (#30): copy wrapped_dek [192, 240) (48 B = 6 qwords). Six load/store pairs at fixed offsets, matching pdxb_parse_superblock's per-slot idiom. No add reg,[mem]; no loop needed at this size.",
+      block: {
+        mov rax, [rdi + 192];  mov [rsi + 0], rax;
+        mov rax, [rdi + 200];  mov [rsi + 8], rax;
+        mov rax, [rdi + 208];  mov [rsi + 16], rax;
+        mov rax, [rdi + 216];  mov [rsi + 24], rax;
+        mov rax, [rdi + 224];  mov [rsi + 32], rax;
+        mov rax, [rdi + 232];  mov [rsi + 40], rax;
+        xor rax, rax; ret;
+      }
+    }
+
+  pub let pdxb_sb_set_wrapped_dek : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (wrapped_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M5-002 (#30): inverse of pdxb_sb_get_wrapped_dek. Six load/store pairs.",
+      block: {
+        mov rax, [rsi + 0];   mov [rdi + 192], rax;
+        mov rax, [rsi + 8];   mov [rdi + 200], rax;
+        mov rax, [rsi + 16];  mov [rdi + 208], rax;
+        mov rax, [rsi + 24];  mov [rdi + 216], rax;
+        mov rax, [rsi + 32];  mov [rdi + 224], rax;
+        mov rax, [rsi + 40];  mov [rdi + 232], rax;
+        xor rax, rax; ret;
+      }
+    }
+
+  // pdxb_sb_get_kdf_salt(sb_ptr, out_ptr): copies 16 bytes from
+  // sb_ptr + 240 to out_ptr.
+  pub let pdxb_sb_get_kdf_salt : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M5-002 (#30): copy kdf_salt [240, 256) (16 B = 2 qwords).",
+      block: {
+        mov rax, [rdi + 240];  mov [rsi + 0], rax;
+        mov rax, [rdi + 248];  mov [rsi + 8], rax;
+        xor rax, rax; ret;
+      }
+    }
+
+  pub let pdxb_sb_set_kdf_salt : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) (salt_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M5-002 (#30): inverse of pdxb_sb_get_kdf_salt.",
+      block: {
+        mov rax, [rsi + 0];  mov [rdi + 240], rax;
+        mov rax, [rsi + 8];  mov [rdi + 248], rax;
+        xor rax, rax; ret;
+      }
+    }
+
+  // pdxb_sb_is_encrypted(sb_ptr): reads the summary's flags slot
+  // (SBS_OFF_FLAGS = +40) and returns bit 1 (PDXB_FLAG_ENCRYPTED)
+  // as a u64 0/1.
+  pub let pdxb_sb_is_encrypted : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M5-002 (#30): decode flags bit 1 (PDXB_FLAG_ENCRYPTED = 0x02). Load summary flags at +40, shift right by 1 then mask with 1 (both small imms, safe under paideia-as's imm-encoding rules). No conditional branch needed; the bit-value IS the boolean return.",
+      block: {
+        mov rax, [rdi + 40];
+        shr rax, 1;
+        and rax, 1;
         ret;
       }
     }

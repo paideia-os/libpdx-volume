@@ -147,7 +147,45 @@ module VolKind = structure {
   pub let vol_kind_mint : (u64) -> u64 !{} @{} =
     fn (dev_cap: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "libpdx-volume.M1-001: vol_kind_mint scaffold stub. Returns LPX_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, loaded via MOVABS -- outside the 0x7FFFFFFF cmp-imm bound but legal for a register load, never compared) without touching dev_cap. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Real body deferred to a future M2 landing once KIND_VOLUME exposes a ring-3-reachable mint syscall (see module header).",
+      justification: "libpdx-volume.M1-001: vol_kind_mint scaffold stub (legacy 1-arg shape kept for v1.0.0 API compatibility). Returns LPX_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, loaded via MOVABS -- outside the 0x7FFFFFFF cmp-imm bound but legal for a register load, never compared) without touching dev_cap. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Callers wanting elevate-broker wiring should use vol_kind_mint_elevate (M2-003, #23) instead. Real body still deferred to a future M2 landing once KIND_VOLUME exposes a ring-3-reachable mint syscall (see module header).",
+      block: {
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // vol_kind_mint_elevate(dev_cap, elevate_channel_slot, out_narrowed_cap_slot)
+  //   -> LPV_VK_OK | LPV_VK_ERR_* | LPV_STUB_NOT_IMPLEMENTED
+  //
+  // libpdx-volume.M2-003 (#23). The elevate-aware form of vol_kind_mint.
+  //
+  //   elevate_channel_slot == 0 (sentinel): no elevate; try to mint
+  //     with the invoker's existing rights on dev_cap. If the invoker
+  //     lacks R_BLKDEV_MINT_VOLUME, the mint fails with
+  //     LPV_VK_ERR_INSUFFICIENT_RIGHTS (1).
+  //   elevate_channel_slot != 0: libpdx-elevate::elevate_request is
+  //     issued for (KIND_VOLUME, R_VOL_ALL=0x43B, dev_cap); on
+  //     ALLOW proceed with the mint, on DENY return
+  //     LPV_VK_ERR_ELEVATE_DENIED (2), on TIMEOUT return
+  //     LPV_VK_ERR_ELEVATE_TIMEOUT (3).
+  //
+  // At this landing the entire body is a STUB (0xFFFFFFFFFFFFFFFF):
+  //   - The kernel-side ring-3 KIND_VOLUME mint syscall does not exist
+  //     yet (STATUS.md's original M5 "Deferred" note); flagged as a
+  //     paideia-os monorepo follow-up issue.
+  //   - libpdx-elevate is not yet linked into this repo's build tree;
+  //     the elevate_request extern would be an unresolved reference at
+  //     consumer link time.
+  //
+  // The signature is landed NOW so downstream mount.pdxfs can code
+  // against the final 3-arg shape from day one; only the body flips
+  // from stub to real once both external blockers close.
+  // ============================================================================
+  pub let vol_kind_mint_elevate : (u64, u64, u64) -> u64 !{} @{} =
+    fn (dev_cap: u64) (elevate_channel_slot: u64) (out_narrowed_cap_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M2-003 (#23): vol_kind_mint_elevate STUB. Blocked on two external substrates: (a) ring-3 KIND_VOLUME mint syscall (paideia-os kernel-side, does not exist -- filed as monorepo follow-up), (b) libpdx-elevate link (not yet in build tree). Signature is the final 3-arg shape from the issue brief (dev_cap, elevate_channel_slot, out_narrowed_cap_slot); body unconditionally returns LPV_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, MOVABS) without touching any argument. Once both blockers close, this becomes: (1) cmp r10,0 (elevate slot); je no_elevate; (2) call elevate_request with KIND_VOLUME=0x1A0 and R_VOL_ALL=0x43B; branch on ALLOW/DENY/TIMEOUT; (3) call the real mint syscall; (4) store the resulting cap slot at *out_narrowed_cap_slot. No labels at this stub landing.",
       block: {
         mov rax, 0xFFFFFFFFFFFFFFFF;
         ret;

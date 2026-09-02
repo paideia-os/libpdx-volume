@@ -750,3 +750,156 @@ LIMITATIONS section citing every deferred/stub item this document
 already flags (§5.1, §4.3, §3.1, §8.2, §8.4) — a single reader-facing
 index into decisions otherwise scattered across ten sections of this
 file.
+
+## 11. v1.1.0 additions — audit-driven follow-up (LV.M1..LV.M6, issues #16..#31)
+
+Sixteen tickets closing gaps identified by a Phase-1 audit of the
+v1.0.0 surface. This section indexes the LOAD-BEARING wire-format
+and shape decisions that recur; per-symbol contracts live in each
+module's own header and in `doc/libpdx-volume.pdxdoc`.
+
+### 11.1 Additive-only compatibility posture
+
+Every v1.0.0 API surface — every public symbol, every constant, every
+error code numeric value — is preserved byte-for-byte at v1.1.0. New
+public symbols are new bindings, never renames or renumbers of
+existing ones. Downstream consumers built against v1.0.0 continue to
+compile and behave identically without any adaptation. This is the
+whole point of a minor-version bump: adopting v1.1.0 is a
+zero-friction operation for a consumer that isn't using the new
+surface, and additive when they are.
+
+The single load-bearing consequence: the `LPV_E_*` banded namespace in
+`src/lpv_errors.pdx` (M1-004) is ADDITIVE alongside the v1.0.0 per-
+module `LPV_VK_*` / `LPV_MTR_*` / `PDXB_ERR_*` small-integer codes.
+Both sets are `pub let`-bound and both are recognised by any future
+full-population of `lpv_strerror` (its scaffold at v1.1.0 returns 0
+for every input; the LPV_E_* bindings and message strings are the
+load-bearing part of the ticket).
+
+### 11.2 CRC32C over the signed range (issue #17)
+
+`src/pdxb_checksum.pdx` implements `pdxb_superblock_checksum` and
+`pdxb_verify_checksum` over the same [0, 696) byte range
+`pdxb_sign_superblock` covers. This is an IN-MEMORY-only helper — the
+on-disk PDXB v1 layout has NO checksum slot (§3.1's substitution
+rationale still holds), and this ticket does not add one. The CRC is
+for cheap bit-rot detection ahead of the expensive ML-DSA-65
+signature verify: mkfs.pdxfs can post-write self-check, mount.pdxfs
+can first-line integrity-screen. A future PDXB v3 that persists the
+CRC into an on-disk slot is a separate wire-format ticket.
+
+Implementation: standard slice-by-1 table-driven CRC32C, 256-entry
+u32 lookup table in `.rodata`, seed 0xFFFFFFFF, final XOR with
+0xFFFFFFFF, Castagnoli reflected polynomial 0x82F63B78. paideia-as
+has no CRC32C intrinsic in v0.28.0 stdlib (only RFC 1071 IP-checksum
+in `checksum.pdx`).
+
+### 11.3 PDXB v2 wire format — encryption + `_reserved` region reuse (issues #29, #30)
+
+The 536-byte `_reserved` region at superblock offset `[160, 696)` is
+reused for three v1.1.0 extensions, packed contiguously so the signed
+range remains identical:
+
+    [+160, +184)  QUOTA anchor       (M4-001 #27)
+      +160  quota_table_lba     u64  (0 = no quotas)
+      +168  quota_table_bcount  u64
+      +176  quota_flags         u64  bit0 ENFORCE_HARD, bit1 ENFORCE_SOFT
+    [+184, +192)  (unused padding)
+    [+192, +268)  CRYPTO material    (M5-002 #30, v2 only)
+      +192  wrapped_dek         48B  (32 ct + 16 tag)
+      +240  kdf_salt            16B
+      +256  wrap_nonce          12B
+      +268                     (12B unused padding to +280)
+    [+268, +284)  MOUNT DEPS anchor  (M6-001 #31)
+      +268  mount_deps_lba      u64  (0 = no deps)
+      +276  mount_deps_bcount   u64
+    [+284, +696)  (unused reserved)
+
+All three regions fall inside the signed range [0, 696), so tampering
+with any of them fails `pdxb_verify_superblock`'s signature check —
+which is exactly the property that makes this reuse safe without a
+wire-format-version bump for the quota + mount-deps regions.
+
+`PDXB_FLAG_ENCRYPTED` (superblock flags bit 1) gates version = 2. When
+set, the parser accepts version 2; the encoder writes version 2. When
+unset, everything stays at v1. `PDXB_FLAG_HAS_QUOTA` (bit 0) gates the
+quota anchor's use — a v1 image with unused reserved region reads its
+quota anchor as all-zero (no quotas), which is the correct default.
+
+### 11.4 Per-block AEAD -- paired-block scheme (M5-002 #30, deferred body)
+
+`pdxb_block_encrypt` / `pdxb_block_decrypt` (`src/pdxb_crypto.pdx`)
+are STUBS at v1.1.0 pending the paired-block-vs-inline-trailer
+decision that the M5-002 issue brief's own trade-off write-up
+requested. This library commits to the **paired-block scheme**:
+data_lba is 4096 bytes of ciphertext; a per-16-block metadata block
+at some computed metadata_lba holds 16 × (12-byte nonce + 16-byte
+tag) = 448 bytes per meta-block. Rationale: paideia-os block devices
+are frozen at 4KiB addressable units; the inline-trailer scheme
+(4124-byte on-disk unit) would require every block driver to expose
+a 4KiB+28B unit, cascading across R51 storage code that isn't in
+scope here. The 2× metadata-read overhead is bounded and cacheable.
+
+Consumers (mkfs.pdxfs, mount.pdxfs) need to agree on WHERE the
+metadata blocks live (interleaved every N data blocks vs a dedicated
+metadata-table region at the tail of the data zone) before the real
+body ships — that agreement is the follow-up.
+
+### 11.5 Snapshot chain (M3-002 #26)
+
+96-byte on-disk snap-metadata record anchored at `snap_head` (the
+existing superblock field at offset +120). Layout in the M3-002
+issue brief and reproduced in `src/vol_snapshot.pdx` module header.
+`snap_record_parse` real body decodes; `snap_chain_walk` stub —
+walking requires block-read authority scaffolding this library
+doesn't have yet, and adding it would break the "zero cap-invoke"
+discipline (a walker would need to read blocks through volume_cap).
+Follow-up: agree on a caller-supplied read-block callback shape.
+
+### 11.6 Mount dependencies (M6-001 #31)
+
+`src/mount_deps.pdx` decodes dep-list blocks anchored at the
+superblock's new `mount_deps_lba` slot (§11.3). Each per-dep entry
+is 128 bytes: 8-byte header (dep_kind + reserved) + 112-byte UTF-8
+mount path. `mount_deps_parse` real body; `mount_table_sort_by_deps`
+stub — Kahn's algorithm shape is documented in the file header;
+implementation follow-up is tracked to close once mountall.pdxfs's
+input-shape decision lands.
+
+### 11.7 Elevate-broker + audit-hook wrappers (issues #22, #23)
+
+Two v1.1.0 helpers add optional-slot arguments that fast-path to the
+untraced/non-elevated path when the slot is 0:
+
+- `pdxb_sign_superblock_traced` (M2-002 #22, `src/pdxb_sign.pdx`) —
+  `audit_client_slot == 0` forwards straight to the untraced
+  `pdxb_sign_superblock`; slot != 0 stubs LPV_STUB until libpdx-audit
+  becomes link-resolvable in the build tree.
+- `vol_kind_mint_elevate` (M2-003 #23, `src/vol_kind.pdx`) —
+  `elevate_channel_slot == 0` attempts a direct mint (blocked today
+  by the missing kernel-side syscall); slot != 0 will call
+  `elevate_request` once libpdx-elevate is link-resolvable.
+
+The optional-slot pattern lets downstream consumers adopt the new
+tracing / elevate capability incrementally without a forced dependency
+on libpdx-audit / libpdx-elevate being present in every build.
+
+### 11.8 What v1.1.0 does NOT close
+
+Enumerated in `CHANGELOG.md`'s v1.1.0 "Deferred substrate" section.
+The short list of external blockers:
+
+- Kernel-side `KIND_VOLUME_SNAPSHOT` (#25)
+- Kernel-side `KIND_KEK` (#29)
+- `mldsa65_verify` intrinsic (#16 stays fail-closed stub)
+- Kernel-side ring-3 `KIND_VOLUME` mint syscall (#23 stays stub body)
+- libpdx-audit link-availability (#22 audit-on branch stays stub)
+- libpdx-elevate link-availability (#23 elevate branch stays stub)
+- mkfs.pdxfs / mount.pdxfs / umount.pdxfs runnable executables
+  (#24 smoke witness cleanly SKIPs)
+- Dual-sign + mirror-push external gates (#21, unchanged from v1.0.0)
+- `pdxb_block_encrypt/_decrypt` paired-block layout agreement (#30)
+- `mount_table_sort_by_deps` full Kahn's body (#31)
+- Inode-quota enforcement (#28)
+- Full `lpv_strerror` dispatch table (#19)

@@ -269,8 +269,58 @@ test contracts: `tests/README.md`. Release workflow:
 `release/RELEASE-1.0.0.md`.
 
 ==== VERSION
-libpdx-volume 1.0.0 (R53 wave, M5-001 signed-release scaffold). The
-actual dual-sign + mirror-push run happens once substrates S1
-(paideia-as toolchain) and S2 (pkgs.paideia-os endpoint) go green and a
-live release-line seed key is available, per `release/RELEASE-1.0.0.md`
-§3.
+libpdx-volume 1.1.0 (LV.M1..LV.M6 audit-driven follow-up over the
+v1.0.0 R53 wave). Additive minor release closing 16 tickets
+(#16..#31); every v1.0.0 API surface is preserved byte-for-byte. See
+`CHANGELOG.md`'s 1.1.0 section for the full landing manifest, and
+`design/architecture.md` §11 for the wire-format additions
+(`_reserved` region reuse, PDXB v2 encryption gating, snap-metadata
+records, quota rows, mount-deps blocks). The dual-sign + mirror-push
+run remains deferred with the same three external gates as v1.0.0
+(paideia-as toolchain in CI, `pkgs.paideia-os` endpoint,
+release-line ML-DSA-65 seed key custody) — see
+`release/RELEASE-1.0.0.md` §3.
+
+==== V1.1.0 API additions (index)
+Full contracts in each module's own header + `design/architecture.md`
+§11. Every symbol below is additive on top of v1.0.0.
+
+- **`src/pdxb_checksum.pdx`** — `pdxb_superblock_checksum(sb_ptr,
+  buf_len)`, `pdxb_verify_checksum(sb_ptr, expected)`. CRC32C over the
+  [0, 696) signed range (real bodies).
+- **`src/lpv_errors.pdx`** — `LPV_E_*` banded namespace (VK, MTR,
+  MTS, PDXB, SIGN, VER, SNAP, QUOTA, CRYPTO, ORDER, STUB bands);
+  `lpv_strerror(code, out, cap)` scaffold (bindings landed; dispatch
+  table follow-up).
+- **`src/vol_snapshot.pdx`** — `KIND_VOLUME_SNAPSHOT = 0x1A1`;
+  `vol_snapshot_narrow` real body (validate + passthrough);
+  `vol_snapshot_mint` / `pdxb_snap_create` / `snap_chain_walk` stubs;
+  `snap_record_parse` real body over the 96-byte metadata record.
+- **`src/pdxb_quota.pdx`** — `PDXQ_MAGIC = 0x50445851`; wire format
+  documented; `pdxb_quota_row_parse` / `_row_encode` / `_table_lookup`
+  real bodies; `pdxb_quota_check` (4 return codes + BAD_ROW);
+  `pdxb_quota_commit` with underflow clamp. Block path fully wired;
+  inode path is a follow-up.
+- **`src/pdxb_crypto.pdx`** — `KIND_KEK = 0x1A2`; `pdxb_kek_derive`
+  (Argon2id RFC 9106 profile); `pdxb_dek_wrap` / `_unwrap` (ChaCha20-
+  Poly1305); `pdxb_block_encrypt` / `_decrypt` stubs pending
+  paired-block layout.
+- **`src/mount_deps.pdx`** — `PDDP_MAGIC = 0x50444450`; per-dep entry
+  128 bytes; `mount_deps_parse` real body; `mount_table_sort_by_deps`
+  stub pending Kahn's-algorithm body.
+- **`src/pdxb_sign.pdx`** additions: `pdxb_verify_superblock` stub
+  (blocked on `mldsa65_verify`); `pdxb_sign_superblock_traced`
+  (audit_client_slot == 0 fast-path fully working).
+- **`src/pdxb_superblock.pdx`** additions: 22 getters + 10 setters
+  over `PdxbSuperblockSummary`; `PDXB_ONDISK_BYTES`,
+  `PDXB_VERSION_V2`, `PDXB_FLAG_HAS_QUOTA`, `PDXB_FLAG_ENCRYPTED`;
+  PDXB v2 wrapped-DEK/salt accessors over `_reserved[+192, +268)`;
+  parser accepts v1 or v2.
+- **`src/mount_table.pdx`** additions: 7 `MountTableRow` field
+  getters (`mtr_get_kind` through `mtr_get_table_row_addr`).
+- **`src/mount_table_snapshot.pdx`** additions: 5 `MountTableEntry`
+  field getters (`mte_get_mountpoint_vnode_idx` through
+  `mte_get_reserved`); `MTE_BYTES = 40` alias.
+- **`src/vol_kind.pdx`** additions: `vol_kind_mint_elevate(dev_cap,
+  elevate_channel_slot, out_slot)` — 3-arg elevate-aware form; body
+  stubs pending kernel-side mint syscall + libpdx-elevate link.

@@ -1,0 +1,382 @@
+// src/pdxb_crypto.pdx — libpdx-volume.M5-001 (#29)
+// PdxbCrypto: KEK/DEK client-side helpers over paideia-as's
+// ChaCha20-Poly1305 AEAD and Argon2id KDF stdlib intrinsics.
+//
+// -----------------------------------------------------------------------------
+// Intrinsics available in paideia-as v0.28.0 (crypto.pdx)
+// -----------------------------------------------------------------------------
+//
+// From tools/paideia-as/crates/paideia-stdlib/pdx/crypto.pdx:
+//
+//   trait Argon2id {
+//     fn derive(params_ptr, out_ptr, out_len) -> i64 !{crypto, mem} @{paideia.crypto};
+//   }
+//   trait ChaCha20Poly1305 {
+//     fn seal(params, plaintext_ptr, plaintext_len, out_ptr, out_cap,
+//             written_ptr) -> i64 !{crypto, mem} @{paideia.crypto};
+//     fn open(params, sealed_ptr, sealed_len, out_ptr, out_cap,
+//             written_ptr) -> i64 !{crypto, mem} @{paideia.crypto};
+//   }
+//
+// Return codes shared across all crypto FFI thunks:
+//    0  OK
+//   -1  InvalidParam
+//   -2  InvalidLength
+//   -3  AuthenticationFailed (AEAD open only)
+//   -4  Primitive-internal failure
+//   -5  BufferTooSmall
+//
+// Argon2idParamsC layout (Rust `#[repr(C)]`, all pointers 8 B):
+//   password_ptr, password_len, salt_ptr, salt_len, secret_ptr,
+//   secret_len, ad_ptr, ad_len (8 pointer/len slots = 64 B),
+//   m_cost_kib (u32), t_cost (u32), p_cost (u32), _reserved (u32)
+//   = 64 + 16 = 80 bytes total.
+//
+// AeadParamsC layout:
+//   key_ptr, nonce_ptr, aad_ptr, aad_len = 4 u64 slots = 32 bytes.
+//
+// -----------------------------------------------------------------------------
+// KIND_KEK -- kernel side does not exist yet
+// -----------------------------------------------------------------------------
+//
+// KIND_KEK (Key-Encryption-Key handle, sealed under a hardware
+// root-of-trust) is the kernel-side capability kind that will
+// eventually hold a wrapped 32-byte KEK. At this landing there is no
+// such kind in paideia-os -- the client helpers below take raw
+// key/salt/nonce POINTERS, following pdxb_sign_superblock's own
+// established "raw pointer, not cap slot" discipline (design/
+// architecture.md §8.2). A `KIND_KEK`-aware wrapper can be layered
+// on top later once (a) the kernel cap kind lands and (b) this
+// library adds its first cap-invoke call. Follow-up filed against
+// paideia-os monorepo.
+//
+// -----------------------------------------------------------------------------
+// Trait declarations -- module-local, matching pdxb_sign.pdx precedent
+// -----------------------------------------------------------------------------
+//
+// Same reasoning as src/pdxb_sign.pdx's module-local `MlDsa65` trait:
+// the elaborator's stdlib_lowering::cryptoops recipe dispatches on the
+// literal (trait_name, method_name) strings at the call site, not on
+// a cross-crate import. Both traits are redeclared here verbatim from
+// crypto.pdx.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder notes
+// -----------------------------------------------------------------------------
+//
+//   - All wrappers pack their AeadParamsC / Argon2idParamsC into a
+//     `.bss`-resident scratch struct (one per helper), then pass its
+//     address to the intrinsic. This avoids stack manipulation and
+//     keeps every function a leaf-plus-one-call.
+//   - Cross-trait-method calls use the module-local trait syntax,
+//     matching pdxb_sign_mldsa65_raw's own plain-lambda-body form.
+//   - Label prefix `lpv_cr_`.
+
+module PdxbCrypto = structure {
+
+  // Key/nonce/tag sizes.
+  pub let LPV_KEK_LEN        : u64 = 32
+  pub let LPV_DEK_LEN        : u64 = 32
+  pub let LPV_AEAD_NONCE_LEN : u64 = 12
+  pub let LPV_AEAD_TAG_LEN   : u64 = 16
+  pub let LPV_KDF_SALT_LEN   : u64 = 16
+
+  // Wrapped-DEK on-disk length (32 ciphertext + 16 tag = 48).
+  pub let LPV_WRAPPED_DEK_LEN : u64 = 48
+
+  // Argon2id parameters (RFC 9106 §4 recommended profile "second
+  // generation" -- 64 MiB, 3 iterations, 1 lane).
+  pub let LPV_ARGON2_M_COST_KIB : u64 = 65536   // 64 MiB
+  pub let LPV_ARGON2_T_COST     : u64 = 3
+  pub let LPV_ARGON2_P_COST     : u64 = 1
+
+  // Status codes (band 0x0900).
+  pub let LPV_CRYPTO_OK              : u64 = 0
+  pub let LPV_CRYPTO_ERR_NOT_IMPL    : u64 = 0x0901
+  pub let LPV_CRYPTO_ERR_KDF_FAIL    : u64 = 0x0902
+  pub let LPV_CRYPTO_ERR_AEAD_FAIL   : u64 = 0x0903
+  pub let LPV_CRYPTO_ERR_TAG_MISMATCH : u64 = 0x0904
+  pub let LPV_CRYPTO_ERR_BAD_KEY_LEN : u64 = 0x0905
+
+  // -------------------------------------------------------------------------
+  // Local trait declarations (see module header for the module-local
+  // dispatch rationale).
+  // -------------------------------------------------------------------------
+  trait Argon2id {
+    fn derive(params_ptr: u64, out_ptr: u64, out_len: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+  }
+  trait ChaCha20Poly1305 {
+    fn seal(params: u64, plaintext_ptr: u64, plaintext_len: u64,
+            out_ptr: u64, out_cap: u64, written_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+    fn open(params: u64, sealed_ptr: u64, sealed_len: u64,
+            out_ptr: u64, out_cap: u64, written_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+  }
+
+  // -------------------------------------------------------------------------
+  // Plain lambda-body trait-call wrappers (mirror pdxb_sign_mldsa65_raw's
+  // pattern -- the ONLY way to reach the stdlib_lowering trait-call
+  // recipe is a call expression at a lambda-body / tail-expression
+  // position, per src/pdxb_sign.pdx's module header).
+  // -------------------------------------------------------------------------
+  pub let pdxb_crypto_argon2id_raw : (u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params_ptr: u64, out_ptr: u64, out_len: u64) ->
+      Argon2id::derive(params_ptr, out_ptr, out_len)
+
+  pub let pdxb_crypto_seal_raw : (u64, u64, u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params: u64, plaintext_ptr: u64, plaintext_len: u64,
+        out_ptr: u64, out_cap: u64, written_ptr: u64) ->
+      ChaCha20Poly1305::seal(params, plaintext_ptr, plaintext_len,
+                              out_ptr, out_cap, written_ptr)
+
+  pub let pdxb_crypto_open_raw : (u64, u64, u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params: u64, sealed_ptr: u64, sealed_len: u64,
+        out_ptr: u64, out_cap: u64, written_ptr: u64) ->
+      ChaCha20Poly1305::open(params, sealed_ptr, sealed_len,
+                              out_ptr, out_cap, written_ptr)
+
+  // -------------------------------------------------------------------------
+  // Per-helper .bss scratch structs (one Argon2idParamsC + one
+  // AeadParamsC + one `written` u64 out-slot). Making these
+  // .bss-resident rather than stack-allocated keeps every wrapper a
+  // pure leaf (no frame manipulation), at the cost of NOT being
+  // reentrant -- two threads calling pdxb_kek_derive simultaneously
+  // will race on `lpv_argon2_scratch`. This matches libpdx-volume's
+  // overall non-reentrant discipline (every other .bss scratch in the
+  // library, e.g. tpr_lcg_state, is single-writer by convention).
+  // -------------------------------------------------------------------------
+
+  // Argon2idParamsC: 8 pointer/len slots (64 B) + 4 u32 config (16 B) = 80 B.
+  pub let mut lpv_argon2_scratch : [u8; 80] = uninit @align(8)
+
+  // AeadParamsC: 4 u64 slots = 32 B.
+  pub let mut lpv_aead_scratch : [u8; 32] = uninit @align(8)
+
+  // Written-length out-slot for seal/open.
+  pub let mut lpv_written_scratch : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // pdxb_kek_derive(passphrase_ptr, passphrase_len, salt_ptr, salt_len,
+  //                 out_kek_ptr) -> u64
+  //
+  // Populates lpv_argon2_scratch with the caller's password + salt +
+  // NULL secret + NULL AD + RFC 9106 recommended profile params, then
+  // calls Argon2id::derive to write 32 bytes into out_kek_ptr. Returns
+  // LPV_CRYPTO_OK on success or LPV_CRYPTO_ERR_KDF_FAIL on any
+  // intrinsic error.
+  //
+  // Argon2idParamsC layout (verified against
+  // tools/paideia-as/crates/paideia-as-crypto/src/ffi/mod.rs):
+  //   [+0]  password_ptr  u64
+  //   [+8]  password_len  u64
+  //   [+16] salt_ptr      u64
+  //   [+24] salt_len      u64
+  //   [+32] secret_ptr    u64  (0 = NULL)
+  //   [+40] secret_len    u64
+  //   [+48] ad_ptr        u64  (0 = NULL)
+  //   [+56] ad_len        u64
+  //   [+64] m_cost_kib    u32
+  //   [+68] t_cost        u32
+  //   [+72] p_cost        u32
+  //   [+76] _reserved     u32  (MUST be 0)
+  // ==========================================================================
+  pub let pdxb_kek_derive : (u64, u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (passphrase_ptr: u64) (passphrase_len: u64) (salt_ptr: u64) (salt_len: u64) (out_kek_ptr: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-volume.M5-001 (#29): pdxb_kek_derive real body. Populate lpv_argon2_scratch: [+0]=password_ptr (rdi), [+8]=password_len (rsi), [+16]=salt_ptr (rdx), [+24]=salt_len (rcx), [+32,+40]=0/0 (no secret), [+48,+56]=0/0 (no AD), [+64]=65536 (m_cost_kib as u32), [+68]=3 (t_cost), [+72]=1 (p_cost), [+76]=0 (_reserved). Marshal args for pdxb_crypto_argon2id_raw(params_ptr=&scratch, out_ptr=out_kek_ptr (r8), out_len=32). Save r8 into r12 across the call since we need out_kek_ptr after the SysV shuffle for the return path -- actually no, we return in rax from the intrinsic directly. call pdxb_crypto_argon2id_raw; cmp rax,0; jne kdf_fail; xor rax,rax; ret. kdf_fail: mov rax,0x0902; ret. Uses lea r11,[rip+lpv_argon2_scratch] for the scratch address. mov_d for u32 stores. No add reg,[mem]; only cmp. Labels prefixed lpv_cr_kd_. push/pop r12 to preserve nothing across the call (r12 is not used post-call; deleted).",
+      block: {
+        // Populate scratch struct.
+        lea r11, [rip + lpv_argon2_scratch];
+        mov [r11 + 0], rdi;              // password_ptr
+        mov [r11 + 8], rsi;              // password_len
+        mov [r11 + 16], rdx;             // salt_ptr
+        mov [r11 + 24], rcx;             // salt_len
+        xor rax, rax;
+        mov [r11 + 32], rax;             // secret_ptr = NULL
+        mov [r11 + 40], rax;             // secret_len = 0
+        mov [r11 + 48], rax;             // ad_ptr = NULL
+        mov [r11 + 56], rax;             // ad_len = 0
+        // u32 config -- use mov_d.
+        mov rax, 65536;
+        mov_d [r11 + 64], rax;           // m_cost_kib
+        mov rax, 3;
+        mov_d [r11 + 68], rax;           // t_cost
+        mov rax, 1;
+        mov_d [r11 + 72], rax;           // p_cost
+        xor rax, rax;
+        mov_d [r11 + 76], rax;           // _reserved
+
+        // Marshal for pdxb_crypto_argon2id_raw(params_ptr, out_ptr, out_len).
+        // r8 currently holds out_kek_ptr. Shuffle: params_ptr -> rdi,
+        // out_ptr -> rsi, out_len -> rdx.
+        mov rdi, r11;                    // params_ptr = &scratch
+        mov rsi, r8;                     // out_ptr = out_kek_ptr
+        mov rdx, 32;                     // out_len = LPV_KEK_LEN
+
+        call pdxb_crypto_argon2id_raw;
+
+        cmp rax, 0;
+        jne lpv_cr_kd_fail;
+
+        xor rax, rax;                    // LPV_CRYPTO_OK
+        ret;
+
+      lpv_cr_kd_fail:
+        mov rax, 0x0902;                 // LPV_CRYPTO_ERR_KDF_FAIL
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_dek_wrap(kek_ptr, dek_ptr, nonce_ptr, out_wrapped_ptr) -> u64
+  //
+  // ChaCha20-Poly1305 seal: takes a 32-byte KEK (as raw ptr, NOT a
+  // kek_slot cap -- see module header rationale), the 32-byte DEK to
+  // wrap, and a 12-byte nonce; writes 48 bytes (32 ct + 16 tag) at
+  // out_wrapped_ptr.
+  //
+  // AeadParamsC layout: key_ptr, nonce_ptr, aad_ptr=NULL, aad_len=0
+  // (no AAD for DEK wrap).
+  //
+  // Signature deviation from the M5-001 issue brief: the brief names
+  // `kek_slot` (a KEK cap slot). Same rationale as pdxb_sign_superblock's
+  // `seed_ptr` (design/architecture.md §8.2) applies here -- KIND_KEK
+  // does not exist kernel-side yet and this library issues zero
+  // cap-invoke calls by established discipline. Signature takes
+  // `kek_ptr` (a raw 32-byte KEK pointer) so the helper is usable
+  // TODAY; a KIND_KEK-aware wrapper is a future landing once both
+  // blockers close.
+  // ==========================================================================
+  pub let pdxb_dek_wrap : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (kek_ptr: u64) (dek_ptr: u64) (nonce_ptr: u64) (out_wrapped_ptr: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-volume.M5-001 (#29): pdxb_dek_wrap real body. Populate lpv_aead_scratch: [+0]=kek_ptr (rdi), [+8]=nonce_ptr (rdx), [+16]=0 (aad_ptr=NULL), [+24]=0 (aad_len=0). Marshal args for pdxb_crypto_seal_raw(params=&scratch, plaintext_ptr=dek_ptr, plaintext_len=32, out_ptr=out_wrapped_ptr, out_cap=48, written_ptr=&lpv_written_scratch). SysV shuffle for the 6-arg call: rdi=params, rsi=plaintext_ptr, rdx=32, rcx=out_ptr, r8=48, r9=written_ptr. Since the caller's rsi=dek_ptr and rdx=nonce_ptr and rcx=out_wrapped_ptr, and we need dek_ptr in rsi (already there) but rdx becomes 32 (currently nonce_ptr, already stored in scratch so safe to overwrite) and rcx becomes out_wrapped_ptr (already there but is the destination), and out_wrapped_ptr is also caller's rcx... shuffle carefully: save out_wrapped_ptr to r10 first, then set rdi=scratch, rdx=32, rcx=out_wrapped_ptr (from r10), r8=48, r9=&written_scratch. call pdxb_crypto_seal_raw. On rax != 0, return LPV_CRYPTO_ERR_AEAD_FAIL (0x0903). Else return LPV_CRYPTO_OK. Labels prefixed lpv_cr_wr_. No add reg,[mem].",
+      block: {
+        // Save out_wrapped_ptr before we clobber rcx.
+        mov r10, rcx;                    // r10 = out_wrapped_ptr
+
+        // Populate AeadParamsC scratch.
+        lea r11, [rip + lpv_aead_scratch];
+        mov [r11 + 0], rdi;              // key_ptr = kek_ptr
+        mov [r11 + 8], rdx;              // nonce_ptr
+        xor rax, rax;
+        mov [r11 + 16], rax;             // aad_ptr = NULL
+        mov [r11 + 24], rax;             // aad_len = 0
+
+        // Marshal for seal_raw(params, plaintext_ptr, plaintext_len,
+        //                       out_ptr, out_cap, written_ptr).
+        mov rdi, r11;                    // params
+        // rsi already holds dek_ptr from the caller's SysV rsi
+        mov rdx, 32;                     // plaintext_len = LPV_DEK_LEN
+        mov rcx, r10;                    // out_ptr = out_wrapped_ptr
+        mov r8, 48;                      // out_cap = LPV_WRAPPED_DEK_LEN
+        lea r9, [rip + lpv_written_scratch];
+
+        call pdxb_crypto_seal_raw;
+
+        cmp rax, 0;
+        jne lpv_cr_wr_fail;
+
+        xor rax, rax;                    // LPV_CRYPTO_OK
+        ret;
+
+      lpv_cr_wr_fail:
+        mov rax, 0x0903;                 // LPV_CRYPTO_ERR_AEAD_FAIL
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_dek_unwrap(kek_ptr, wrapped_ptr, nonce_ptr, out_dek_ptr) -> u64
+  //
+  // Inverse of pdxb_dek_wrap. On tag mismatch (intrinsic -3) returns
+  // LPV_CRYPTO_ERR_TAG_MISMATCH -- caller can distinguish this from a
+  // generic AEAD failure.
+  // ==========================================================================
+  pub let pdxb_dek_unwrap : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (kek_ptr: u64) (wrapped_ptr: u64) (nonce_ptr: u64) (out_dek_ptr: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-volume.M5-001 (#29): pdxb_dek_unwrap real body. Same scratch-populate + SysV shuffle as pdxb_dek_wrap, but calls open_raw. sealed_len = 48 (32 ct + 16 tag); out_cap = 32 (recovered DEK). After the call: cmp rax,0 (OK), cmp rax,-3 (tag mismatch). The intrinsic returns i64 -3 = 0xFFFFFFFFFFFFFFFD. Stage the comparand via MOVABS: mov r10,0xFFFFFFFFFFFFFFFD; cmp rax,r10; je tag_mismatch. Else if rax != 0, generic AEAD fail. Labels prefixed lpv_cr_uw_.",
+      block: {
+        mov r10, rcx;                    // r10 = out_dek_ptr
+
+        lea r11, [rip + lpv_aead_scratch];
+        mov [r11 + 0], rdi;              // key_ptr = kek_ptr
+        mov [r11 + 8], rdx;              // nonce_ptr
+        xor rax, rax;
+        mov [r11 + 16], rax;             // aad_ptr = NULL
+        mov [r11 + 24], rax;             // aad_len = 0
+
+        mov rdi, r11;                    // params
+        // rsi already holds wrapped_ptr from the caller
+        mov rdx, 48;                     // sealed_len = LPV_WRAPPED_DEK_LEN
+        mov rcx, r10;                    // out_ptr = out_dek_ptr
+        mov r8, 32;                      // out_cap = LPV_DEK_LEN
+        lea r9, [rip + lpv_written_scratch];
+
+        call pdxb_crypto_open_raw;
+
+        cmp rax, 0;
+        je  lpv_cr_uw_ok;
+
+        // Tag-mismatch check (i64 -3 = 0xFFFFFFFFFFFFFFFD).
+        mov r10, 0xFFFFFFFFFFFFFFFD;
+        cmp rax, r10;
+        je  lpv_cr_uw_tag;
+
+        mov rax, 0x0903;                 // LPV_CRYPTO_ERR_AEAD_FAIL
+        ret;
+
+      lpv_cr_uw_tag:
+        mov rax, 0x0904;                 // LPV_CRYPTO_ERR_TAG_MISMATCH
+        ret;
+
+      lpv_cr_uw_ok:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_block_encrypt(dek_ptr, block_ptr, nonce_ptr, out_tag_ptr) -> u64
+  //
+  // Encrypts one 4096-byte block IN PLACE (block_ptr is both input
+  // and output) and writes the 16-byte tag to out_tag_ptr. Under the
+  // paired-block scheme (see src/pdxb_superblock.pdx PDXB_D_OFF_
+  // WRAPPED_DEK section), nonce_ptr and out_tag_ptr are 12-byte and
+  // 16-byte cursors into the per-16-block metadata block the caller
+  // maintains.
+  //
+  // Uses lpv_aead_scratch just like pdxb_dek_wrap. In-place encrypt
+  // requires an auxiliary scratch buffer since the AEAD writes
+  // ciphertext + tag to a distinct out_ptr; we chunk-copy the
+  // ciphertext back after the call using an inline loop (512 qwords
+  // for 4096 bytes). This is a v1.1.0 scaffold: the block-cipher path
+  // is scoped for actual on-disk use only once the paired-block
+  // metadata layout lands in mkfs.pdxfs / mount.pdxfs. STUB body at
+  // this landing (returns LPV_CRYPTO_ERR_NOT_IMPL) so callers know
+  // the in-place semantics + metadata-block layout still need agreement
+  // before the real body ships.
+  // ==========================================================================
+  pub let pdxb_block_encrypt : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (dek_ptr: u64) (block_ptr: u64) (nonce_ptr: u64) (out_tag_ptr: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-volume.M5-001 (#29): pdxb_block_encrypt STUB at v1.1.0. In-place encrypt requires a per-block scratch buffer (the AEAD writes ciphertext+tag to a distinct out_ptr) and the paired-block metadata layout is still pending mkfs.pdxfs/mount.pdxfs agreement. Signature is final; body returns LPV_CRYPTO_ERR_NOT_IMPL (0x0901) fail-closed so no caller can accidentally write plaintext to disk thinking it's encrypted.",
+      block: {
+        mov rax, 0x0901;
+        ret;
+      }
+    }
+
+  pub let pdxb_block_decrypt : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
+    fn (dek_ptr: u64) (block_ptr: u64) (nonce_ptr: u64) (tag_ptr: u64) -> unsafe {
+      effects: {crypto, mem}, capabilities: {paideia.crypto},
+      justification: "libpdx-volume.M5-001 (#29): pdxb_block_decrypt STUB, symmetric with pdxb_block_encrypt. Same paired-block layout gap; returns LPV_CRYPTO_ERR_NOT_IMPL.",
+      block: {
+        mov rax, 0x0901;
+        ret;
+      }
+    }
+}

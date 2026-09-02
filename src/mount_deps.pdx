@@ -1,0 +1,208 @@
+// src/mount_deps.pdx — libpdx-volume.M6-001 (#31)
+// MountDeps: mount-dependency wire format + client-side codec + a
+// topological-sort helper (`mount_table_sort_by_deps`) implementing
+// Kahn's algorithm over a pending-mounts array with parsed dep lists.
+//
+// -----------------------------------------------------------------------------
+// Wire format (per-volume, in superblock _reserved region)
+// -----------------------------------------------------------------------------
+//
+// Two new u64 slots in the superblock's on-disk `_reserved`:
+//
+//   [+268]  mount_deps_lba:    u64   0 = no deps on this volume
+//   [+276]  mount_deps_bcount: u64   size in 4KiB blocks
+//
+// These live BELOW the M5-002 wrapped-DEK/salt/nonce region ([+192,
+// +268)) so both extensions coexist without overlap. The signed range
+// remains [0, 696), so both regions are covered by the ML-DSA-65
+// signature.
+//
+// Dep-list block layout (up to 32 deps per 4KiB block, 128 bytes/dep):
+//
+//   [+0]   magic:                u32 = 0x50444450  ('PDDP')
+//   [+4]   version:              u16 = 1
+//   [+6]   dep_count:            u16 = N (< 32)
+//   [+8]   dep[i].dep_kind:      u8    0=mount-before,
+//                                       1=mount-after,
+//                                       2=mount-requires (fail if missing)
+//   [+9]   dep[i].reserved:      [u8; 7]
+//   [+16]  dep[i].mount_point:   [u8; 112]  UTF-8 mount path
+//
+// Note: `dep[0]` starts at offset +16 in this diagram (not +8) because
+// the +8..+16 region is dep[0]'s header (dep_kind + reserved); the
+// UTF-8 path is the tail of dep[0]. dep[1] starts at +16 + 112 = +128
+// from the block base, and so on.
+//
+// -----------------------------------------------------------------------------
+// Topological sort -- Kahn's algorithm
+// -----------------------------------------------------------------------------
+//
+// Kahn's algorithm walks the DAG by repeatedly emitting a node with
+// no unresolved dependencies, then removing outgoing edges from that
+// node. If any node remains after all resolvable nodes are emitted,
+// the graph has a cycle.
+//
+// Implementation shape (concrete for this library):
+//   in_degree[i] = number of "mount-after" deps for entry i
+//   ready_queue = FIFO of indices with in_degree[i] == 0
+//   while ready_queue not empty:
+//     emit ready_queue.pop()
+//     for each edge (emitted -> other):
+//       in_degree[other] -= 1
+//       if in_degree[other] == 0: ready_queue.push(other)
+//   if emitted_count != entry_count: LPV_ORDER_ERR_CYCLE
+//
+// STUB body at this landing: the FULL sort with in-degree counters +
+// FIFO ring + edge matrix walking is a substantial chunk of code (100+
+// instructions) and depends on decisions about the caller's dep-list
+// storage format (parsed vs on-disk) that aren't nailed down until
+// mountall.pdxfs (the future proposed consumer) actually starts
+// building against it. The parser gets a real body; the sort helper
+// gets a fail-closed stub returning LPV_ORDER_OK (0) for entry_count
+// == 0 and LPV_ORDER_ERR_CYCLE for anything else -- so a caller
+// walking a nonempty pending-mounts list sees a clear "sort refused,
+// use insertion order" signal rather than silently accepting an
+// unordered walk.
+//
+// Follow-up filed against this repo for the full sort body once
+// mountall.pdxfs's exact input shape is agreed.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder notes
+// -----------------------------------------------------------------------------
+//
+//   - PDDP magic (0x50444450) fits imm32 sign-extend bound.
+//   - Same u16-in-u32-word decode idiom as vol_snapshot.pdx.
+//   - Label prefixes: `lpv_mdp_` (parse), `lpv_mdt_` (topo sort).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#31);
+// design/architecture.md §<new-section-mount-deps> (this repo).
+
+module MountDeps = structure {
+
+  // On-disk dep-block magic ('PDDP'). Fits imm32 bound.
+  pub let PDDP_MAGIC : u64 = 0x50444450
+
+  // Superblock offsets for the dep-list anchor (M6-001 additions to
+  // the _reserved region below M5-002's wrapped-DEK/salt/nonce).
+  pub let PDXB_D_OFF_MOUNT_DEPS_LBA    : u64 = 268
+  pub let PDXB_D_OFF_MOUNT_DEPS_BCOUNT : u64 = 276
+
+  // Dep-list block size + per-entry size.
+  pub let MOUNT_DEPS_BLOCK_BYTES : u64 = 4096
+  pub let MOUNT_DEPS_ENTRY_BYTES : u64 = 128
+  pub let MOUNT_DEPS_MAX_PER_BLOCK : u64 = 32
+
+  // Dep-kind ordinals.
+  pub let MDEP_KIND_MOUNT_BEFORE   : u64 = 0
+  pub let MDEP_KIND_MOUNT_AFTER    : u64 = 1
+  pub let MDEP_KIND_MOUNT_REQUIRES : u64 = 2
+
+  // Status codes (band 0x0A00).
+  pub let LPV_ORDER_OK              : u64 = 0
+  pub let LPV_ORDER_ERR_CYCLE       : u64 = 0x0A01
+  pub let LPV_ORDER_ERR_BAD_MAGIC   : u64 = 0x0A02
+  pub let LPV_ORDER_ERR_CAP_TOO_SMALL : u64 = 0x0A03
+  pub let LPV_ORDER_ERR_NOT_IMPL    : u64 = 0x0A04
+
+  // Summary sizes.
+  pub let MDEP_SUMMARY_BYTES : u64 = 128   // one per-dep entry summary
+
+  // ==========================================================================
+  // mount_deps_parse(block_ptr, out_ptr, out_cap, out_count_ptr) -> u64
+  //
+  // Decodes a dep-list block: gates on magic + version, reads dep_count,
+  // copies min(dep_count, out_cap) entries verbatim (each entry is
+  // already 128 bytes aligned so a plain block copy is byte-perfect
+  // for the summary layout). Writes actual count to *out_count_ptr.
+  // ==========================================================================
+  pub let mount_deps_parse : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (block_ptr: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M6-001 (#31): mount_deps_parse real body. Gate 1: mov_d rax,[rdi+0]; cmp rax,0x50444450 (PDDP_MAGIC); jne bad_magic. Gate 2: mov_d rax,[rdi+4]; mov r10,rax; and r10,0xFFFF; cmp r10,1; jne bad_magic (single error, matches vol_snapshot's own single-error-for-magic-and-version pattern). Read dep_count = (u32-at-+4 >> 16). walk_count = min(dep_count, out_cap). Store *out_count_ptr = walk_count. Loop i=0..walk_count: copy MOUNT_DEPS_ENTRY_BYTES=128 bytes from block_ptr+16+i*128 to out_ptr+i*128 (128 bytes = 16 qwords; use nested copy loop). At this landing the copy is a bounded qword loop rather than fully unrolled since 128 * 32 max = 4096 bytes worst case is a lot of code to unroll. Labels prefixed lpv_mdp_. r8..r14 caller-save; leaf.",
+      block: {
+        // Gate 1: magic.
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x50444450;
+        jne lpv_mdp_bad_magic;
+
+        // Gate 2: version.
+        mov_d rax, [rdi + 4];
+        mov r10, rax;
+        and r10, 0xFFFF;
+        cmp r10, 1;
+        jne lpv_mdp_bad_magic;
+
+        // dep_count = (rax >> 16), where rax already holds the u32 at +4.
+        shr rax, 16;
+        // rax = dep_count
+
+        // walk_count = min(dep_count, out_cap).
+        cmp rax, rdx;
+        jbe lpv_mdp_have_count;
+        mov rax, rdx;
+      lpv_mdp_have_count:
+        // rax = walk_count. Store to *out_count_ptr.
+        mov [rcx + 0], rax;
+
+        // Copy walk_count * 128 bytes from block_ptr+16 to out_ptr.
+        // Total qwords = walk_count * 16.
+        mov r8, rax;                     // r8 = walk_count
+        shl r8, 4;                       // r8 = walk_count * 16 (qwords)
+        xor r9, r9;                      // qword index
+
+        // src_base = block_ptr + 16
+        mov r10, rdi;
+        add r10, 16;
+
+      lpv_mdp_copy:
+        cmp r9, r8;
+        jae lpv_mdp_done;
+        mov r11, [r10 + r9 * 8];
+        mov [rsi + r9 * 8], r11;
+        add r9, 1;
+        jmp lpv_mdp_copy;
+
+      lpv_mdp_done:
+        xor rax, rax;                    // LPV_ORDER_OK
+        ret;
+
+      lpv_mdp_bad_magic:
+        mov rax, 0x0A02;                 // LPV_ORDER_ERR_BAD_MAGIC
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_table_sort_by_deps(entries_ptr, entry_count, deps_ptr,
+  //                          deps_count, out_ordered_ptr) -> u64
+  //
+  // Topological sort of `entries_ptr[0..entry_count)` by dependency
+  // edges from `deps_ptr[0..deps_count)`. Writes the ordered indices
+  // (u64 each, entry_count of them) to `out_ordered_ptr`.
+  //
+  // STUB at this landing (see module header rationale). Special-cases
+  // entry_count == 0 as LPV_ORDER_OK (trivial identity sort of an
+  // empty list). Every other input returns LPV_ORDER_ERR_NOT_IMPL --
+  // the sentinel is DIFFERENT from LPV_ORDER_ERR_CYCLE so a caller
+  // can distinguish "algorithm not yet landed" from "your graph has
+  // a cycle". Follow-up filed for the full Kahn's-algorithm body
+  // once mountall.pdxfs's input shape is agreed.
+  // ==========================================================================
+  pub let mount_table_sort_by_deps : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (entries_ptr: u64) (entry_count: u64) (deps_ptr: u64) (deps_count: u64) (out_ordered_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M6-001 (#31): mount_table_sort_by_deps STUB. entry_count == 0: identity sort of empty list, return LPV_ORDER_OK. Else: LPV_ORDER_ERR_NOT_IMPL (0x0A04) -- distinct from LPV_ORDER_ERR_CYCLE (0x0A01) so a caller can tell 'algorithm pending' from 'real cycle detected'. Real body will implement Kahn's algorithm: in_degree[i] from mount-after deps, ready-FIFO seeded with in_degree==0 nodes, emit-and-decrement loop; on premature termination (emitted < entry_count) return LPV_ORDER_ERR_CYCLE. Labels prefixed lpv_mdt_.",
+      block: {
+        cmp rsi, 0;
+        jne lpv_mdt_notimpl;
+
+        xor rax, rax;                    // LPV_ORDER_OK (empty list)
+        ret;
+
+      lpv_mdt_notimpl:
+        mov rax, 0x0A04;                 // LPV_ORDER_ERR_NOT_IMPL
+        ret;
+      }
+    }
+}

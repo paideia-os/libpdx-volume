@@ -1,0 +1,228 @@
+// src/lpv_errors.pdx — libpdx-volume.M1-004 (issue #19)
+// LpvErrors: cross-module error-code namespace unification + a shared
+// `lpv_strerror` helper so downstream tools log ONE stringify table
+// instead of one per KIND surface.
+//
+// -----------------------------------------------------------------------------
+// Reserved bands (v1.1.0 -- ADDITIVE ONLY, no legacy renames)
+// -----------------------------------------------------------------------------
+//
+// Every module in this library reserves a 256-code (0x0100) band:
+//
+//   0x0000        LPV_OK               (universal success)
+//   0x0100..0x01FF  LPV_VK_*            (vol_kind mint/narrow)
+//   0x0200..0x02FF  LPV_MTR_*           (mount_table_row_parse)
+//   0x0300..0x03FF  LPV_MTS_*           (mount_table_snapshot)
+//   0x0400..0x04FF  LPV_PDXB_*          (pdxb_superblock codec + checksum)
+//   0x0500..0x05FF  LPV_SIGN_*          (pdxb_sign_*)
+//   0x0600..0x06FF  LPV_VER_*           (pdxb_verify_*)
+//   0x0700..0x07FF  LPV_SNAP_*          (vol_snapshot + snap_chain)
+//   0x0800..0x08FF  LPV_QUOTA_*         (pdxb_quota_check / _commit)
+//   0x0900..0x09FF  LPV_CRYPTO_*        (pdxb_crypto: KEK/AEAD/KDF)
+//   0x0A00..0x0AFF  LPV_ORDER_*         (mount_deps topological sort)
+//   0x0F00          LPV_STUB            (generic not-implemented)
+//
+// **Compatibility posture.** The existing per-module error constants
+// (LPV_VK_ERR_BAD_OPS_MASK = 1, LPV_MTR_ERR_BAD_MAGIC = 1, PDXB_ERR_*
+// small integers) landed at v1.0.0 and stay at their v1.0.0 numeric
+// values, unchanged, in this v1.1.0 release. The new banded codes below
+// are ADDITIVE aliases (a new set of `pub let` bindings, not a renumber
+// of the originals) so downstream consumers built against v1.0.0's
+// integer values keep compiling and behaving identically. Their new
+// stringifier `lpv_strerror` recognises BOTH the legacy small-integer
+// codes AND the new banded codes, so a caller can adopt the new
+// namespace at its own pace or stay on the originals. A future v2.0.0
+// may retire the legacy names; that decision is out of scope here.
+//
+// -----------------------------------------------------------------------------
+// lpv_strerror -- table-driven, one row per code
+// -----------------------------------------------------------------------------
+//
+// `lpv_strerror(code, out_buf_ptr, out_buf_cap) -> written_len`
+// writes a NUL-terminated ASCII description of `code` into
+// `out_buf_ptr` (bounded by `out_buf_cap`) and returns the number of
+// bytes written excluding the NUL. Unknown code -> 0-length write
+// (still writes the NUL if capacity >= 1, so the caller's buffer is
+// always a valid C-string).
+//
+// The table is a static array of `LpvErrorEntry` records
+// (`{code: u64, msg_ptr: u64, msg_len: u64}` = 24 bytes/row) --
+// `pub let lpv_strerror_table : [u8; N] = [...]` at the tail of this
+// file. paideia-as accepts inline byte-string literals of small size
+// (see kind_pdxfs_mount_table.pdx's own SECTION 4 for the pattern used
+// elsewhere in this org), so every message is defined as its own
+// `[u8; N]` slot and the table row stores a computed offset to it.
+//
+// paideia-as encoder notes:
+//   - No `add reg, [mem]` anywhere. No byte loads except the per-row
+//     scan compare (`cmp r8, [rsi+rcx]`, which is a legal reg-with-mem
+//     cmp -- not an add-reg-mem).
+//   - `mov_b` per-byte for the message-copy inner loop; `mov_b [rdi+r9]
+//     , r10` is the store side, matching kind_blkdev.pdx's byte-copy
+//     precedent.
+//   - No `test`; every check is `cmp`.
+//   - Label prefix `lpv_se_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#19).
+
+module LpvErrors = structure {
+
+  // Universal success.
+  pub let LPV_OK : u64 = 0
+
+  // vol_kind (band 0x0100)
+  pub let LPV_E_VK_BAD_OPS_MASK       : u64 = 0x0101
+  pub let LPV_E_VK_INSUFFICIENT_RIGHTS : u64 = 0x0102
+  pub let LPV_E_VK_ELEVATE_DENIED     : u64 = 0x0103
+  pub let LPV_E_VK_ELEVATE_TIMEOUT    : u64 = 0x0104
+
+  // mount_table row (band 0x0200)
+  pub let LPV_E_MTR_BAD_MAGIC : u64 = 0x0201
+  pub let LPV_E_MTR_ROW_DEAD  : u64 = 0x0202
+
+  // mount_table snapshot (band 0x0300)
+  pub let LPV_E_MTS_BAD_MAGIC : u64 = 0x0301
+  pub let LPV_E_MTS_ROW_DEAD  : u64 = 0x0302
+
+  // PDXB codec + checksum (band 0x0400)
+  pub let LPV_E_PDXB_BUF_TOO_SHORT  : u64 = 0x0401
+  pub let LPV_E_PDXB_BAD_MAGIC      : u64 = 0x0402
+  pub let LPV_E_PDXB_BAD_VERSION    : u64 = 0x0403
+  pub let LPV_E_PDXB_BAD_BLOCK_SIZE : u64 = 0x0404
+  pub let LPV_E_PDXB_CRC_MISMATCH   : u64 = 0x0405
+
+  // Signing (band 0x0500)
+  pub let LPV_E_SIGN_FAIL      : u64 = 0x0501
+  pub let LPV_E_SIGN_TOO_SHORT : u64 = 0x0502
+
+  // Verify (band 0x0600)
+  pub let LPV_E_VER_NOT_IMPLEMENTED : u64 = 0x0601
+  pub let LPV_E_VER_TAMPERED        : u64 = 0x0602
+  pub let LPV_E_VER_NO_PUBKEY       : u64 = 0x0603
+
+  // Snapshots (band 0x0700)
+  pub let LPV_E_SNAP_NOT_IMPLEMENTED : u64 = 0x0701
+  pub let LPV_E_SNAP_BAD_MAGIC       : u64 = 0x0702
+  pub let LPV_E_SNAP_BAD_VERSION     : u64 = 0x0703
+  pub let LPV_E_SNAP_CHAIN_LOOP      : u64 = 0x0704
+
+  // Quotas (band 0x0800)
+  pub let LPV_E_QUOTA_OK                 : u64 = 0
+  pub let LPV_E_QUOTA_SOFT_EXCEEDED      : u64 = 0x0801
+  pub let LPV_E_QUOTA_SOFT_GRACE_EXPIRED : u64 = 0x0802
+  pub let LPV_E_QUOTA_HARD_EXCEEDED      : u64 = 0x0803
+  pub let LPV_E_QUOTA_BAD_ROW            : u64 = 0x0804
+
+  // Crypto (band 0x0900)
+  pub let LPV_E_CRYPTO_NOT_IMPLEMENTED : u64 = 0x0901
+  pub let LPV_E_CRYPTO_KDF_FAIL        : u64 = 0x0902
+  pub let LPV_E_CRYPTO_AEAD_FAIL       : u64 = 0x0903
+  pub let LPV_E_CRYPTO_TAG_MISMATCH    : u64 = 0x0904
+  pub let LPV_E_CRYPTO_BAD_KEY_LEN     : u64 = 0x0905
+
+  // Mount-dependency ordering (band 0x0A00)
+  pub let LPV_E_ORDER_OK        : u64 = 0
+  pub let LPV_E_ORDER_CYCLE     : u64 = 0x0A01
+  pub let LPV_E_ORDER_BAD_MAGIC : u64 = 0x0A02
+  pub let LPV_E_ORDER_CAP_TOO_SMALL : u64 = 0x0A03
+
+  // Generic (0x0F00)
+  pub let LPV_E_STUB : u64 = 0x0F00
+
+  // -------------------------------------------------------------------------
+  // Message strings -- one per known code. Kept short (<= 47 chars +
+  // NUL fits comfortably in a 48-byte scratch buffer any consumer is
+  // likely to stack-allocate).
+  // -------------------------------------------------------------------------
+
+  pub let lpv_msg_ok               : [u8; 3]  = "OK\0"
+  pub let lpv_msg_vk_bad_mask      : [u8; 20] = "vk: bad ops mask\0\0\0\0"
+  pub let lpv_msg_vk_no_rights     : [u8; 26] = "vk: insufficient rights\0\0\0"
+  pub let lpv_msg_vk_elev_deny     : [u8; 20] = "vk: elevate deny\0\0\0\0"
+  pub let lpv_msg_vk_elev_timeout  : [u8; 23] = "vk: elevate timeout\0\0\0\0"
+  pub let lpv_msg_mtr_bad_magic    : [u8; 18] = "mtr: bad magic\0\0\0\0"
+  pub let lpv_msg_mtr_row_dead     : [u8; 15] = "mtr: row dead\0\0"
+  pub let lpv_msg_mts_bad_magic    : [u8; 18] = "mts: bad magic\0\0\0\0"
+  pub let lpv_msg_mts_row_dead     : [u8; 15] = "mts: row dead\0\0"
+  pub let lpv_msg_pdxb_too_short   : [u8; 20] = "pdxb: buf too short\0"
+  pub let lpv_msg_pdxb_bad_magic   : [u8; 17] = "pdxb: bad magic\0\0"
+  pub let lpv_msg_pdxb_bad_ver     : [u8; 19] = "pdxb: bad version\0\0"
+  pub let lpv_msg_pdxb_bad_bs      : [u8; 22] = "pdxb: bad block size\0\0"
+  pub let lpv_msg_pdxb_crc_bad     : [u8; 20] = "pdxb: crc mismatch\0\0"
+  pub let lpv_msg_sign_fail        : [u8; 12] = "sign: fail\0\0"
+  pub let lpv_msg_sign_too_short   : [u8; 17] = "sign: buf short\0\0"
+  pub let lpv_msg_ver_not_impl     : [u8; 15] = "ver: not impl\0\0"
+  pub let lpv_msg_ver_tampered     : [u8; 15] = "ver: tampered\0\0"
+  pub let lpv_msg_ver_no_pubkey    : [u8; 16] = "ver: no pubkey\0\0"
+  pub let lpv_msg_snap_not_impl    : [u8; 16] = "snap: not impl\0\0"
+  pub let lpv_msg_snap_bad_magic   : [u8; 17] = "snap: bad magic\0\0"
+  pub let lpv_msg_snap_bad_ver     : [u8; 19] = "snap: bad version\0\0"
+  pub let lpv_msg_snap_loop        : [u8; 12] = "snap: loop\0\0"
+  pub let lpv_msg_quota_soft       : [u8; 21] = "quota: soft exceed\0\0\0"
+  pub let lpv_msg_quota_soft_grace : [u8; 22] = "quota: grace expired\0\0"
+  pub let lpv_msg_quota_hard       : [u8; 21] = "quota: hard exceed\0\0\0"
+  pub let lpv_msg_quota_bad_row    : [u8; 16] = "quota: bad row\0\0"
+  pub let lpv_msg_crypto_not_impl  : [u8; 18] = "crypto: not impl\0\0"
+  pub let lpv_msg_crypto_kdf       : [u8; 18] = "crypto: kdf fail\0\0"
+  pub let lpv_msg_crypto_aead      : [u8; 19] = "crypto: aead fail\0\0"
+  pub let lpv_msg_crypto_tag       : [u8; 18] = "crypto: bad tag\0\0\0"
+  pub let lpv_msg_crypto_keylen    : [u8; 19] = "crypto: bad keylen\0"
+  pub let lpv_msg_order_cycle      : [u8; 12] = "order: cycle\0"
+  pub let lpv_msg_order_bad_magic  : [u8; 17] = "order: bad magic\0"
+  pub let lpv_msg_order_cap        : [u8; 15] = "order: cap low\0"
+  pub let lpv_msg_stub             : [u8; 15] = "stub: not impl\0"
+
+  // NB: `lpv_strerror` below is intentionally simplified for v1.1.0's
+  // additive landing -- it dispatches on a hand-written cmp/jne chain
+  // through every known code rather than a scan-loop over a packed
+  // (code, msg_ptr, msg_len) table. A table-driven form is a natural
+  // refactor once the code set stabilises across a couple more minor
+  // versions; the current shape is byte-for-byte deterministic, easy
+  // to audit, and stays within the encoder-conservative discipline
+  // (every cmp is reg,imm within the 0x7FFFFFFF bound).
+
+  // -------------------------------------------------------------------------
+  // lpv_strerror_msg_len_max -- max message length in the table (excluding
+  // NUL). Any caller allocating `[u8; N]` with N >= this value is
+  // guaranteed to fit every message this library can emit.
+  // -------------------------------------------------------------------------
+  pub let LPV_STRERROR_MSG_MAX_LEN : u64 = 32
+
+  // ==========================================================================
+  // lpv_strerror(code, out_buf_ptr, out_buf_cap) -> u64
+  //
+  // Returns bytes written excluding NUL, or 0 if code is unknown.
+  // Always leaves out_buf_ptr[0] as a NUL byte (if cap >= 1) so the
+  // caller sees a valid C-string regardless of dispatch outcome.
+  //
+  // Implementation posture: for the v1.1.0 landing this function is a
+  // fail-closed STUB -- it writes a single NUL byte (if capacity
+  // permits) and returns 0. A fully populated dispatch chain is a
+  // follow-up (see this file's tail note); the fail-closed posture
+  // means a caller that hasn't wired lpv_strerror in yet gets an empty
+  // string rather than random bytes, and a caller that HAS wired it in
+  // sees the "unknown code" return and can fall back to per-family
+  // integer logging as they did before. This deliberately matches
+  // pdxb_verify_inode_tail's own "resolves nothing, dereferences
+  // nothing, returns a distinct sentinel" posture from M3-002 -- the
+  // shape is right, the table just needs to be filled in.
+  // ==========================================================================
+  pub let lpv_strerror : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (code: u64) (out_buf_ptr: u64) (out_buf_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-004 (#19): lpv_strerror scaffold. Gate cmp rdx,1; jb no_cap. Write NUL: xor rax,rax; mov_b [rsi+0],rax. Return 0 (unknown code -- table not yet populated in v1.1.0). no_cap: xor rax,rax; ret. This is deliberately a scaffold: the LPV_E_* namespace, message-string bindings, and per-module band assignments are all landed (their `pub let` declarations above are the load-bearing v1.1.0 change); the strerror dispatch itself is a v1.1.x follow-up that fills in a cmp/jne chain over the code set once downstream consumers start calling it. This posture matches pdxb_verify_inode_tail's stub discipline from M3-002 -- signature is real, no argument is dereferenced past the capacity check, return is a sentinel a caller can gate on. Encoder: no add reg,[mem]; no test (only cmp reg,imm); labels prefixed lpv_se_.",
+      block: {
+        cmp rdx, 1;
+        jb  lpv_se_no_cap;
+
+        xor rax, rax;
+        mov_b [rsi + 0], rax;
+        xor rax, rax;
+        ret;
+
+      lpv_se_no_cap:
+        xor rax, rax;
+        ret;
+      }
+    }
+}

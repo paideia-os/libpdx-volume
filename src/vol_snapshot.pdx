@@ -1,0 +1,312 @@
+// src/vol_snapshot.pdx — libpdx-volume.M3-001 (#25) + M3-002 (#26)
+// VolSnapshot: KIND_VOLUME_SNAPSHOT client-side scaffolding + a walker
+// over the on-disk snap-chain metadata records anchored at the
+// superblock's `snap_head` field.
+//
+// -----------------------------------------------------------------------------
+// KIND_VOLUME_SNAPSHOT -- kernel side does not exist yet
+// -----------------------------------------------------------------------------
+//
+// The kernel-side capability kind + cap-invoke handler + row layout are
+// out of scope for this repo (they belong under paideia-os proper, and
+// require a coordinated landing that mints the cap kind, adds the mint/
+// narrow/snap-create syscall entry points, and wires them into the
+// cap-invoke dispatcher). A paideia-os monorepo follow-up issue tracks
+// that work.
+//
+// What THIS library owns is the client-side helper shape downstream
+// consumers (mount.pdxfs --snapshot=<snap-cap>, a future fsck-restore-
+// from-snapshot, a future snap-list CLI) will call. The three mint/
+// narrow/create helpers below are STUBS returning LPV_STUB_NOT_IMPLEMENTED
+// until the kernel side lands; their signatures are the final shape so
+// consumers can code against them today and get a distinct
+// fail-closed sentinel back rather than a false-positive cap slot.
+//
+// `vol_snapshot_narrow` gets a real body (matching vol_kind_narrow's
+// M2-004 discipline: validate the requested ops mask, passthrough the
+// cap slot on a valid mask -- no kernel-side derivation primitive
+// exists yet but the validation gate is a genuine correctness check the
+// caller benefits from today).
+//
+// -----------------------------------------------------------------------------
+// Snapshot metadata wire format (96 bytes / 12 u64 slots on disk)
+// -----------------------------------------------------------------------------
+//
+// See the M3-002 issue brief:
+//
+//   [+0]   magic:              u32   = 0x50445853  ('PDXS')
+//   [+4]   version:            u16   = 1
+//   [+6]   record_flags:       u16
+//   [+8]   snap_id:            u64
+//   [+16]  parent_snap_id:     u64
+//   [+24]  next_record_lba:    u64
+//   [+32]  wal_frontier_lsn:   u64
+//   [+40]  created_at_ns:      u64
+//   [+48]  invoker_user_lo:    u64
+//   [+56]  invoker_user_hi:    u64
+//   [+64]  retention_policy:   u8
+//   [+65]  _reserved:          [u8; 31]
+//
+// The decoded summary here (SnapRecord) is 11 u64-aligned slots = 88 B,
+// dropping the _reserved tail and splitting the header0 word
+// (magic|version|record_flags) into three separate slots.
+//
+// paideia-as encoder notes: same discipline as pdxb_superblock's parser
+// (mov_d for u32 loads, mov_b for u8 loads with zero-extend, no
+// add reg,[mem], no test, no byte STORE via mov_b beyond field decode).
+// Snap-magic 0x50445853 is inside the imm32 sign-extend bound
+// (0x50445853 < 0x7FFFFFFF), so a direct `cmp reg, 0x50445853` is legal
+// without r11 staging.
+
+module VolSnapshot = structure {
+
+  // KIND_VOLUME_SNAPSHOT = 0x1A1 (neighbor of KIND_VOLUME=0x1A0). This
+  // is the FINAL ordinal main should stamp into kind_volume_snapshot.pdx
+  // (paideia-os follow-up) so this library's own constant survives.
+  pub let KIND_VOLUME_SNAPSHOT : u64 = 0x1A1
+
+  // Right bits (mirrored across the follow-up kernel file). Placed in
+  // the 0x001..0x400 band matching KIND_VOLUME's own convention.
+  pub let R_VSNAP_READ    : u64 = 0x001
+  pub let R_VSNAP_INVOKE  : u64 = 0x008
+  pub let R_VSNAP_REVOKE  : u64 = 0x010
+  pub let R_VSNAP_OBSERVE : u64 = 0x400
+  pub let R_VSNAP_ALL     : u64 = 0x419
+
+  // Op catalog (mirrors the kernel-side ordinals). Bits 0..3 legal.
+  pub let VSNAP_OP_QUERY_SNAP_ID    : u64 = 0
+  pub let VSNAP_OP_QUERY_PARENT_ID  : u64 = 1
+  pub let VSNAP_OP_QUERY_WAL_LSN    : u64 = 2
+  pub let VSNAP_OP_DEBUG_PRINT      : u64 = 3
+  pub let VSNAP_OPS_VALID_MASK      : u64 = 0x00F
+
+  // Status codes (band 0x0700 -- see src/lpv_errors.pdx).
+  pub let LPV_SNAP_OK                : u64 = 0
+  pub let LPV_SNAP_ERR_NOT_IMPLEMENTED : u64 = 0x0701
+  pub let LPV_SNAP_ERR_BAD_MAGIC      : u64 = 0x0702
+  pub let LPV_SNAP_ERR_BAD_VERSION    : u64 = 0x0703
+  pub let LPV_SNAP_ERR_CHAIN_LOOP     : u64 = 0x0704
+  pub let LPV_SNAP_ERR_BAD_OPS_MASK   : u64 = 0x0705
+
+  // On-disk snap magic ('PDXS'). Fits imm32 sign-extend bound directly.
+  pub let SNAP_MAGIC : u64 = 0x50445853
+
+  // On-disk record size + summary size.
+  pub let SNAP_RECORD_BYTES : u64 = 96
+  pub let SNAP_SUMMARY_BYTES : u64 = 88   // 11 u64 slots
+
+  // On-disk field offsets (raw bytes).
+  pub let SNAP_D_OFF_MAGIC             : u64 = 0
+  pub let SNAP_D_OFF_VERSION           : u64 = 4
+  pub let SNAP_D_OFF_RECORD_FLAGS      : u64 = 6
+  pub let SNAP_D_OFF_SNAP_ID           : u64 = 8
+  pub let SNAP_D_OFF_PARENT_SNAP_ID    : u64 = 16
+  pub let SNAP_D_OFF_NEXT_RECORD_LBA   : u64 = 24
+  pub let SNAP_D_OFF_WAL_FRONTIER_LSN  : u64 = 32
+  pub let SNAP_D_OFF_CREATED_AT_NS     : u64 = 40
+  pub let SNAP_D_OFF_INVOKER_USER_LO   : u64 = 48
+  pub let SNAP_D_OFF_INVOKER_USER_HI   : u64 = 56
+  pub let SNAP_D_OFF_RETENTION_POLICY  : u64 = 64
+
+  // Summary offsets (11 u64 slots, 88 bytes).
+  pub let SNAP_OFF_MAGIC             : u64 = 0
+  pub let SNAP_OFF_VERSION           : u64 = 8
+  pub let SNAP_OFF_RECORD_FLAGS      : u64 = 16
+  pub let SNAP_OFF_SNAP_ID           : u64 = 24
+  pub let SNAP_OFF_PARENT_SNAP_ID    : u64 = 32
+  pub let SNAP_OFF_NEXT_RECORD_LBA   : u64 = 40
+  pub let SNAP_OFF_WAL_FRONTIER_LSN  : u64 = 48
+  pub let SNAP_OFF_CREATED_AT_NS     : u64 = 56
+  pub let SNAP_OFF_INVOKER_USER_LO   : u64 = 64
+  pub let SNAP_OFF_INVOKER_USER_HI   : u64 = 72
+  pub let SNAP_OFF_RETENTION_POLICY  : u64 = 80
+
+  // ==========================================================================
+  // vol_snapshot_mint(volume_cap, out_snap_cap_slot) -> u64
+  //
+  // STUB. Blocked on the kernel-side KIND_VOLUME_SNAPSHOT + mint op
+  // landing (paideia-os monorepo follow-up). Dereferences nothing;
+  // returns LPV_SNAP_ERR_NOT_IMPLEMENTED (0x0701).
+  // ==========================================================================
+  pub let vol_snapshot_mint : (u64, u64) -> u64 !{} @{} =
+    fn (volume_cap: u64) (out_snap_cap_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M3-001 (#25): vol_snapshot_mint STUB. Kernel-side KIND_VOLUME_SNAPSHOT does not exist yet; filed as paideia-os monorepo follow-up. Returns LPV_SNAP_ERR_NOT_IMPLEMENTED (0x0701, small imm) without touching either argument. Real body once kernel lands the cap kind: issue the mint syscall for KIND_VOLUME_SNAPSHOT parented at volume_cap, receive a new cap slot, store at *out_snap_cap_slot. No labels; single path.",
+      block: {
+        mov rax, 0x0701;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // vol_snapshot_narrow(snap_cap, requested_ops_mask, out_narrowed_cap_slot)
+  //   -> LPV_SNAP_OK | LPV_SNAP_ERR_BAD_OPS_MASK
+  //
+  // REAL body -- validate + passthrough, matching vol_kind_narrow's
+  // M2-004 discipline (see src/vol_kind.pdx module header). No kernel-
+  // side cap_narrow primitive exists for KIND_VOLUME_SNAPSHOT (there
+  // is no kernel-side cap kind for it at all yet), so the passthrough
+  // is doubly-warranted here; the value the validation gate adds is
+  // catching an out-of-range op ordinal at the client boundary rather
+  // than at some future syscall's own refusal path.
+  // ==========================================================================
+  pub let vol_snapshot_narrow : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (snap_cap: u64) (requested_ops_mask: u64) (out_narrowed_cap_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M3-001 (#25): vol_snapshot_narrow real body. Same validate+passthrough shape vol_kind_narrow uses. VSNAP_OPS_VALID_MASK = 0x00F (bits 0..3 for the four op ordinals). Gate: mov r10,0x00F; mov r11,r10; mov r10,0xFFFFFFFFFFFFFFFF (MOVABS all-ones); xor r10,r11 (r10 = ~VSNAP_OPS_VALID_MASK); mov rax,rsi; and rax,r10; cmp rax,0; jne bad. Valid: mov [rdx+0],rdi; xor rax,rax (LPV_SNAP_OK); ret. Bad: mov rax,0x0705 (LPV_SNAP_ERR_BAD_OPS_MASK, small imm); ret -- out untouched. Same encoder discipline as vol_kind_narrow: no add reg,[mem]; no test; only cmp reg,imm. Labels prefixed lpv_snn_.",
+      block: {
+        mov r10, 0x00F;
+        mov r11, r10;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        xor r10, r11;                    // r10 = ~VSNAP_OPS_VALID_MASK
+
+        mov rax, rsi;
+        and rax, r10;
+        cmp rax, 0;
+        jne lpv_snn_bad;
+
+        mov [rdx + 0], rdi;
+        xor rax, rax;                    // LPV_SNAP_OK
+        ret;
+
+      lpv_snn_bad:
+        mov rax, 0x0705;                 // LPV_SNAP_ERR_BAD_OPS_MASK
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_snap_create(volume_cap, wal_frontier_lsn, out_snap_cap_slot) -> u64
+  //
+  // STUB. Blocked on the kernel-side snap-create op landing. Real body:
+  // freeze WAL at wal_frontier_lsn, append a snap-metadata record to
+  // snap_head's chain, mint a KIND_VOLUME_SNAPSHOT cap.
+  // ==========================================================================
+  pub let pdxb_snap_create : (u64, u64, u64) -> u64 !{} @{} =
+    fn (volume_cap: u64) (wal_frontier_lsn: u64) (out_snap_cap_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M3-001 (#25): pdxb_snap_create STUB. Blocked on kernel-side snap-create op; returns LPV_SNAP_ERR_NOT_IMPLEMENTED (0x0701) without touching any argument.",
+      block: {
+        mov rax, 0x0701;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // snap_record_parse(record_ptr, out_ptr) -> u64
+  //
+  // libpdx-volume.M3-002 (#26). Decode one 96-byte on-disk snap-
+  // metadata record into a SnapRecord summary at out_ptr. Two gates:
+  // magic (SNAP_MAGIC = 'PDXS'), version (must == 1). On any gate
+  // failure, out_ptr is untouched.
+  //
+  // Encoder discipline: mov_d for u32 magic load; for the u16 version
+  // and record_flags fields (packed into one u32 at offset +4), we load
+  // the full u32 via mov_d then shift/mask (paideia-as has no proven
+  // mov_w short-form in this repo). No add reg,[mem]; no bzx/wzx
+  // pseudo-mnemonics (encoder-conservative discipline).
+  // The magic constant 0x50445853 is within the imm32 sign-extend bound
+  // (< 0x7FFFFFFF), so `cmp reg, imm` is legal directly.
+  // ==========================================================================
+  pub let snap_record_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M3-002 (#26): snap_record_parse real body. Gate 1: mov_d rax,[rdi+0]; cmp rax,0x50445853 (SNAP_MAGIC, fits imm32 bound directly); jne bad_magic. Gate 2: load the u32 covering both u16 fields at +4 (version at [4,6), record_flags at [6,8)): mov_d rax,[rdi+4]; mov rcx,rax; and rcx,0xFFFF (small imm); cmp rcx,1; jne bad_version. Decode: 11 slots at their SNAP_OFF_* offsets, each a mov load from the on-disk offset SNAP_D_OFF_* and a mov store to the summary. u8 retention_policy: mov_b rax,[rdi+64] (zero-extend into rax); mov [rsi+80],rax. u32 magic/version/record_flags: mov_d then store the full qword slot (the summary's slot is 8 bytes, the meaningful value fits). u64 fields: plain mov both sides. Return LPV_SNAP_OK (0). No add reg,[mem]; no test; only cmp. Labels prefixed lpv_snp_.",
+      block: {
+        // Gate 1: magic.
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x50445853;
+        jne lpv_snp_bad_magic;
+
+        // Gate 2: version at [4,6) is a u16 packed in the u32 word at +4.
+        mov_d rax, [rdi + 4];
+        mov rcx, rax;
+        and rcx, 0xFFFF;
+        cmp rcx, 1;
+        jne lpv_snp_bad_version;
+
+        // Decode. magic -> +0
+        mov_d rax, [rdi + 0];
+        mov [rsi + 0], rax;
+
+        // version -> +8 (mask low 16 bits of the u32-at-+4 load)
+        mov_d rax, [rdi + 4];
+        mov rcx, rax;
+        and rcx, 0xFFFF;
+        mov [rsi + 8], rcx;
+
+        // record_flags -> +16 (upper 16 bits of the same u32)
+        mov_d rax, [rdi + 4];
+        shr rax, 16;
+        mov [rsi + 16], rax;
+
+        // snap_id -> +24
+        mov rax, [rdi + 8];
+        mov [rsi + 24], rax;
+
+        // parent_snap_id -> +32
+        mov rax, [rdi + 16];
+        mov [rsi + 32], rax;
+
+        // next_record_lba -> +40
+        mov rax, [rdi + 24];
+        mov [rsi + 40], rax;
+
+        // wal_frontier_lsn -> +48
+        mov rax, [rdi + 32];
+        mov [rsi + 48], rax;
+
+        // created_at_ns -> +56
+        mov rax, [rdi + 40];
+        mov [rsi + 56], rax;
+
+        // invoker_user_lo -> +64
+        mov rax, [rdi + 48];
+        mov [rsi + 64], rax;
+
+        // invoker_user_hi -> +72
+        mov rax, [rdi + 56];
+        mov [rsi + 72], rax;
+
+        // retention_policy -> +80 (u8 byte, zero-extended)
+        mov_b rax, [rdi + 64];
+        mov [rsi + 80], rax;
+
+        xor rax, rax;                    // LPV_SNAP_OK
+        ret;
+
+      lpv_snp_bad_magic:
+        mov rax, 0x0702;                 // LPV_SNAP_ERR_BAD_MAGIC
+        ret;
+
+      lpv_snp_bad_version:
+        mov rax, 0x0703;                 // LPV_SNAP_ERR_BAD_VERSION
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // snap_chain_walk(volume_cap, snap_head_lba, out_ptr, out_cap, out_count_ptr)
+  //   -> u64
+  //
+  // STUB at this landing. The walker needs to READ blocks from the
+  // volume (following each parsed record's `next_record_lba` field
+  // through to a 0 terminator), which requires either (a) an in-
+  // memory block cache the library can peek into, or (b) a
+  // caller-supplied read-block callback, or (c) cap-invoke through
+  // volume_cap -- none of which this library has established
+  // scaffolding for at v1.1.0. Returns LPV_SNAP_ERR_NOT_IMPLEMENTED.
+  //
+  // Signature is the final shape from the M3-002 issue brief so
+  // consumers can code against it today.
+  // ==========================================================================
+  pub let snap_chain_walk : (u64, u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (volume_cap: u64) (snap_head_lba: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "libpdx-volume.M3-002 (#26): snap_chain_walk STUB. No block-read authority scaffolding yet at v1.1.0. Returns LPV_SNAP_ERR_NOT_IMPLEMENTED (0x0701) without touching any argument. Real body will iterate: parse record at snap_head_lba (via snap_record_parse over a read-block-into-buffer callback), follow next_record_lba until 0, cap at out_cap; loop-detection via a visited-set (either a small u64[16] scratch or by comparing next_record_lba against every previously-visited LBA in the loop). No labels; single path.",
+      block: {
+        mov rax, 0x0701;
+        ret;
+      }
+    }
+}

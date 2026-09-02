@@ -96,3 +96,51 @@
 # seed_ptr rather than a sig_key_slot cap -- see the KIND_SIG_KEY entry
 # above. pdxb_verify_inode_tail (#8's verify half) is a STUB: no
 # mldsa65_verify intrinsic exists in paideia-as v0.24.0.
+#
+# ============================================================================
+# v1.1.0 additions (issues #16..#31, landed at M6..M11)
+# ============================================================================
+#
+# New KIND surfaces referenced by this library's v1.1.0 additive
+# surface. All are stub-typed at this landing (see per-issue notes) --
+# no cap-invoke syscall reaches any of them from this library's own
+# call graph. The declarations exist here so downstream consumers can
+# see the KIND boundary this library will START typing against once
+# kernel-side landings close each blocker.
+#
+#   KIND_VOLUME_SNAPSHOT   = 0x1A1  (M3-001 #25, NOT YET LANDED in
+#     paideia-os -- follow-up filed). Client-side helpers in
+#     src/vol_snapshot.pdx take opaque cap-slot integers and either
+#     stub (vol_snapshot_mint, pdxb_snap_create -- kernel side missing)
+#     or validate + passthrough (vol_snapshot_narrow -- same discipline
+#     as vol_kind_narrow, no kernel-side cap_narrow primitive exists).
+#     Right bits R_VSNAP_READ/INVOKE/REVOKE/OBSERVE mirrored in the
+#     library file; op catalog VSNAP_OP_QUERY_* + VSNAP_OP_DEBUG_PRINT
+#     ordinals 0..3, VSNAP_OPS_VALID_MASK = 0x00F.
+#
+#   KIND_KEK               = 0x1A2  (M5-001 #29, NOT YET LANDED in
+#     paideia-os -- follow-up filed). Key-Encryption-Key handle,
+#     sealed under a hardware root-of-trust. Client-side helpers in
+#     src/pdxb_crypto.pdx take raw KEK POINTERS (not cap slots), per
+#     the same "raw pointer, not cap slot" discipline pdxb_sign_
+#     superblock's own seed_ptr uses -- see design/architecture.md
+#     §8.2 and the M5-001 issue brief.
+#
+#   KIND_AUDIT_CHANNEL     (optional). Referenced by
+#     pdxb_sign_superblock_traced (M2-002 #22, src/pdxb_sign.pdx) via
+#     an OPTIONAL audit_client_slot argument -- slot == 0 skips audit
+#     entirely (no cap-invoke). Slot != 0 currently returns
+#     LPV_STUB_NOT_IMPLEMENTED until libpdx-audit lands as a build-tree
+#     sibling and its audit_client_emit extern becomes link-resolvable.
+#
+#   KIND_ELEVATE_CHANNEL   (optional). Referenced by
+#     vol_kind_mint_elevate (M2-003 #23, src/vol_kind.pdx) via an
+#     OPTIONAL elevate_channel_slot argument -- slot == 0 short-circuits
+#     the elevate call. Body is a STUB until (a) kernel-side ring-3
+#     KIND_VOLUME mint syscall lands and (b) libpdx-elevate is
+#     link-available.
+#
+# Every v1.1.0 addition preserves this library's "zero cap-invoke
+# syscalls in the own call graph" discipline (design/architecture.md
+# §7). The KIND surfaces above are TYPED against, not INVOKED against,
+# in this landing.

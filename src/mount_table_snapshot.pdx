@@ -255,4 +255,57 @@ module MountTableSnapshot = structure {
         ret;
       }
     }
+
+  // ==========================================================================
+  // libpdx-volume.M1-003 (#18) -- MountTableEntry field accessors.
+  //
+  // One-line getters over each 40-byte MountTableEntry the walk writes.
+  // Consumer takes an entry_ptr (a pointer INTO an out_ptr[i] slot the
+  // caller already computed from mount_table_snapshot's out_count) and
+  // reads a specific field. No setters at this landing -- the array is
+  // a decoded read-only view of the live _mount_table[] backing store,
+  // and mutation goes through sys_mount / sys_unmount, not this
+  // library.
+  // ==========================================================================
+
+  pub let mte_get_mountpoint_vnode_idx : (u64) -> u64 !{mem} @{} =
+    fn (entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTE_OFF_MOUNTPOINT_VNODE_IDX (+0). Plain qword load.",
+      block: { mov rax, [rdi + 0]; ret; }
+    }
+
+  pub let mte_get_root_vnode_idx : (u64) -> u64 !{mem} @{} =
+    fn (entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTE_OFF_ROOT_VNODE_IDX (+8).",
+      block: { mov rax, [rdi + 8]; ret; }
+    }
+
+  pub let mte_get_backend_type : (u64) -> u64 !{mem} @{} =
+    fn (entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTE_OFF_BACKEND_TYPE (+16).",
+      block: { mov rax, [rdi + 16]; ret; }
+    }
+
+  pub let mte_get_flags : (u64) -> u64 !{mem} @{} =
+    fn (entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTE_OFF_FLAGS (+24).",
+      block: { mov rax, [rdi + 24]; ret; }
+    }
+
+  pub let mte_get_reserved : (u64) -> u64 !{mem} @{} =
+    fn (entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.M1-003 (#18): accessor for MTE_OFF_RESERVED (+32).",
+      block: { mov rax, [rdi + 32]; ret; }
+    }
+
+  // Public alias for the entry size the M1-005 issue brief names
+  // MTE_BYTES. This library's own convention is MTE_SUMMARY_BYTES;
+  // both names bind to the same 40-byte value so downstream callers
+  // can use either.
+  pub let MTE_BYTES : u64 = 40
 }
