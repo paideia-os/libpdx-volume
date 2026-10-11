@@ -296,10 +296,20 @@ policy):
   standing (does not exist as of R53 close), and (c) a live
   release-line ML-DSA-65 seed key. See `release/RELEASE-1.0.0.md` §3
   and design/architecture.md §10.
-- **`mldsa65_verify` intrinsic.** `pdxb_verify_inode_tail` stays a
-  fail-closed stub and `tests/test_pdxb_sigverify.pdx` stays a
-  sentinel-only test until this lands on the `MlDsa65` trait
-  (design/architecture.md §8.4).
+- **`mldsa65_verify` intrinsic — UPSTREAM LANDED, libpdx-volume
+  adoption pending.** The intrinsic shipped as
+  `paideia-os/paideia-as#1347` (v0.28.1, 2026-09-02); the current
+  `tools/paideia-as/` submodule is well past that floor at v0.37.0.
+  Both `pdxb_verify_superblock` and `pdxb_verify_inode_tail` continue
+  to carry the fail-closed stub bodies at this v1.1.5 landing, and
+  `tests/test_pdxb_sigverify.pdx` continues to be the sentinel-only
+  driver, pending a dedicated adoption ticket. Cross-repo contract +
+  §4.5 real-body skeleton + §5.2 corpus specification live at
+  `design/pdxfs/mldsa65-verify-intrinsic.md` in the paideia-os repo
+  (parent `paideia-os/paideia-os#2571`); defense-in-depth verify-ACVP
+  vectors tracked at `paideia-os/paideia-as#1604`. The gap bullet in
+  `design/architecture.md` §8.4 is a frozen archaeology record of
+  the pre-v0.28.1 state and will be retired at adoption.
 - **`vol_kind_mint` / `vol_kind_narrow`'s kernel-enforced derivation.**
   `M2-004`'s `vol_kind_narrow` landed as validation + passthrough
   rather than a real kernel-enforced narrowing (see
