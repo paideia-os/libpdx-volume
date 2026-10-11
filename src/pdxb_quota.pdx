@@ -1,6 +1,8 @@
-// src/pdxb_quota.pdx — libpdx-volume.M4-001 (#27) + M4-002 (#28)
+// src/pdxb_quota.pdx — libpdx-volume.M4-001 (#27) + M4-002 (#28) +
+// LV.M11 (PFS-08 / paideia-os#2575)
 // PdxbQuota: per-volume quota row wire format + client-side codec +
-// write-path enforcement helpers (check / commit).
+// write-path enforcement helpers (block check / commit + inode
+// check / commit).
 //
 // -----------------------------------------------------------------------------
 // Superblock extension (PDXB v1-compatible, uses _reserved)
@@ -61,7 +63,33 @@
 //     `jb` == jump-if-carry per the paideia-as encoder discipline
 //     (precedent: kernel/core/syscall/ptr_check.pdx:56).
 //   - Label prefixes: `lpv_qp_` (parse), `lpv_qe_` (encode),
-//     `lpv_ql_` (lookup), `lpv_qc_` (check), `lpv_qm_` (commit).
+//     `lpv_ql_` (lookup), `lpv_qc_` (check), `lpv_qm_` (commit),
+//     `lpv_qci_` (check_inode, LV.M11 / PFS-08),
+//     `lpv_qcmi_` (commit_inode, LV.M11 / PFS-08).
+//
+// -----------------------------------------------------------------------------
+// Inode-path helpers (LV.M11 / PFS-08, paideia-os#2575)
+// -----------------------------------------------------------------------------
+//
+// `pdxb_quota_check_inode` and `pdxb_quota_commit_inode` mirror the
+// block-path pair (`pdxb_quota_check` / `pdxb_quota_commit`) against
+// the inode-count slots in the same decoded 88-byte summary layout:
+// `PDXQ_OFF_INODES_USED` (+64), `PDXQ_OFF_INODES_HARD` (+80). The
+// inode-path shape is deliberately simpler than the block-path shape:
+// hard-limit-only (no soft/grace path), two caller-facing refusal
+// codes (`LPV_QUOTA_ERR_INODE_OVER` for over-quota and
+// `LPV_QUOTA_ERR_INODE_OVERFLOW` for unsigned wrap past 2^64 on
+// `inodes_used + inode_delta`). `0 = no limit` semantics apply the
+// same way to `inodes_hard` as to `blocks_hard` in the block path.
+//
+// `LPV_QUOTA_ERR_INODE_WRITEBACK` is additionally reserved for a
+// future consumer-side writeback plumbing step; at this landing the
+// commit helper mutates the in-memory summary only (same posture as
+// `pdxb_quota_commit`), and the surrounding caller re-encodes +
+// persists via `pdxb_quota_row_encode` + its own block-write
+// authority. The code is published so a future wave that wires a
+// real superblock writeback helper through this library can emit it
+// without a return-surface breaking change.
 //
 // Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#27, #28);
 // design/architecture.md §<new-section-quota> (this repo).
@@ -90,6 +118,21 @@ module PdxbQuota = structure {
   pub let LPV_QUOTA_HARD_EXCEEDED      : u64 = 0x0803
   pub let LPV_QUOTA_ERR_BAD_ROW        : u64 = 0x0804
   pub let LPV_QUOTA_ERR_NOT_FOUND      : u64 = 0x0805
+
+  // LV.M11 (PFS-08 / paideia-os#2575) inode-path refusal codes. The
+  // inode-path pair (`pdxb_quota_check_inode` /
+  // `pdxb_quota_commit_inode`) uses a hard-limit-only semantics with
+  // distinct refusal codes rather than reusing `LPV_QUOTA_SOFT_*` /
+  // `_HARD_EXCEEDED` so a caller doing simultaneous block + inode
+  // accounting (future consumers like mkfs/fsck.pdxfs) can
+  // disambiguate "block hard exceeded" from "inode hard exceeded"
+  // off the return code alone.
+  pub let LPV_QUOTA_ERR_INODE_OVER     : u64 = 0x0806
+  pub let LPV_QUOTA_ERR_INODE_OVERFLOW : u64 = 0x0807
+  // Reserved for a future consumer-side writeback plumbing: the
+  // commit helper mutates the summary in-memory only at this
+  // landing, so this code is published but never emitted here.
+  pub let LPV_QUOTA_ERR_INODE_WRITEBACK : u64 = 0x0808
 
   // On-disk offsets.
   pub let PDXQ_D_OFF_MAGIC            : u64 = 0
@@ -516,6 +559,148 @@ module PdxbQuota = structure {
       lpv_qm_store:
         mov [rdi + 40], r10;
         xor rax, rax;                    // LPV_QUOTA_OK
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_quota_check_inode(quota_summary_ptr, inode_delta) -> u64
+  //
+  // libpdx-volume LV.M11 (PFS-08 / paideia-os#2575). Mirrors the
+  // block-path shape of `pdxb_quota_check` against the inode slots
+  // of the same decoded 88-byte summary layout -- hard-limit-only,
+  // no soft/grace surface.
+  //
+  // Return codes:
+  //   0      (LPV_QUOTA_OK)                   - fits within hard
+  //   0x0804 (LPV_QUOTA_ERR_BAD_ROW)          - magic mismatch
+  //   0x0806 (LPV_QUOTA_ERR_INODE_OVER)       - new > inodes_hard
+  //   0x0807 (LPV_QUOTA_ERR_INODE_OVERFLOW)   - inodes_used + inode_delta
+  //                                             wraps past 2^64
+  //
+  // Semantics for `0 = no limit`:
+  //   - inodes_hard == 0 -> never trip INODE_OVER
+  //
+  // Overflow guard: `add r10, rsi` (inodes_used + inode_delta) is
+  // followed by `jb lpv_qci_overflow` -- any raw 2^64 wrap on the
+  // add is refused rather than allowed to produce a wrong-branch
+  // verdict against inodes_hard, the same defensive posture
+  // `pdxb_quota_check` applies to blocks_used + block_delta
+  // (issue #33 precedent).
+  //
+  // Does NOT mutate the summary. The sibling `pdxb_quota_commit_
+  // inode` performs the mutation after the caller has walked any
+  // other concurrent-write / audit gates.
+  // ==========================================================================
+  pub let pdxb_quota_check_inode : (u64, u64) -> u64 !{mem} @{} =
+    fn (quota_summary_ptr: u64) (inode_delta: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.LV.M11 (PFS-08 / paideia-os#2575): pdxb_quota_check_inode real body. Mirrors pdxb_quota_check's block-path shape against inodes_used (summary +64) and inodes_hard (summary +80) with a hard-limit-only verdict surface. Magic gate: mov_d rax,[rdi+0] (PDXQ_OFF_MAGIC); cmp rax,0x50445851 (PDXQ_MAGIC, fits imm32 sign-extend); jne lpv_qci_bad_row. Compute new inodes_used: mov r10,[rdi+64] (PDXQ_OFF_INODES_USED); add r10,rsi (inode_delta -- treated as raw u64; underflow via negative delta clamped by the sibling _commit_inode, not here); jb lpv_qci_overflow (any raw 2^64 wrap refused as INODE_OVERFLOW, matching the issue #33 precedent for the block-path check). Hard check: mov r11,[rdi+80] (PDXQ_OFF_INODES_HARD); cmp r11,0; je lpv_qci_ok (0 = no limit); cmp r10,r11; ja lpv_qci_over (strict > means over; new == inodes_hard is at-boundary OK, matching the block-path's lpv_qc_hard discipline). lpv_qci_ok: xor rax,rax; ret. lpv_qci_over: mov rax,0x0806 (LPV_QUOTA_ERR_INODE_OVER); ret. lpv_qci_overflow: mov rax,0x0807 (LPV_QUOTA_ERR_INODE_OVERFLOW); ret. lpv_qci_bad_row: mov rax,0x0804 (LPV_QUOTA_ERR_BAD_ROW); ret. All immediates fit imm32 sign-extend; no add reg,[mem]; no test; only cmp reg,imm/reg; no byte loads except the mov_d magic gate which is a u32 load (same discipline as pdxb_quota_check). Labels prefixed lpv_qci_.",
+      block: {
+        // Magic gate.
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x50445851;
+        jne lpv_qci_bad_row;
+
+        // new_inodes_used = inodes_used + inode_delta
+        // Overflow guard: any unsigned wrap past 2^64 is refused as
+        // INODE_OVERFLOW rather than allowed to fool the cmp-vs-hard
+        // branch below. `jb` is the paideia-as encoder-preferred
+        // spelling of jump-if-carry (precedent: pdxb_quota_check's
+        // own lpv_qc_overflow_refuse at issue #33).
+        mov r10, [rdi + 64];
+        add r10, rsi;
+        jb  lpv_qci_overflow;
+
+        // Hard limit check.
+        mov r11, [rdi + 80];
+        cmp r11, 0;
+        je  lpv_qci_ok;
+        cmp r10, r11;
+        ja  lpv_qci_over;
+
+      lpv_qci_ok:
+        xor rax, rax;                    // LPV_QUOTA_OK
+        ret;
+
+      lpv_qci_over:
+        mov rax, 0x0806;                 // LPV_QUOTA_ERR_INODE_OVER
+        ret;
+
+      lpv_qci_overflow:
+        mov rax, 0x0807;                 // LPV_QUOTA_ERR_INODE_OVERFLOW
+        ret;
+
+      lpv_qci_bad_row:
+        mov rax, 0x0804;                 // LPV_QUOTA_ERR_BAD_ROW
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_quota_commit_inode(quota_summary_ptr, inode_delta) -> u64
+  //
+  // libpdx-volume LV.M11 (PFS-08 / paideia-os#2575). Atomically
+  // applies `inode_delta` to the summary's inodes_used slot
+  // (PDXQ_OFF_INODES_USED, +64 into the 88-byte decoded summary).
+  //
+  // Return codes:
+  //   0      (LPV_QUOTA_OK)                 - commit stored successfully
+  //   0x0807 (LPV_QUOTA_ERR_INODE_OVERFLOW) - positive delta's add
+  //                                           wraps past 2^64; summary
+  //                                           not mutated
+  //
+  // Signed inode_delta: negative deltas (freeing inodes) that
+  // underflow inodes_used past 0 are clamped to 0 -- soft failure,
+  // not fatal, since quota drift is recoverable via fsck.pdxfs's
+  // future recompute-inodes-used pass (same discipline as the
+  // block-path commit's underflow clamp).
+  //
+  // `LPV_QUOTA_ERR_INODE_WRITEBACK` is published in the return-code
+  // namespace for future consumer-side writeback plumbing but is
+  // never emitted at this landing: this helper mutates the
+  // in-memory summary only. A caller persists by re-encoding via
+  // `pdxb_quota_row_encode` and writing the row through its own
+  // block-write authority.
+  // ==========================================================================
+  pub let pdxb_quota_commit_inode : (u64, u64) -> u64 !{mem} @{} =
+    fn (quota_summary_ptr: u64) (inode_delta: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume.LV.M11 (PFS-08 / paideia-os#2575): pdxb_quota_commit_inode real body. Mirrors pdxb_quota_commit against inodes_used (summary +64) with explicit overflow (positive-delta wrap) + underflow (negative-delta clamp) handling. Load old: mov r11,[rdi+64]. new = r11 + rsi: mov r10,r11; add r10,rsi. Determine sign of delta: mov r12,rsi; shr r12,63 (r12 = 1 if delta negative); cmp r12,0; jne lpv_qcmi_neg. Positive-delta path: unsigned wrap detectable via r10 < r11; cmp r10,r11; jb lpv_qcmi_overflow (new strictly below old on positive delta == wrapped past 2^64); jmp lpv_qcmi_store. lpv_qcmi_neg (negative-delta path): underflow detectable via r10 > r11 (would mean subtracting past 0 wrapped); cmp r10,r11; jbe lpv_qcmi_store (r10 <= r11 is a valid subtract); xor r10,r10 (clamp to zero, matches sibling pdxb_quota_commit's established policy that drift is recoverable). lpv_qcmi_store: mov [rdi+64],r10; xor rax,rax (LPV_QUOTA_OK); ret. lpv_qcmi_overflow: mov rax,0x0807 (LPV_QUOTA_ERR_INODE_OVERFLOW); ret. Uses r10/r11/r12 (all caller-save). All immediates fit imm32 sign-extend. No add reg,[mem]; no test; only cmp reg,imm/reg; no byte loads. Labels prefixed lpv_qcmi_.",
+      block: {
+        // Save old, compute new.
+        mov r11, [rdi + 64];             // r11 = old inodes_used
+        mov r10, r11;
+        add r10, rsi;                    // r10 = new (potentially wrapped)
+
+        // Sign-of-delta dispatch.
+        mov r12, rsi;
+        shr r12, 63;                     // r12 = 1 if delta negative
+        cmp r12, 0;
+        jne lpv_qcmi_neg;
+
+        // Positive delta: overflow (wrap past 2^64) check.
+        // Positive delta implies new >= old; new < old means wrapped.
+        cmp r10, r11;
+        jb  lpv_qcmi_overflow;
+        jmp lpv_qcmi_store;
+
+      lpv_qcmi_neg:
+        // Negative delta: underflow (wrap past 0) check / clamp.
+        // Valid subtract gives r10 <= r11; r10 > r11 means wrapped.
+        cmp r10, r11;
+        jbe lpv_qcmi_store;
+        // Wrapped: clamp to zero (same policy as pdxb_quota_commit's
+        // underflow clamp -- drift is recoverable via fsck.pdxfs).
+        xor r10, r10;
+
+      lpv_qcmi_store:
+        mov [rdi + 64], r10;
+        xor rax, rax;                    // LPV_QUOTA_OK
+        ret;
+
+      lpv_qcmi_overflow:
+        mov rax, 0x0807;                 // LPV_QUOTA_ERR_INODE_OVERFLOW
         ret;
       }
     }

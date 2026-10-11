@@ -1,7 +1,11 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** LV.M10 (v1.1.7 patch — PFS-07 /
+**Current milestone:** LV.M11 (v1.1.8 patch — PFS-08 /
+paideia-os#2575: inode-path quota check + commit, closing the
+inode-half of the quota subsystem the v1.1.0 LV.M4 / #28 landing
+flagged as "straightforward duplicate of the block path … scheduled
+as a v1.1.x follow-up"). LV.M10 (v1.1.7 patch — PFS-07 /
 paideia-os#2574: real `snap_chain_walk` body + 4-case correctness
 matrix, closing M3-002 / LV.M3 follow-up on the snap-chain walker).
 LV.M9 (v1.1.6 patch — PFS-06 / paideia-os#2573: real Kahn's-algorithm
@@ -10,19 +14,18 @@ LV.M8 (v1.1.2 patch — additive superblock setter accessors) landed.
 LV.M7 (v1.1.1 patch — quota input-contract + arithmetic-wrap guard)
 landed. LV.M6 (multivol ordering) landed (partial) at v1.1.0, full
 sort body at v1.1.6.
-**Version:** 1.1.7 (patch on v1.1.6: PFS-07 /
-paideia-os#2574 — replace `snap_chain_walk` fail-closed stub with a
-real walker over parent-linked 4096-byte on-disk snap-chain blocks,
-new 3-arg signature `(root_snap_lba, cb_ptr, cb_ctx) -> count |
-SnapErr`, 128-step walk cap, external block-read authority
-`lpv_bc_read` as an unresolved extern resolved by a KIND_BLOCK_CACHE
-shim at production link time or a test mock at test-harness link
-time, new return-code band 0x0B00..0x0B0F for walker errors
-(`LPV_SNAP_ERR_READ`/`_BAD_MAGIC_SCB`/`_WALK_CAP`), new
-`tests/test_snap_chain_walk.pdx` four-case correctness matrix. One
-in-tree caller [`mount.pdxfs/src/snapshot_wire.pdx::snapshot_wire_
-list`] flagged for main-side adaptation in the same submodule-bump
-wave).
+**Version:** 1.1.8 (patch on v1.1.7: PFS-08 /
+paideia-os#2575 — add `pdxb_quota_check_inode` /
+`pdxb_quota_commit_inode` real bodies mirroring the v1.1.0 block-path
+pair against inode slots of the same 88-byte summary layout
+(`PDXQ_OFF_INODES_USED` +64, `PDXQ_OFF_INODES_HARD` +80),
+simplified hard-limit-only verdict surface, three new return codes
+in the already-reserved 0x0800..0x08FF quota band
+(`LPV_QUOTA_ERR_INODE_OVER` 0x0806, `_INODE_OVERFLOW` 0x0807,
+`_INODE_WRITEBACK` 0x0808 reserved for a future writeback plumbing
+step), new `tests/test_quota_inode.pdx` five-case correctness
+matrix (under-quota, at-boundary, over-quota, overflow guard,
+commit idempotence). Additive; no breaking signature changes).
 **Version history:** 1.1.5 (patch on v1.1.4: R91-XREPO.M1 Phase D —
 surface `paideia-satellite-runtime`'s `PDX_MLDSA_ERR_NO_SIGNER = -6`
 fail-closed sentinel upward through `pdxb_sign_superblock` /
@@ -282,8 +285,9 @@ section; per-ticket landing state:
         New file `src/pdxb_quota.pdx`.
   - [x] **#28** — `pdxb_quota_check` (all four codes: SOFT_EXCEEDED /
         SOFT_GRACE_EXPIRED / HARD_EXCEEDED / OK) + `pdxb_quota_
-        commit` (underflow-clamped). Block path only; inode path is
-        a v1.1.x follow-up.
+        commit` (underflow-clamped). Block path only; inode path
+        follow-up closed at **PFS-08 / paideia-os#2575** in v1.1.8
+        (LV.M11, below).
 - **LV.M5 encryption (#29..#30)**
   - [x] **#29** — `pdxb_kek_derive` / `pdxb_dek_wrap` / `pdxb_dek_
         unwrap` real bodies via Argon2id + ChaCha20-Poly1305
@@ -358,6 +362,36 @@ Full breakdown in `CHANGELOG.md`'s v1.1.2 stanza.
       further getters (`data_lba`, `data_bcount`,
       `sig_key_hash_word`) still lack setter siblings; out of scope
       for #34, a follow-up ticket may close the remaining gap.
+
+### LV.M11 — PFS-08 patch (v1.1.8, landed)
+
+Inode-path half of the quota subsystem closed; completes the v1.1.0
+LV.M4 / #28 landing's "inode enforcement is a straightforward
+duplicate of the block path … scheduled as a v1.1.x follow-up"
+flag. Additive; v1.0.0/v1.1.x API surface byte-identical to v1.1.7.
+Full breakdown in `CHANGELOG.md`'s v1.1.8 stanza.
+
+- [x] **PFS-08 (paideia-os#2575)** — `pdxb_quota_check_inode` +
+      `pdxb_quota_commit_inode` real bodies (`src/pdxb_quota.pdx`).
+      Signatures `(quota_summary_ptr, inode_delta) -> u64` mirror
+      the block-path pair but against inode summary slots
+      (`PDXQ_OFF_INODES_USED` +64, `PDXQ_OFF_INODES_HARD` +80).
+      Hard-limit-only verdict surface (no soft/grace path, no
+      `grace_expired` argument). Three new return codes in the
+      already-reserved 0x0800..0x08FF quota band:
+      `LPV_QUOTA_ERR_INODE_OVER` (0x0806, over hard),
+      `LPV_QUOTA_ERR_INODE_OVERFLOW` (0x0807, unsigned wrap past
+      2^64 on `used + delta`), `LPV_QUOTA_ERR_INODE_WRITEBACK`
+      (0x0808, reserved for a future writeback plumbing step; not
+      emitted at this landing). Overflow guard follows issue #33's
+      `add; jb` precedent on the block-path check. Underflow
+      (negative-delta subtract past 0) clamps to zero per the
+      block-path commit's established policy. New file
+      `tests/test_quota_inode.pdx` -- five correctness cases
+      (under-quota check, at-boundary check, over-quota check,
+      overflow guard, commit idempotence) returning 0 on all-pass
+      or 1..5 per the shared M4 return-code convention
+      (`tests/README.md`).
 
 ## Next milestone
 

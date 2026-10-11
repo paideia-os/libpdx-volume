@@ -1,0 +1,333 @@
+// tests/test_quota_inode.pdx — libpdx-volume LV.M11 (PFS-08 /
+// paideia-os#2575)
+// TestQuotaInode: correctness matrix for the inode-path quota
+// helpers (`PdxbQuota::pdxb_quota_check_inode` /
+// `pdxb_quota_commit_inode`) landed in src/pdxb_quota.pdx.
+//
+// ================================================================
+// The fixture -- an 88-byte PDXQ summary buffer in this file's own
+// `.bss`
+// ================================================================
+//
+// Both helpers consume the decoded 88-byte summary layout produced
+// by `pdxb_quota_row_parse` (PDXQ_SUMMARY_BYTES, 11 u64 slots), NOT
+// the raw 64-byte on-disk row. Field offsets used here are the
+// `PDXQ_OFF_*` family, duplicated as immediates per this repo's
+// no-cross-module-constant-import convention:
+//
+//   +0   magic           (PDXQ_OFF_MAGIC, filled u64 slot, u32 valid)
+//   +64  inodes_used     (PDXQ_OFF_INODES_USED)
+//   +80  inodes_hard     (PDXQ_OFF_INODES_HARD)
+//
+// Every other summary slot (version, subject_kind, subject_id_lo/hi,
+// blocks_used/soft/hard, inodes_soft) is left at its `.bss` zero-init
+// value; the inode-path helpers never read those slots, so a zero
+// value is byte-for-byte equivalent to a parsed real row for the
+// purposes of this driver.
+//
+// ================================================================
+// Five cases
+// ================================================================
+//
+//   Case 1 -- under-quota check. Fixture: inodes_used=10,
+//             inodes_hard=100, inode_delta=50. Expected:
+//             pdxb_quota_check_inode returns LPV_QUOTA_OK (0) and
+//             the summary's inodes_used slot remains 10 (check
+//             does not mutate).
+//
+//   Case 2 -- at-boundary check. Fixture: inodes_used=50,
+//             inodes_hard=100, inode_delta=50 (new == hard).
+//             Expected: LPV_QUOTA_OK (0) -- the inode-path hard
+//             check uses `ja` (strict >) just like the block-path
+//             `pdxb_quota_check`, so new == inodes_hard is OK.
+//             inodes_used remains 50 (check does not mutate).
+//
+//   Case 3 -- over-quota check. Fixture: inodes_used=50,
+//             inodes_hard=100, inode_delta=51. Expected:
+//             LPV_QUOTA_ERR_INODE_OVER (0x0806). inodes_used
+//             remains 50 (check does not mutate).
+//
+//   Case 4 -- overflow guard. Fixture: inodes_used=
+//             0xFFFFFFFFFFFFFFF0, inodes_hard=100, inode_delta=0x20
+//             (so inodes_used + inode_delta wraps past 2^64 to
+//             0x10). Expected: LPV_QUOTA_ERR_INODE_OVERFLOW
+//             (0x0807) -- the add; jb overflow guard fires BEFORE
+//             the cmp-vs-hard branch, matching issue #33's precedent
+//             on the block-path check.
+//
+//   Case 5 -- commit idempotence. Fixture starts with
+//             inodes_used=0, inodes_hard=0 (0 = no limit; irrelevant
+//             to commit anyway, which does not consult hard).
+//             Call pdxb_quota_commit_inode(summary, 5) twice.
+//             Expected: both calls return LPV_QUOTA_OK (0) and the
+//             summary's inodes_used slot reads 10 after the second
+//             call (accumulation across two consecutive commits).
+//
+// ================================================================
+// Return-code convention -- NOT a literal emit+exit pair
+// ================================================================
+//
+// This library has no console/print capability anywhere in `caps.
+// decl` (same discipline as every other M4/PFS test driver here --
+// see `tests/README.md` and `test_mount_sort.pdx`'s own return-code
+// block for the full rationale). `run()` therefore returns a `u64`
+// status code:
+//
+//   0     -- all five cases passed.
+//   1..5  -- the 1-based ordinal of the first case that failed.
+//
+// A future consumer with a real print primitive maps the ordinal
+// back to a human-readable name via the case list above.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//
+//   - No `@no_frame` anywhere.
+//   - Cross-module `call pdxb_quota_check_inode;` / `call
+//     pdxb_quota_commit_inode;` use the bare unqualified symbol
+//     (this repo's convention; see `test_mount_sort.pdx`'s header
+//     for the full libpdx-audit precedent and the standalone-
+//     compilation rationale).
+//   - Magic value 0x50445851 fits imm32 sign-extend cleanly.
+//   - Status codes 0x0806 / 0x0807 fit imm32 sign-extend cleanly.
+//   - The one 64-bit immediate (0xFFFFFFFFFFFFFFF0 for case 4)
+//     stages via a plain `mov rax, 0xFF...F0` (MOVABS) before the
+//     store, matching `test_pdxb_sigverify.pdx`'s own MOVABS
+//     discipline for the fail-closed sentinel.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0` or
+//     `cmp reg, reg`.
+//   - No `add reg, [mem]`; every add is reg,reg or reg,imm.
+//   - No byte loads (all values here are full qwords).
+//   - No `imul`.
+//   - No reserved-word labels (`loop`/`if`/`let`); label prefix
+//     `tqi_` (TestQuotaInode).
+//
+// Upstream: paideia-os#2575 (PFS-08 chain-head);
+// `src/pdxb_quota.pdx` (this repo, LV.M11); `tests/README.md`
+// (this repo, return-code convention).
+
+module TestQuotaInode = structure {
+
+  // --- Status-code echoes (duplicated from src/pdxb_quota.pdx per
+  // this repo's no-cross-module-constant-import convention). ---
+  pub let TQI_LPV_QUOTA_OK                 : u64 = 0
+  pub let TQI_LPV_QUOTA_ERR_INODE_OVER     : u64 = 0x0806
+  pub let TQI_LPV_QUOTA_ERR_INODE_OVERFLOW : u64 = 0x0807
+
+  // --- .bss summary buffer. 11 u64 slots = 88 bytes. ---
+  pub let mut tqi_summary : [u8; 88] = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Five flat case blocks, each clearing the summary, stamping the
+  // fields relevant to that case, invoking the helper under test, and
+  // verifying the return code (and for cases 1/2/3/5 the post-call
+  // summary mutation state). See module header for the case list and
+  // return-code convention.
+  // ==========================================================================
+  pub let test_quota_inode_run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume LV.M11 (PFS-08 / paideia-os#2575) TestQuotaInode::run entry point. Drives five correctness cases over PdxbQuota's new inode-path pair (pdxb_quota_check_inode / pdxb_quota_commit_inode). Each case: (1) zero tqi_summary (88 B = 11 qwords) via bounded xor/store/add/cmp/jb loop; (2) stamp magic (PDXQ_MAGIC 0x50445851 fits imm32) at +0, inodes_used at +64, inodes_hard at +80 as the case requires; (3) marshal SysV args rdi=&tqi_summary, rsi=inode_delta, then call pdxb_quota_check_inode (cases 1-4) or pdxb_quota_commit_inode (case 5); (4) check return rax against the expected code (0 / 0x0806 / 0x0807 as per case); (5) for cases 1/2/3 (check does not mutate), verify inodes_used slot still reads its pre-call value; for case 5 (two commits), verify inodes_used accumulated to 10. On any failure jump to tqi_cN_fail returning N (1..5); on all five passing fall through to xor rax,rax; ret. Case 4 stages 0xFFFFFFFFFFFFFFF0 into inodes_used via MOVABS (the one 64-bit immediate in this driver, matching test_pdxb_sigverify.pdx's sentinel-staging discipline) and expects the add; jb overflow guard inside pdxb_quota_check_inode to fire before the cmp-vs-hard branch. Cross-module calls use bare unqualified symbols per repo convention. No test mnemonic; no add reg,[mem]; no byte loads; no imul; every status-code immediate fits imm32 sign-extend. Label prefix tqi_.",
+      block: {
+        // ====================================================================
+        // Case 1: under-quota check.
+        // inodes_used=10, inodes_hard=100, delta=50 -> OK, used unchanged.
+        // ====================================================================
+
+        // Clear tqi_summary (11 qwords).
+        lea r11, [rip + tqi_summary];
+        xor rax, rax;
+        xor rcx, rcx;
+      tqi_c1_zero:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 11;
+        jb  tqi_c1_zero;
+
+        // Stamp magic/used/hard.
+        lea r11, [rip + tqi_summary];
+        mov rax, 0x50445851;              // PDXQ_MAGIC
+        mov [r11 + 0], rax;
+        mov rax, 10;                      // inodes_used
+        mov [r11 + 64], rax;
+        mov rax, 100;                     // inodes_hard
+        mov [r11 + 80], rax;
+
+        // Call pdxb_quota_check_inode(&summary, 50).
+        lea rdi, [rip + tqi_summary];
+        mov rsi, 50;
+        call pdxb_quota_check_inode;
+        cmp rax, 0;
+        jne tqi_c1_fail;
+
+        // Verify inodes_used unchanged (still 10 -- check does not mutate).
+        lea r11, [rip + tqi_summary];
+        mov rax, [r11 + 64];
+        cmp rax, 10;
+        jne tqi_c1_fail;
+
+        // ====================================================================
+        // Case 2: at-boundary check.
+        // inodes_used=50, inodes_hard=100, delta=50 (new == hard) -> OK.
+        // ====================================================================
+
+        lea r11, [rip + tqi_summary];
+        xor rax, rax;
+        xor rcx, rcx;
+      tqi_c2_zero:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 11;
+        jb  tqi_c2_zero;
+
+        lea r11, [rip + tqi_summary];
+        mov rax, 0x50445851;
+        mov [r11 + 0], rax;
+        mov rax, 50;
+        mov [r11 + 64], rax;
+        mov rax, 100;
+        mov [r11 + 80], rax;
+
+        lea rdi, [rip + tqi_summary];
+        mov rsi, 50;
+        call pdxb_quota_check_inode;
+        cmp rax, 0;
+        jne tqi_c2_fail;
+
+        lea r11, [rip + tqi_summary];
+        mov rax, [r11 + 64];
+        cmp rax, 50;
+        jne tqi_c2_fail;
+
+        // ====================================================================
+        // Case 3: over-quota check.
+        // inodes_used=50, inodes_hard=100, delta=51 -> INODE_OVER (0x0806).
+        // ====================================================================
+
+        lea r11, [rip + tqi_summary];
+        xor rax, rax;
+        xor rcx, rcx;
+      tqi_c3_zero:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 11;
+        jb  tqi_c3_zero;
+
+        lea r11, [rip + tqi_summary];
+        mov rax, 0x50445851;
+        mov [r11 + 0], rax;
+        mov rax, 50;
+        mov [r11 + 64], rax;
+        mov rax, 100;
+        mov [r11 + 80], rax;
+
+        lea rdi, [rip + tqi_summary];
+        mov rsi, 51;
+        call pdxb_quota_check_inode;
+        cmp rax, 0x0806;
+        jne tqi_c3_fail;
+
+        // Verify inodes_used unchanged (still 50 -- check does not mutate).
+        lea r11, [rip + tqi_summary];
+        mov rax, [r11 + 64];
+        cmp rax, 50;
+        jne tqi_c3_fail;
+
+        // ====================================================================
+        // Case 4: overflow guard.
+        // inodes_used=0xFFFFFFFFFFFFFFF0, delta=0x20 -> INODE_OVERFLOW
+        // (0x0807) via add; jb before the cmp-vs-hard branch fires.
+        // ====================================================================
+
+        lea r11, [rip + tqi_summary];
+        xor rax, rax;
+        xor rcx, rcx;
+      tqi_c4_zero:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 11;
+        jb  tqi_c4_zero;
+
+        lea r11, [rip + tqi_summary];
+        mov rax, 0x50445851;
+        mov [r11 + 0], rax;
+        mov rax, 0xFFFFFFFFFFFFFFF0;      // MOVABS -- outside imm32 bound
+        mov [r11 + 64], rax;
+        mov rax, 100;
+        mov [r11 + 80], rax;
+
+        lea rdi, [rip + tqi_summary];
+        mov rsi, 0x20;
+        call pdxb_quota_check_inode;
+        cmp rax, 0x0807;
+        jne tqi_c4_fail;
+
+        // ====================================================================
+        // Case 5: commit idempotence.
+        // Two consecutive commit(+5) accumulate -> inodes_used = 10.
+        // ====================================================================
+
+        lea r11, [rip + tqi_summary];
+        xor rax, rax;
+        xor rcx, rcx;
+      tqi_c5_zero:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 11;
+        jb  tqi_c5_zero;
+
+        // Magic + inodes_used=0 (left at zero-init); inodes_hard=0
+        // (0 = no limit, but commit does not consult hard anyway).
+        lea r11, [rip + tqi_summary];
+        mov rax, 0x50445851;
+        mov [r11 + 0], rax;
+
+        // First commit.
+        lea rdi, [rip + tqi_summary];
+        mov rsi, 5;
+        call pdxb_quota_commit_inode;
+        cmp rax, 0;
+        jne tqi_c5_fail;
+
+        // Second commit.
+        lea rdi, [rip + tqi_summary];
+        mov rsi, 5;
+        call pdxb_quota_commit_inode;
+        cmp rax, 0;
+        jne tqi_c5_fail;
+
+        // Verify accumulation: inodes_used reads 10.
+        lea r11, [rip + tqi_summary];
+        mov rax, [r11 + 64];
+        cmp rax, 10;
+        jne tqi_c5_fail;
+
+        // All five cases passed.
+        xor rax, rax;
+        ret;
+
+      tqi_c1_fail:
+        mov rax, 1;
+        ret;
+
+      tqi_c2_fail:
+        mov rax, 2;
+        ret;
+
+      tqi_c3_fail:
+        mov rax, 3;
+        ret;
+
+      tqi_c4_fail:
+        mov rax, 4;
+        ret;
+
+      tqi_c5_fail:
+        mov rax, 5;
+        ret;
+      }
+    }
+}

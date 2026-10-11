@@ -1,5 +1,102 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.8 — 2026-10-11 (PFS-08 / paideia-os#2575: inode-path quota check + commit)
+
+**Patch bump — additive. Closes the inode-path half of the quota
+subsystem whose block-path pair landed in v1.1.0 (LV.M4 / #28) and
+whose module header had carried the "inode enforcement is a
+straightforward duplicate of the block path … scheduled as a v1.1.x
+follow-up" flag ever since. Two new public symbols, three new
+return codes in the already-reserved 0x0800..0x08FF quota band, one
+new test driver.** Closes `paideia-os#2575` (PFS-08, chain-head wave
+PFS-W5).
+
+### Added
+
+- **`src/pdxb_quota.pdx`** — `PdxbQuota::pdxb_quota_check_inode`
+  real body (`(quota_summary_ptr, inode_delta) -> u64`). Mirrors
+  the block-path `pdxb_quota_check`'s shape against the inode slots
+  of the same 88-byte decoded summary (`PDXQ_OFF_INODES_USED` +64
+  reader, `PDXQ_OFF_INODES_HARD` +80 reader) with a deliberately
+  simpler, hard-limit-only verdict surface -- no soft/grace path,
+  no `grace_expired` parameter. Returns `LPV_QUOTA_OK` (0),
+  `LPV_QUOTA_ERR_INODE_OVER` (0x0806) on `new > inodes_hard`,
+  `LPV_QUOTA_ERR_INODE_OVERFLOW` (0x0807) on `inodes_used +
+  inode_delta` wrapping past 2^64, or `LPV_QUOTA_ERR_BAD_ROW`
+  (0x0804, reused) on magic mismatch. `0 = no limit` semantics
+  apply to `inodes_hard` the same way as to `blocks_hard` in the
+  block path. Overflow guard follows the issue #33 precedent:
+  `add r10, rsi; jb lpv_qci_overflow` refuses any raw 2^64 wrap
+  before the cmp-vs-hard branch can see a bogus wrapped value.
+  Does NOT mutate the summary -- the sibling `_commit_inode` is
+  the mutation entry point.
+- **`src/pdxb_quota.pdx`** — `PdxbQuota::pdxb_quota_commit_inode`
+  real body (`(quota_summary_ptr, inode_delta) -> u64`). Mirrors
+  `pdxb_quota_commit` against the inode slot (+64) with explicit
+  positive-delta overflow handling: a positive-delta add that
+  wraps past 2^64 returns `LPV_QUOTA_ERR_INODE_OVERFLOW` (0x0807)
+  without mutating the summary. Negative-delta underflow retains
+  the sibling block-path's established clamp-to-zero policy
+  (quota drift is recoverable via fsck.pdxfs's future
+  recompute-inodes-used pass). Returns `LPV_QUOTA_OK` (0) after a
+  successful in-memory store.
+- **`src/pdxb_quota.pdx`** — three new return-code constants in
+  the already-reserved 0x0800..0x08FF band:
+  `LPV_QUOTA_ERR_INODE_OVER = 0x0806`,
+  `LPV_QUOTA_ERR_INODE_OVERFLOW = 0x0807`,
+  `LPV_QUOTA_ERR_INODE_WRITEBACK = 0x0808`. The first two are
+  emitted by the two new helpers. The third is published but
+  deliberately not emitted at this landing: both helpers mutate
+  only the in-memory summary (same posture as `pdxb_quota_commit`),
+  so writeback failures surface at the caller's own
+  `pdxb_quota_row_encode` + block-write step. The code is
+  reserved so a future wave that wires a real
+  superblock-writeback helper through this library can emit it
+  without a return-surface breaking change.
+- **`tests/test_quota_inode.pdx`** (new file) —
+  `TestQuotaInode::test_quota_inode_run()` five-case correctness
+  matrix:
+  (1) under-quota check (used=10, hard=100, delta=50 -> OK);
+  (2) at-boundary check (used=50, hard=100, delta=50 -> OK;
+      `ja` strict > discipline means new == hard is at-boundary OK);
+  (3) over-quota check (used=50, hard=100, delta=51 ->
+      `LPV_QUOTA_ERR_INODE_OVER` 0x0806);
+  (4) overflow guard (used=0xFFFFFFFFFFFFFFF0, delta=0x20 ->
+      `LPV_QUOTA_ERR_INODE_OVERFLOW` 0x0807 via the
+      `add; jb` guard firing before the cmp-vs-hard branch);
+  (5) commit idempotence (two consecutive `commit(+5)` accumulate
+      to inodes_used == 10, both calls returning
+      `LPV_QUOTA_OK`).
+  Cases 1/2/3 additionally verify that `_check_inode` does not
+  mutate the summary's inodes_used slot. Returns 0 on all-pass or
+  the 1-based ordinal of the first failing case per the shared M4
+  return-code convention (`tests/README.md`). 88-byte summary
+  fixture lives in the driver's own `.bss`; every non-inode slot
+  is left at its zero-init value (the inode-path helpers never
+  read those slots).
+
+### Changed
+
+- **`src/pdxb_quota.pdx`** — module header gains a new
+  "Inode-path helpers (LV.M11 / PFS-08)" section documenting the
+  simplified hard-only shape, the two new refusal codes, the
+  summary-layout offsets consulted (`PDXQ_OFF_INODES_USED` +64,
+  `PDXQ_OFF_INODES_HARD` +80), and the writeback-code reserve
+  rationale. "Label prefixes" bullet extended with
+  `lpv_qci_` (check_inode) and `lpv_qcmi_` (commit_inode).
+
+### Notes
+
+- Encoder-pitfall discipline: no `test rN,rN`; no `add reg,[mem]`;
+  no 2-op `imul reg,imm`; no multiline `pub let =`; no reserved
+  labels (`loop`/`if`/`let`; all labels prefixed `lpv_qci_` /
+  `lpv_qcmi_` in src and `tqi_` in the test). All status-code
+  immediates fit imm32 sign-extend; the one 64-bit immediate
+  (0xFFFFFFFFFFFFFFF0 for case 4) stages via MOVABS per
+  `test_pdxb_sigverify.pdx`'s precedent. `jb` (jump-if-carry)
+  spelling for the overflow guard matches `pdxb_quota_check`'s
+  own `lpv_qc_overflow_refuse` discipline (issue #33 precedent).
+
 ## 1.1.7 — 2026-10-11 (PFS-07 / paideia-os#2574: real snap_chain_walk body + 4-case correctness matrix)
 
 **Patch bump — the one caller in the paideia-os tree
