@@ -1,0 +1,505 @@
+// tests/test_snap_chain_walk.pdx — libpdx-volume PFS-07 (paideia-os#2574)
+// TestSnapChainWalk: correctness matrix for the real
+// snap_chain_walk body landed at `VolSnapshot::snap_chain_walk`
+// (`src/vol_snapshot.pdx`), which walks a parent-linked chain of
+// 4096-byte on-disk "snap-chain blocks" via an externally provided
+// `lpv_bc_read(lba, out_ptr) -> u64` block-read authority.
+//
+// ================================================================
+// The mock -- a .bss-backed virtual block table (mode-driven)
+// ================================================================
+//
+// `lpv_bc_read` is defined IN THIS FILE as a mode-driven synthesizer:
+// per the walker's current `tcw_mode` (one of 1..4), the mock writes
+// a 32-byte "snap-chain block" header into the walker's out_ptr
+// scratch and returns 0; LBAs outside the current mode's expected
+// set return 1. This mirrors the brief's "stub the KIND_BLOCK_CACHE
+// invoke at the test-harness level" directive without materializing
+// a full 4096-byte block per LBA in .bss (which would cost ~512 KB
+// for the walk-cap case alone).
+//
+// Modes (one per test case, with case 3 reusing mode 1 since the
+// abort behaviour lives in the callback, not the mock):
+//
+//   mode 1 -- linear chain of 3 at LBAs 100 -> 200 -> 300:
+//     LBA 100: {magic='PDXS', gen=1, parent=200, data_root=1000}
+//     LBA 200: {magic='PDXS', gen=2, parent=300, data_root=2000}
+//     LBA 300: {magic='PDXS', gen=3, parent=0,   data_root=3000}
+//     Any other LBA: return 1 (read error).
+//
+//   mode 2 -- bad magic at root LBA 100:
+//     LBA 100: {magic=0x12345678, gen=0, parent=0, data_root=0}
+//     Any other LBA: return 1.
+//
+//   mode 4 -- infinite chain starting at LBA 100 (parent = lba+1):
+//     LBA 100..200000: {magic='PDXS', gen=1, parent=lba+1,
+//                        data_root=lba*7} (lba+1 never zero in this
+//                        range so the walker never terminates on
+//                        parent=0; the walk-cap gate fires at step
+//                        128).
+//     LBA < 100: return 1.
+//
+// Mode 3 reuses mode 1's chain; case 3 drives abort via the
+// `tcw_abort_on` toggle (cb returns 0xB099 on invocation N).
+//
+// ================================================================
+// The callback -- logs visits + optional abort
+// ================================================================
+//
+// `tcw_cb(snap_lba, generation, data_root_lba, parent_lba, cb_ctx)`
+// records each invocation's snap_lba into `tcw_visit_lba_log` and
+// its generation into `tcw_visit_gen_log` (so case 1 can assert
+// both the chain order and the generation progression), increments
+// `tcw_cb_count`, then consults `tcw_abort_on`: if non-zero and
+// equal to the current cb_count, returns 0xB099 (the test's chosen
+// cb-abort sentinel, outside the walker's 0x0B01..0x0B03 reserved
+// band). cb_ctx is ignored (the test uses .bss globals rather than
+// threading state through cb_ctx -- both approaches are legitimate;
+// cb_ctx carrying is exercised at the ABI level by the walker's
+// mov r8,r15 shuffle, which this test deliberately validates by
+// passing a distinctive pointer value and NOT depending on its
+// contents).
+//
+// ================================================================
+// Return-code convention -- shared with every other M4/PFS driver
+// ================================================================
+//
+//   0     -- all four cases passed.
+//   1..4  -- the 1-based ordinal of the first case that failed.
+//
+// ================================================================
+// Correctness matrix
+// ================================================================
+//
+//   Case 1 -- linear chain of 3 (mode 1).
+//     Call: snap_chain_walk(100, &tcw_cb, 0x07000001).
+//     Expected: rax == 3 (count), tcw_cb_count == 3,
+//               tcw_visit_lba_log[0..3] == [100, 200, 300],
+//               tcw_visit_gen_log[0..3] == [1, 2, 3].
+//
+//   Case 2 -- bad-magic root block (mode 2).
+//     Call: snap_chain_walk(100, &tcw_cb, 0x07000002).
+//     Expected: rax == LPV_SNAP_ERR_BAD_MAGIC_SCB (0x0B02),
+//               tcw_cb_count == 0 (cb never invoked).
+//
+//   Case 3 -- callback aborts at step 2 (mode 1 + abort_on=2).
+//     Call: snap_chain_walk(100, &tcw_cb, 0x07000003).
+//     Expected: rax == 0xB099 (cb's abort sentinel),
+//               tcw_cb_count == 2,
+//               tcw_visit_lba_log[0..2] == [100, 200].
+//
+//   Case 4 -- walk-cap exceeded (mode 4, synthetic 129+-link chain).
+//     Call: snap_chain_walk(100, &tcw_cb, 0x07000004).
+//     Expected: rax == LPV_SNAP_ERR_WALK_CAP (0x0B03),
+//               tcw_cb_count == 128 (every slot visited before the
+//               cap gate fired on step 129).
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//
+//   - Cross-module `call snap_chain_walk;` uses the bare unqualified
+//     symbol (repo convention). `call lpv_bc_read;` from the walker's
+//     own .o resolves to THIS file's mock at link time (the test's
+//     own symbol table publishes `lpv_bc_read`).
+//   - Function-pointer passage via `lea rsi, [rip + tcw_cb]` matches
+//     the paideia-as hash_dispatch smoke-test precedent (fixture
+//     pa_r18_010 under tools/paideia-as/tests/build-emit/).
+//   - Immediates 100/200/300/1000/2000/3000/0x12345678/0x50445853/
+//     0x0B02/0x0B03/0xB099/0x07000001../0x07000004 all fit imm32
+//     sign-extend cleanly (every value < 0x7FFFFFFF); 128 is staged
+//     via `mov rax,imm; cmp` to sidestep the imm8-sign-extend trap
+//     (same discipline the walker itself uses on its own 128 cap).
+//   - No `test`; no `add reg,[mem]`; no byte loads; no `imul`.
+//   - Labels prefixed `tcw_` (TestSnapChainWalk) + per-section
+//     suffixes (`_m1_`, `_m2_`, `_c1_`, `_cb_`, `_bc_`...).
+//
+// Upstream: paideia-os#2574 (PFS-07, chain-head wave PFS-W4);
+// `src/vol_snapshot.pdx` (this repo, LV.M10 / PFS-07);
+// `tests/README.md` (this repo, return-code convention).
+
+module TestSnapChainWalk = structure {
+
+  // --- .bss state (zero-init at process start; reset per-case) ---
+
+  // Walker-driven mode selector (1..4; see module header).
+  pub let mut tcw_mode : u64 = uninit @align(8)
+
+  // Count of cb invocations in the current case.
+  pub let mut tcw_cb_count : u64 = uninit @align(8)
+
+  // If non-zero, cb returns 0xB099 on the Nth invocation.
+  pub let mut tcw_abort_on : u64 = uninit @align(8)
+
+  // Per-visit snap_lba + generation logs. 132 slots -- enough for
+  // the walk-cap case's 128 steps plus headroom. 1056 B each.
+  pub let mut tcw_visit_lba_log : [u8; 1056] = uninit @align(8)
+  pub let mut tcw_visit_gen_log : [u8; 1056] = uninit @align(8)
+
+  // ==========================================================================
+  // lpv_bc_read(lba, out_ptr) -> u64
+  //
+  // Mode-driven mock of KIND_BLOCK_CACHE's BC_OP_READ. Resolves the
+  // walker's own unresolved extern reference at link time (standalone
+  // .o emit per libpdx-volume's build.sh; a downstream consumer that
+  // links a REAL block-cache shim alongside vol_snapshot.pdx would
+  // provide its own `lpv_bc_read` and this mock would be shadowed /
+  // not linked at all).
+  //
+  // Returns 0 on success (block synthesized into [out_ptr..+32)),
+  // 1 on an LBA outside the current mode's expected set. Only the
+  // first 32 bytes of out_ptr are stamped (the walker reads only
+  // offsets 0, 8, 16, 24); the remainder of the 4096-byte scratch
+  // is left at whatever state the previous mock iteration left it.
+  // ==========================================================================
+  pub let lpv_bc_read : (u64, u64) -> u64 !{mem} @{} =
+    fn (lba: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume PFS-07 (paideia-os#2574) TestSnapChainWalk mock of lpv_bc_read. Branches on tcw_mode (loaded via lea r11,[rip+tcw_mode]; mov rcx,[r11+0]). Mode 1 (chain 100->200->300->0): three per-LBA arms stamping magic/gen/parent/data_root at offsets 0 (mov_d), 8, 16, 24 then xor rax,rax; ret. Mode 2 (bad magic at 100): one LBA==100 arm writing magic=0x12345678 (any non-'PDXS' value within imm32 sign-extend bound) via mov_d then zero fields; xor rax,rax; ret. Mode 4 (infinite chain for walk-cap): LBAs >= 100 synthesize {gen=1, parent=lba+1, data_root=lba*7} inline -- `mov rax,rdi; add rax,1` for parent; 3-op `imul rax,rdi,7` for data_root, matching this repo's established 3-op imul discipline (mount_table_snapshot.pdx uses imul with imm 40). Fall-through default returns 1. Immediates 100/200/300/0x12345678/0x50445853 all fit imm32 sign-extend. No test; no add reg,[mem]; no byte loads. Label prefix tcw_bc_.",
+      block: {
+        // Load tcw_mode.
+        lea r11, [rip + tcw_mode];
+        mov rcx, [r11 + 0];
+
+        // ---- Mode 1: chain 100 -> 200 -> 300 -> 0 ----
+        cmp rcx, 1;
+        jne tcw_bc_mode2_check;
+
+        cmp rdi, 100;
+        jne tcw_bc_m1_200;
+        mov rax, 0x50445853; mov_d [rsi + 0], rax;
+        mov rax, 1;          mov   [rsi + 8], rax;
+        mov rax, 200;        mov   [rsi + 16], rax;
+        mov rax, 1000;       mov   [rsi + 24], rax;
+        xor rax, rax;
+        ret;
+
+      tcw_bc_m1_200:
+        cmp rdi, 200;
+        jne tcw_bc_m1_300;
+        mov rax, 0x50445853; mov_d [rsi + 0], rax;
+        mov rax, 2;          mov   [rsi + 8], rax;
+        mov rax, 300;        mov   [rsi + 16], rax;
+        mov rax, 2000;       mov   [rsi + 24], rax;
+        xor rax, rax;
+        ret;
+
+      tcw_bc_m1_300:
+        cmp rdi, 300;
+        jne tcw_bc_m1_bad;
+        mov rax, 0x50445853; mov_d [rsi + 0], rax;
+        mov rax, 3;          mov   [rsi + 8], rax;
+        mov rax, 0;          mov   [rsi + 16], rax;    // chain terminator
+        mov rax, 3000;       mov   [rsi + 24], rax;
+        xor rax, rax;
+        ret;
+
+      tcw_bc_m1_bad:
+        mov rax, 1;
+        ret;
+
+        // ---- Mode 2: bad magic at root LBA 100 ----
+      tcw_bc_mode2_check:
+        cmp rcx, 2;
+        jne tcw_bc_mode4_check;
+
+        cmp rdi, 100;
+        jne tcw_bc_m2_bad;
+        // 0x12345678 is any non-'PDXS' value within imm32 sign-extend
+        // bound (< 0x7FFFFFFF); the walker's `cmp rax, 0x50445853`
+        // misses so the magic gate fires.
+        mov rax, 0x12345678; mov_d [rsi + 0], rax;
+        mov rax, 0;          mov   [rsi + 8], rax;
+        mov rax, 0;          mov   [rsi + 16], rax;
+        mov rax, 0;          mov   [rsi + 24], rax;
+        xor rax, rax;
+        ret;
+
+      tcw_bc_m2_bad:
+        mov rax, 1;
+        ret;
+
+        // ---- Mode 4: infinite chain starting at LBA 100 ----
+      tcw_bc_mode4_check:
+        cmp rcx, 4;
+        jne tcw_bc_mode_unknown;
+
+        cmp rdi, 100;
+        jb  tcw_bc_m4_bad;
+
+        mov rax, 0x50445853;
+        mov_d [rsi + 0], rax;
+
+        mov rax, 1;
+        mov [rsi + 8], rax;             // generation (fixed; we only
+                                        // care that the chain never
+                                        // terminates)
+
+        mov rax, rdi;
+        add rax, 1;
+        mov [rsi + 16], rax;            // parent = lba + 1 (never 0
+                                        // for lba >= 100)
+
+        imul rax, rdi, 7;
+        mov [rsi + 24], rax;            // data_root = lba * 7
+
+        xor rax, rax;
+        ret;
+
+      tcw_bc_m4_bad:
+        mov rax, 1;
+        ret;
+
+      tcw_bc_mode_unknown:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // tcw_cb(snap_lba, generation, data_root_lba, parent_lba, cb_ctx) -> u64
+  //
+  // Logs the visit, increments tcw_cb_count, consults tcw_abort_on.
+  // Returns 0xB099 on triggered abort (cb_count == tcw_abort_on
+  // AFTER increment), else 0. cb_ctx is ignored; the test uses .bss
+  // globals rather than threaded context.
+  // ==========================================================================
+  pub let tcw_cb : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (snap_lba: u64) (generation: u64) (data_root_lba: u64) (parent_lba: u64) (cb_ctx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume PFS-07 (paideia-os#2574) TestSnapChainWalk callback. SysV args: rdi=snap_lba, rsi=generation, rdx=data_root_lba, rcx=parent_lba, r8=cb_ctx. (1) Load cb_count via lea r11,[rip+tcw_cb_count]; mov rax,[r11+0] -- rax = current count (also the slot index into the visit logs). (2) Log snap_lba: lea r10,[rip+tcw_visit_lba_log]; mov [r10+rax*8],rdi. (3) Log generation: lea r10,[rip+tcw_visit_gen_log]; mov [r10+rax*8],rsi. (4) Increment: add rax,1; mov [r11+0],rax (r11 still points to tcw_cb_count). (5) Abort check: lea r11,[rip+tcw_abort_on]; mov rcx,[r11+0]; cmp rcx,0; je tcw_cb_ok; cmp rax,rcx; jne tcw_cb_ok; mov rax,0xB099; ret. (6) OK path: xor rax,rax; ret. No test; no add reg,[mem]; immediates 0/0xB099 within imm32 bound. Labels prefixed tcw_cb_.",
+      block: {
+        // Load current cb_count into rax (= slot index for logs).
+        lea r11, [rip + tcw_cb_count];
+        mov rax, [r11 + 0];
+
+        // Log snap_lba.
+        lea r10, [rip + tcw_visit_lba_log];
+        mov [r10 + rax * 8], rdi;
+
+        // Log generation.
+        lea r10, [rip + tcw_visit_gen_log];
+        mov [r10 + rax * 8], rsi;
+
+        // cb_count += 1.
+        add rax, 1;
+        mov [r11 + 0], rax;
+
+        // Abort gate.
+        lea r11, [rip + tcw_abort_on];
+        mov rcx, [r11 + 0];
+        cmp rcx, 0;
+        je  tcw_cb_ok;
+        cmp rax, rcx;
+        jne tcw_cb_ok;
+
+        mov rax, 0xB099;
+        ret;
+
+      tcw_cb_ok:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // test_snap_chain_walk_run() -> u64
+  //
+  // Four flat case blocks (see module header for the matrix).
+  // Returns 0 on all-pass or the 1-based ordinal of the first
+  // failing case.
+  // ==========================================================================
+  pub let test_snap_chain_walk_run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume PFS-07 (paideia-os#2574) TestSnapChainWalk::run entry point. Drives four correctness cases over VolSnapshot::snap_chain_walk's real body. Each case: (1) reset .bss state (tcw_mode / tcw_cb_count / tcw_abort_on) via explicit scalar stores (visit logs don't need resetting since the per-case bounded verify loop only reads indices [0, cb_count)); (2) marshal SysV args rdi=root_snap_lba, rsi=&tcw_cb (via lea rip-rel -- same precedent as paideia-as hash_dispatch smoke test using lea rsi,[rip+handle_ls]), rdx=cb_ctx; (3) call snap_chain_walk; (4) assert rax == expected return; (5) assert tcw_cb_count == expected count; (6) for cases 1 and 3, verify tcw_visit_lba_log[0..N] against the expected chain order (and for case 1, tcw_visit_gen_log[0..3] against [1,2,3]). On any failure jump to tcw_cN_fail returning N (1..4); on all four passing fall through to xor rax,rax; ret. Immediates 100/200/300/128/0x0B02/0x0B03/0xB099/0x07000001..0x07000004 all fit imm32 sign-extend cleanly (every value below 0x7FFFFFFF); the integer `3` and `2` bounds for verify loops are staged via `mov rax,imm; cmp` only when the comparison is against a count (never against a sign-sensitive register in this driver). Cross-module `call snap_chain_walk;` uses the bare unqualified symbol per repo convention. No test mnemonic; no add reg,[mem]; no byte loads; no imul; label prefix tcw_.",
+      block: {
+        // ====================================================================
+        // Case 1: linear chain 100 -> 200 -> 300 (mode 1).
+        // Expected: rax == 3, cb_count == 3, log == [100,200,300].
+        // ====================================================================
+
+        // Reset state.
+        lea r11, [rip + tcw_mode];
+        mov rax, 1;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_cb_count];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_abort_on];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        // Call snap_chain_walk(100, &tcw_cb, 0x07000001).
+        mov rdi, 100;
+        lea rsi, [rip + tcw_cb];
+        mov rdx, 0x07000001;
+        call snap_chain_walk;
+
+        // Expect rax == 3.
+        cmp rax, 3;
+        jne tcw_c1_fail;
+
+        // Expect cb_count == 3.
+        lea r11, [rip + tcw_cb_count];
+        mov rax, [r11 + 0];
+        cmp rax, 3;
+        jne tcw_c1_fail;
+
+        // Expect visit_lba_log == [100, 200, 300].
+        lea r11, [rip + tcw_visit_lba_log];
+        mov rax, [r11 + 0];
+        cmp rax, 100;
+        jne tcw_c1_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 200;
+        jne tcw_c1_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 300;
+        jne tcw_c1_fail;
+
+        // Expect visit_gen_log == [1, 2, 3].
+        lea r11, [rip + tcw_visit_gen_log];
+        mov rax, [r11 + 0];
+        cmp rax, 1;
+        jne tcw_c1_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 2;
+        jne tcw_c1_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 3;
+        jne tcw_c1_fail;
+
+        // ====================================================================
+        // Case 2: bad-magic root (mode 2).
+        // Expected: rax == 0x0B02, cb_count == 0.
+        // ====================================================================
+
+        lea r11, [rip + tcw_mode];
+        mov rax, 2;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_cb_count];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_abort_on];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        mov rdi, 100;
+        lea rsi, [rip + tcw_cb];
+        mov rdx, 0x07000002;
+        call snap_chain_walk;
+
+        // Expect rax == 0x0B02.
+        mov rcx, 0x0B02;
+        cmp rax, rcx;
+        jne tcw_c2_fail;
+
+        // Expect cb_count == 0.
+        lea r11, [rip + tcw_cb_count];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne tcw_c2_fail;
+
+        // ====================================================================
+        // Case 3: callback aborts at step 2 (mode 1 + abort_on = 2).
+        // Expected: rax == 0xB099, cb_count == 2, log == [100, 200].
+        // ====================================================================
+
+        lea r11, [rip + tcw_mode];
+        mov rax, 1;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_cb_count];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_abort_on];
+        mov rax, 2;
+        mov [r11 + 0], rax;
+
+        mov rdi, 100;
+        lea rsi, [rip + tcw_cb];
+        mov rdx, 0x07000003;
+        call snap_chain_walk;
+
+        // Expect rax == 0xB099.
+        mov rcx, 0xB099;
+        cmp rax, rcx;
+        jne tcw_c3_fail;
+
+        // Expect cb_count == 2.
+        lea r11, [rip + tcw_cb_count];
+        mov rax, [r11 + 0];
+        cmp rax, 2;
+        jne tcw_c3_fail;
+
+        // Expect visit_lba_log[0..2] == [100, 200].
+        lea r11, [rip + tcw_visit_lba_log];
+        mov rax, [r11 + 0];
+        cmp rax, 100;
+        jne tcw_c3_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 200;
+        jne tcw_c3_fail;
+
+        // ====================================================================
+        // Case 4: walk-cap exceeded (mode 4, synthetic 129+-link chain).
+        // Expected: rax == 0x0B03, cb_count == 128.
+        // ====================================================================
+
+        lea r11, [rip + tcw_mode];
+        mov rax, 4;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_cb_count];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + tcw_abort_on];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        mov rdi, 100;
+        lea rsi, [rip + tcw_cb];
+        mov rdx, 0x07000004;
+        call snap_chain_walk;
+
+        // Expect rax == 0x0B03.
+        mov rcx, 0x0B03;
+        cmp rax, rcx;
+        jne tcw_c4_fail;
+
+        // Expect cb_count == 128.
+        lea r11, [rip + tcw_cb_count];
+        mov rax, [r11 + 0];
+        mov rcx, 128;
+        cmp rax, rcx;
+        jne tcw_c4_fail;
+
+        // All four cases passed.
+        xor rax, rax;
+        ret;
+
+      tcw_c1_fail:
+        mov rax, 1;
+        ret;
+
+      tcw_c2_fail:
+        mov rax, 2;
+        ret;
+
+      tcw_c3_fail:
+        mov rax, 3;
+        ret;
+
+      tcw_c4_fail:
+        mov rax, 4;
+        ret;
+      }
+    }
+}

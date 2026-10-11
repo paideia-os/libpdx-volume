@@ -1,7 +1,72 @@
 // src/vol_snapshot.pdx — libpdx-volume.M3-001 (#25) + M3-002 (#26)
+//                      + LV.M10 / PFS-07 (paideia-os#2574)
 // VolSnapshot: KIND_VOLUME_SNAPSHOT client-side scaffolding + a walker
 // over the on-disk snap-chain metadata records anchored at the
 // superblock's `snap_head` field.
+//
+// -----------------------------------------------------------------------------
+// PFS-07 (paideia-os#2574) -- real snap_chain_walk body
+// -----------------------------------------------------------------------------
+//
+// snap_chain_walk now has a real body with a new, simpler 3-arg
+// signature `(root_snap_lba, cb_ptr, cb_ctx) -> count | SnapErr`
+// (replacing the v1.1.0 5-arg stub `(volume_cap, snap_head_lba,
+// out_ptr, out_cap, out_count_ptr)` that returned
+// LPV_SNAP_ERR_NOT_IMPLEMENTED unconditionally). This is a BREAKING
+// change at the symbol level -- the one caller in the paideia-os
+// tree is `mount.pdxfs/src/snapshot_wire.pdx::snapshot_wire_list`,
+// which the mount.pdxfs CHANGELOG explicitly flagged as "reachable
+// only once snap_chain_walk gains a real body". Main must bump the
+// libpdx-volume submodule in paideia-os AND adapt that one caller
+// after this landing.
+//
+// The walker reads 4096-byte "snap-chain blocks" via an externally
+// provided block-read authority `lpv_bc_read(lba, out_ptr) -> u64`
+// (0 on success, non-zero on error). The intended real-world
+// provider is a thin shim over the KIND_BLOCK_CACHE cap's BC_OP_READ
+// op (paideia-os-side); tests substitute a .bss-backed virtual block
+// table (see `tests/test_snap_chain_walk.pdx`). This keeps the
+// library's own "zero cap-invoke syscalls in the own call graph"
+// discipline intact -- lpv_bc_read is an unresolved extern in this
+// file's own .o, resolved by whichever consumer links a real
+// block-cache shim (or a test harness) alongside this library's
+// vol_snapshot.pdx object.
+//
+// Snap-chain block on-disk shape (PFS-07, 4096 B / one page):
+//
+//   [+0]   magic:          u32   = 0x50445853  ('PDXS')
+//   [+8]   generation:     u64
+//   [+16]  parent_lba:     u64   (0 terminates the chain)
+//   [+24]  data_root_lba:  u64
+//
+// Only the first 32 bytes are inspected by the walker; the rest of
+// the 4096-byte block is reserved for a future per-snapshot payload
+// (quota deltas, retention metadata, invoker provenance) carried
+// off-page from the 96-byte snap-metadata record this module's
+// snap_record_parse continues to decode. The two layouts are
+// orthogonal: snap_record_parse operates on an in-memory record
+// buffer the caller supplies; snap_chain_walk pulls full blocks via
+// the external block-read authority and inspects a fixed-offset
+// header. A future consolidation that folds the 96-byte record into
+// the 4096-byte block header is a deliberate v2.x question.
+//
+// Return codes (band 0x0B00..0x0B0F, PFS-07):
+//
+//   LPV_SNAP_ERR_READ      = 0x0B01   -- lpv_bc_read returned non-zero
+//   LPV_SNAP_ERR_BAD_MAGIC = 0x0B02   -- block magic != 'PDXS'
+//   LPV_SNAP_ERR_WALK_CAP  = 0x0B03   -- 128 steps consumed without
+//                                        reaching parent_lba == 0
+//
+// Walk cap is a fail-closed 128 (same cap as mount_deps.pdx's
+// LPV_MDT_MAX_ROWS; keeps the walker bounded without a visited-set
+// scan).
+//
+// Note: this file's existing 0x0702/0x0703/0x0704 constants
+// (LPV_SNAP_ERR_BAD_MAGIC/_BAD_VERSION/_CHAIN_LOOP) remain in place
+// as they belong to snap_record_parse's own return surface. The
+// 0x0B0X band is DISTINCT from the 0x070X band so a caller can
+// discriminate "snap-chain block parse failure" from "snap-metadata
+// record parse failure".
 //
 // -----------------------------------------------------------------------------
 // KIND_VOLUME_SNAPSHOT -- kernel side does not exist yet
@@ -88,6 +153,17 @@ module VolSnapshot = structure {
   pub let LPV_SNAP_ERR_CHAIN_LOOP     : u64 = 0x0704
   pub let LPV_SNAP_ERR_BAD_OPS_MASK   : u64 = 0x0705
 
+  // PFS-07 (paideia-os#2574) snap-chain-walk return codes
+  // (band 0x0B00..0x0B0F). Deliberately NOT in the 0x0700 band so a
+  // caller can tell "block-read authority / snap-chain block layout
+  // failure" (walker) from "96-byte snap-metadata record parse
+  // failure" (snap_record_parse).
+  pub let LPV_SNAP_ERR_READ      : u64 = 0x0B01
+  pub let LPV_SNAP_ERR_BAD_MAGIC_SCB : u64 = 0x0B02
+  pub let LPV_SNAP_ERR_WALK_CAP  : u64 = 0x0B03
+  pub let LPV_SNAP_WALK_CAP_LIMIT : u64 = 128
+  pub let LPV_SNAP_CB_ABORT_RESERVED_BAND : u64 = 0x0B04
+
   // On-disk snap magic ('PDXS'). Fits imm32 sign-extend bound directly.
   pub let SNAP_MAGIC : u64 = 0x50445853
 
@@ -107,6 +183,27 @@ module VolSnapshot = structure {
   pub let SNAP_D_OFF_INVOKER_USER_LO   : u64 = 48
   pub let SNAP_D_OFF_INVOKER_USER_HI   : u64 = 56
   pub let SNAP_D_OFF_RETENTION_POLICY  : u64 = 64
+
+  // PFS-07 snap-chain-block on-disk offsets (4096 B / one page).
+  // Only the first 32 B are inspected by snap_chain_walk; the rest
+  // is reserved. See module header for the layout rationale.
+  pub let SCB_D_OFF_MAGIC         : u64 = 0
+  pub let SCB_D_OFF_GENERATION    : u64 = 8
+  pub let SCB_D_OFF_PARENT_LBA    : u64 = 16
+  pub let SCB_D_OFF_DATA_ROOT_LBA : u64 = 24
+  pub let SCB_BLOCK_BYTES         : u64 = 4096
+
+  // .bss scratch block the walker fills via lpv_bc_read at each step
+  // (single-writer, non-reentrant per this library's established
+  // .bss scratch discipline -- same shape as mount_deps.pdx's
+  // lpv_mdt_in_degree / lpv_mdt_queue).
+  pub let mut lpv_snap_scratch : [u8; 4096] = uninit @align(8)
+
+  // Scratch cache for parent_lba across the callback invocation
+  // (preserves parent_lba without pushing it onto the stack, which
+  // would misalign rsp relative to the SysV `call` alignment
+  // discipline -- see snap_chain_walk's own alignment commentary).
+  pub let mut lpv_snap_parent_cache : u64 = uninit @align(8)
 
   // Summary offsets (11 u64 slots, 88 bytes).
   pub let SNAP_OFF_MAGIC             : u64 = 0
@@ -286,26 +383,166 @@ module VolSnapshot = structure {
     }
 
   // ==========================================================================
-  // snap_chain_walk(volume_cap, snap_head_lba, out_ptr, out_cap, out_count_ptr)
-  //   -> u64
+  // snap_chain_walk(root_snap_lba, cb_ptr, cb_ctx) -> count | SnapErr
   //
-  // STUB at this landing. The walker needs to READ blocks from the
-  // volume (following each parsed record's `next_record_lba` field
-  // through to a 0 terminator), which requires either (a) an in-
-  // memory block cache the library can peek into, or (b) a
-  // caller-supplied read-block callback, or (c) cap-invoke through
-  // volume_cap -- none of which this library has established
-  // scaffolding for at v1.1.0. Returns LPV_SNAP_ERR_NOT_IMPLEMENTED.
+  // PFS-07 (paideia-os#2574). Walks the on-disk snap-chain linked
+  // list starting at `root_snap_lba`, following each block's
+  // parent_lba field until it reaches 0 or the 128-step walk cap
+  // fires. For each block it reads successfully, invokes the
+  // caller-supplied callback as
   //
-  // Signature is the final shape from the M3-002 issue brief so
-  // consumers can code against it today.
+  //     cb(snap_lba, generation, data_root_lba, parent_lba, cb_ctx)
+  //
+  // The callback's return is the walker's own return if nonzero
+  // (callback-triggered abort); zero means "continue". The callback
+  // MUST return values outside the 0x0B00..0x0B0F band to be cleanly
+  // discriminable from the walker's own error band -- callers
+  // instrumenting their callbacks with their own error codes should
+  // pick a different band entirely.
+  //
+  // Return (rax):
+  //   count (0..=128)         walk completed; count is the number of
+  //                           snapshots visited (parent_lba==0 reached
+  //                           OR callback-triggered abort with cb's
+  //                           return captured elsewhere -- see cb_abort
+  //                           semantics in the module header).
+  //   LPV_SNAP_ERR_READ       0x0B01 -- lpv_bc_read returned non-zero
+  //                                     for the current step's LBA
+  //   LPV_SNAP_ERR_BAD_MAGIC_SCB  0x0B02 -- block magic != 'PDXS'
+  //   LPV_SNAP_ERR_WALK_CAP   0x0B03 -- 128 steps consumed without
+  //                                     reaching parent_lba == 0
+  //   <cb's non-zero return>  callback aborted; its exact return
+  //                           flows through unchanged
+  //
+  // External symbol: `lpv_bc_read(lba, out_ptr) -> u64` is an
+  // unresolved extern in this file's .o. The intended real-world
+  // provider is a thin shim over KIND_BLOCK_CACHE's BC_OP_READ cap-
+  // invoke; tests substitute a mock implementation that fills
+  // out_ptr from a .bss virtual block table. See module header.
+  //
+  // Register plan:
+  //   rdi = root_snap_lba (SysV arg0)
+  //   rsi = cb_ptr        (SysV arg1)
+  //   rdx = cb_ctx        (SysV arg2)
+  //
+  //   r12 = current_lba (preserved across lpv_bc_read + cb calls)
+  //   r13 = count       (preserved)
+  //   r14 = cb_ptr      (preserved, for indirect `call r14`)
+  //   r15 = cb_ctx      (preserved, passed verbatim to cb)
+  //
+  // Alignment: SysV requires rsp % 16 == 0 at every call site (so
+  // the callee enters with rsp % 16 == 8). paideia-as auto-emits
+  // `push rbp; mov rbp, rsp` as the non-leaf prolog -- that single
+  // push realigns rsp to 0 relative to the entry rsp%16==8. The
+  // user-level 4 manual callee-save pushes (r12, r13, r14, r15)
+  // preserve that alignment (even push count), matching
+  // mount_deps.pdx's PFS-06 pattern. parent_lba is preserved
+  // across the callback via the .bss `lpv_snap_parent_cache`
+  // slot rather than a stack push (an odd push would misalign
+  // rsp for the cb's own call site).
+  //
+  // Encoder-pitfall discipline:
+  //   - 128 compared via `mov rax,128; cmp r13,rax; jae ...` (imm8
+  //     128 sign-extends to -128, as in mount_deps.pdx's own walk-cap
+  //     gate).
+  //   - 0x50445853 fits imm32 sign-extend bound (< 0x7FFFFFFF), so
+  //     `cmp rax, 0x50445853` is legal directly (same discipline as
+  //     snap_record_parse above).
+  //   - No `test`; no `add reg,[mem]`; every immediate compared
+  //     fits imm32 sign-extend cleanly (0, 128, 0x50445853,
+  //     0x0B01..0x0B03).
+  //   - Labels prefixed `scw_` (SnapChainWalk).
+  //   - `mov_d` for the 32-bit magic load; plain `mov` for u64 fields.
   // ==========================================================================
-  pub let snap_chain_walk : (u64, u64, u64, u64, u64) -> u64 !{} @{} =
-    fn (volume_cap: u64) (snap_head_lba: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-volume.M3-002 (#26): snap_chain_walk STUB. No block-read authority scaffolding yet at v1.1.0. Returns LPV_SNAP_ERR_NOT_IMPLEMENTED (0x0701) without touching any argument. Real body will iterate: parse record at snap_head_lba (via snap_record_parse over a read-block-into-buffer callback), follow next_record_lba until 0, cap at out_cap; loop-detection via a visited-set (either a small u64[16] scratch or by comparing next_record_lba against every previously-visited LBA in the loop). No labels; single path.",
+  pub let snap_chain_walk : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (root_snap_lba: u64) (cb_ptr: u64) (cb_ctx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume LV.M10 / PFS-07 (paideia-os#2574): snap_chain_walk real body. paideia-as auto-emits `push rbp; mov rbp, rsp` as the non-leaf prolog -- that single push realigns the entry rsp%16==8 to rsp%16==0 for the user-level body. 4 manual callee-save pushes (r12, r13, r14, r15) preserve that alignment (even push count), matching mount_deps.pdx's PFS-06 pattern. Setup: r12=rdi (current_lba), r13=0 (count), r14=rsi (cb_ptr), r15=rdx (cb_ctx). Loop body: (1) walk-cap gate `mov rax,128; cmp r13,rax; jae scw_err_cap` -- staged via rax because imm8 128 sign-extends to -128 (same guard mount_deps.pdx's PFS-06 body uses). (2) block read: `mov rdi,r12; lea rsi,[rip+lpv_snap_scratch]; call lpv_bc_read; cmp rax,0; jne scw_err_read`. (3) magic check: `lea r11,[rip+lpv_snap_scratch]; mov_d rax,[r11+0]; cmp rax,0x50445853; jne scw_err_magic` (SNAP_MAGIC fits imm32 bound, no staging). (4) cb-arg marshal + indirect call. r11 still points to scratch, so loads come directly from the on-disk layout offsets: `mov rdi,r12` (snap_lba), `mov rsi,[r11+8]` (generation), `mov rdx,[r11+24]` (data_root_lba), `mov rcx,[r11+16]` (parent_lba), `mov r8,r15` (cb_ctx). (5) save parent_lba to .bss cache (NOT the stack -- a single push would make rsp%16==8 at the next `call r14` and the SysV alignment contract would break): `lea r11,[rip+lpv_snap_parent_cache]; mov [r11+0],rcx`. (6) `call r14; cmp rax,0; jne scw_cb_abort`. (7) post-cb: `add r13,1; lea r11,[rip+lpv_snap_parent_cache]; mov r10,[r11+0]; cmp r10,0; je scw_done; mov r12,r10; jmp scw_loop`. Exit paths: scw_done loads rax=r13 (count) and jumps to scw_epilog; scw_err_cap/_read/_magic load their sentinel into rax and jump to scw_epilog; scw_cb_abort flows cb's rax through unchanged (just jumps to scw_epilog). scw_epilog pops r15/r14/r13/r12 (reverse order) and rets. External symbol `lpv_bc_read` is an unresolved extern in this .o; test files resolve it via their own mock, production consumers link a KIND_BLOCK_CACHE shim. No `test`; no `add reg,[mem]`; every immediate within imm32 bound; labels prefixed scw_. mov_d for the 32-bit magic load; plain mov for u64 fields.",
       block: {
-        mov rax, 0x0701;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                   // current_lba
+        xor r13, r13;                   // count = 0
+        mov r14, rsi;                   // cb_ptr
+        mov r15, rdx;                   // cb_ctx
+
+      scw_loop:
+        // Walk-cap gate: 128 steps max.
+        mov rax, 128;
+        cmp r13, rax;
+        jae scw_err_cap;
+
+        // Block read: lpv_bc_read(current_lba, &lpv_snap_scratch).
+        mov rdi, r12;
+        lea rsi, [rip + lpv_snap_scratch];
+        call lpv_bc_read;
+        cmp rax, 0;
+        jne scw_err_read;
+
+        // Magic check: scratch[0..4] == 'PDXS' (0x50445853).
+        lea r11, [rip + lpv_snap_scratch];
+        mov_d rax, [r11 + 0];
+        cmp rax, 0x50445853;
+        jne scw_err_magic;
+
+        // cb-arg marshal direct from scratch offsets (r11 still
+        // points to scratch): snap_lba from r12, generation at +8,
+        // data_root_lba at +24, parent_lba at +16, cb_ctx from r15.
+        mov rdi, r12;
+        mov rsi, [r11 + 8];
+        mov rdx, [r11 + 24];
+        mov rcx, [r11 + 16];
+        mov r8,  r15;
+
+        // Save parent_lba to .bss cache (avoid stack push to keep
+        // rsp%16==0 for the cb call site).
+        lea r11, [rip + lpv_snap_parent_cache];
+        mov [r11 + 0], rcx;
+
+        // Callback: cb(snap_lba, generation, data_root_lba,
+        //              parent_lba, cb_ctx).
+        call r14;
+        cmp rax, 0;
+        jne scw_cb_abort;
+
+        // Normal continue.
+        add r13, 1;
+        lea r11, [rip + lpv_snap_parent_cache];
+        mov r10, [r11 + 0];
+        cmp r10, 0;
+        je  scw_done;
+
+        mov r12, r10;
+        jmp scw_loop;
+
+      scw_done:
+        mov rax, r13;
+        jmp scw_epilog;
+
+      scw_err_cap:
+        mov rax, 0x0B03;
+        jmp scw_epilog;
+
+      scw_err_read:
+        mov rax, 0x0B01;
+        jmp scw_epilog;
+
+      scw_err_magic:
+        mov rax, 0x0B02;
+        jmp scw_epilog;
+
+      scw_cb_abort:
+        // rax already carries cb's non-zero return.
+        jmp scw_epilog;
+
+      scw_epilog:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
         ret;
       }
     }

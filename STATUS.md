@@ -1,20 +1,28 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** LV.M9 (v1.1.6 patch — PFS-06 /
-paideia-os#2573: real Kahn's-algorithm body for
-`mount_table_sort_by_deps`, closing M3-003 / LV.M6 follow-up).
+**Current milestone:** LV.M10 (v1.1.7 patch — PFS-07 /
+paideia-os#2574: real `snap_chain_walk` body + 4-case correctness
+matrix, closing M3-002 / LV.M3 follow-up on the snap-chain walker).
+LV.M9 (v1.1.6 patch — PFS-06 / paideia-os#2573: real Kahn's-algorithm
+body for `mount_table_sort_by_deps`, closing M3-003 / LV.M6 follow-up).
 LV.M8 (v1.1.2 patch — additive superblock setter accessors) landed.
 LV.M7 (v1.1.1 patch — quota input-contract + arithmetic-wrap guard)
 landed. LV.M6 (multivol ordering) landed (partial) at v1.1.0, full
 sort body at v1.1.6.
-**Version:** 1.1.6 (patch on v1.1.5: PFS-06 /
-paideia-os#2573 — replace `mount_table_sort_by_deps` identity-order
-stub with a real Kahn's-algorithm topological sort over 40-byte
-MountTableEntry summaries, two 128-slot `.bss` work arrays, new
-`LPV_ORDER_ERR_TOO_MANY_ROWS` / `LPV_MOUNT_SORT_FAIL` fail-closed
-sentinel at the fixed-size cap, new `tests/test_mount_sort.pdx`
-five-case correctness matrix).
+**Version:** 1.1.7 (patch on v1.1.6: PFS-07 /
+paideia-os#2574 — replace `snap_chain_walk` fail-closed stub with a
+real walker over parent-linked 4096-byte on-disk snap-chain blocks,
+new 3-arg signature `(root_snap_lba, cb_ptr, cb_ctx) -> count |
+SnapErr`, 128-step walk cap, external block-read authority
+`lpv_bc_read` as an unresolved extern resolved by a KIND_BLOCK_CACHE
+shim at production link time or a test mock at test-harness link
+time, new return-code band 0x0B00..0x0B0F for walker errors
+(`LPV_SNAP_ERR_READ`/`_BAD_MAGIC_SCB`/`_WALK_CAP`), new
+`tests/test_snap_chain_walk.pdx` four-case correctness matrix. One
+in-tree caller [`mount.pdxfs/src/snapshot_wire.pdx::snapshot_wire_
+list`] flagged for main-side adaptation in the same submodule-bump
+wave).
 **Version history:** 1.1.5 (patch on v1.1.4: R91-XREPO.M1 Phase D —
 surface `paideia-satellite-runtime`'s `PDX_MLDSA_ERR_NO_SIGNER = -6`
 fail-closed sentinel upward through `pdxb_sign_superblock` /
@@ -228,6 +236,46 @@ section; per-ticket landing state:
   - [x] **#26** — `snap_record_parse` real body (96-byte record decode);
         `snap_chain_walk` stub (blocked on block-read authority
         scaffolding). New file `src/vol_snapshot.pdx`.
+  - [x] **PFS-07 (paideia-os#2574)** — `snap_chain_walk` real body
+        (`src/vol_snapshot.pdx`). Replaces the v1.1.0 5-arg
+        fail-closed stub (`volume_cap, snap_head_lba, out_ptr,
+        out_cap, out_count_ptr`, returning `LPV_SNAP_ERR_NOT_
+        IMPLEMENTED`) with a new 3-arg signature
+        `(root_snap_lba, cb_ptr, cb_ctx) -> count | SnapErr` that
+        walks a parent-linked chain of 4096-byte on-disk "snap-chain
+        blocks" via an externally provided block-read authority
+        `lpv_bc_read(lba, out_ptr) -> u64` (unresolved extern,
+        resolved at consumer link time by either a real
+        KIND_BLOCK_CACHE shim or a test mock -- preserves the
+        library's established "zero cap-invoke syscalls in the own
+        call graph" discipline, see `caps.decl` closing note).
+        128-step walk cap, deliberately-distinct 0x0B00..0x0B0F
+        return-code band (`LPV_SNAP_ERR_READ` / `_BAD_MAGIC_SCB` /
+        `_WALK_CAP`) separating walker errors from the 0x0700 band
+        that belongs to `snap_record_parse`'s 96-byte record parser.
+        Snap-chain block layout (`SCB_D_OFF_*`) is orthogonal to
+        the 96-byte metadata record layout -- the two shapes
+        coexist; a future consolidation is a v2.x discussion. New
+        `.bss` scratch slots `lpv_snap_scratch` (4096 B per-step
+        block buffer) and `lpv_snap_parent_cache` (8 B,
+        parent_lba preservation across the callback invocation
+        without stack-pushing-and-misaligning rsp). New file
+        `tests/test_snap_chain_walk.pdx` -- four correctness cases
+        (linear chain of 3, bad-magic root, callback aborts at
+        step 2, walk-cap exceeded via a 129-link synthetic chain)
+        returning 0 on pass or 1..4 per the shared M4 return-code
+        convention (`tests/README.md`). Mock KIND_BLOCK_CACHE
+        substituted by the test file's own `lpv_bc_read` (mode-
+        driven synthesizer rather than materializing 128 full
+        4096-byte blocks in `.bss`). **Breaking at the symbol
+        level**: the one in-tree caller
+        `mount.pdxfs/src/snapshot_wire.pdx::snapshot_wire_list` is
+        flagged in `mount.pdxfs/CHANGELOG.md` as "reachable only
+        once snap_chain_walk gains a real body" -- main's wave-
+        closing commit in the paideia-os parent repo must bump
+        the libpdx-volume submodule AND adapt that one caller in
+        the same wave (or re-stub its passthrough until the new
+        signature is wired through).
 - **LV.M4 quotas (#27..#28)**
   - [x] **#27** — Per-subject quota row wire format + `pdxb_quota_
         row_parse` / `_row_encode` / `_table_lookup` real bodies.

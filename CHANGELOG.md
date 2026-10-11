@@ -1,5 +1,121 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.7 — 2026-10-11 (PFS-07 / paideia-os#2574: real snap_chain_walk body + 4-case correctness matrix)
+
+**Patch bump — the one caller in the paideia-os tree
+(`mount.pdxfs/src/snapshot_wire.pdx::snapshot_wire_list`) is
+explicitly flagged in `mount.pdxfs/CHANGELOG.md` as "reachable only
+once snap_chain_walk gains a real body". That body lands here with
+a new 3-arg signature replacing v1.1.0's 5-arg stub, so main must
+bump the libpdx-volume submodule in paideia-os AND adapt that one
+caller in the same wave.** Closes `paideia-os#2574` (PFS-07,
+chain-head wave PFS-W4).
+
+### Added
+
+- **`src/vol_snapshot.pdx`** —
+  `VolSnapshot::snap_chain_walk` real body with new 3-arg
+  signature `(root_snap_lba, cb_ptr, cb_ctx) -> count | SnapErr`.
+  Walks a parent-linked chain of 4096-byte on-disk "snap-chain
+  blocks" via an externally provided block-read authority
+  `lpv_bc_read(lba, out_ptr) -> u64`. Intended real-world provider
+  is a thin shim over KIND_BLOCK_CACHE's BC_OP_READ cap-invoke
+  (paideia-os-side); tests substitute a `.bss`-backed virtual
+  block table. 128-step walk cap guards against an unbounded
+  chain. Per-step: block read into `.bss` scratch, magic check
+  against 0x50445853 ('PDXS'), field decode (generation at +8,
+  parent_lba at +16, data_root_lba at +24), callback invocation
+  `cb(snap_lba, generation, data_root_lba, parent_lba, cb_ctx)`,
+  then follow parent_lba (0 terminates). cb's non-zero return
+  flows through unchanged as the walker's own return (callback-
+  triggered abort). Preserves the library's "zero cap-invoke
+  syscalls in the own call graph" discipline -- `lpv_bc_read`
+  remains an unresolved extern in this file's `.o`.
+- **`src/vol_snapshot.pdx`** — snap-chain-block on-disk offsets
+  (`SCB_D_OFF_MAGIC = 0`, `SCB_D_OFF_GENERATION = 8`,
+  `SCB_D_OFF_PARENT_LBA = 16`, `SCB_D_OFF_DATA_ROOT_LBA = 24`;
+  `SCB_BLOCK_BYTES = 4096`). Deliberately separate from the
+  existing 96-byte snap-metadata record layout
+  (`SNAP_D_OFF_*`): the two shapes are orthogonal (the record is
+  an in-memory decode buffer the caller supplies to
+  `snap_record_parse`; the block is a 4096-byte page the walker
+  pulls via the block-read authority).
+- **`src/vol_snapshot.pdx`** — new return-code band
+  0x0B00..0x0B0F for snap-chain-walk errors, deliberately
+  distinct from the 0x0700 band (which belongs to the 96-byte
+  record parser): `LPV_SNAP_ERR_READ = 0x0B01` (block-read
+  authority failure), `LPV_SNAP_ERR_BAD_MAGIC_SCB = 0x0B02`
+  (block magic != 'PDXS'), `LPV_SNAP_ERR_WALK_CAP = 0x0B03`
+  (128-step cap exceeded). `LPV_SNAP_WALK_CAP_LIMIT = 128`
+  constant documents the cap.
+  `LPV_SNAP_CB_ABORT_RESERVED_BAND = 0x0B04` documents the
+  convention that callbacks instrumenting their own abort codes
+  should pick values outside the 0x0B01..0x0B03 band so the
+  caller can discriminate "walker aborted" from "cb aborted".
+- **`src/vol_snapshot.pdx`** — two `.bss` scratch slots
+  (`lpv_snap_scratch`, 4096 B, the per-step block buffer;
+  `lpv_snap_parent_cache`, 8 B, preserves parent_lba across the
+  callback invocation without pushing it onto the stack and
+  misaligning rsp). Single-writer non-reentrant per this
+  library's established `.bss` scratch discipline (same shape as
+  `mount_deps.pdx`'s `lpv_mdt_in_degree` / `lpv_mdt_queue` and
+  `pdxb_crypto.pdx`'s `lpv_argon2_scratch`).
+- **`tests/test_snap_chain_walk.pdx`** (new file) —
+  `TestSnapChainWalk::test_snap_chain_walk_run()` four-case
+  correctness matrix:
+  (1) linear chain of 3 (`100 -> 200 -> 300 -> 0`); expect
+      `rax == 3` with cb logging `[100, 200, 300]` and generations
+      `[1, 2, 3]`.
+  (2) bad-magic root block (LBA 100 holds magic `0xDEADBEEF`);
+      expect `rax == LPV_SNAP_ERR_BAD_MAGIC_SCB` (0x0B02) with
+      `cb_count == 0`.
+  (3) callback aborts at step 2 (mode 1 chain + `tcw_abort_on=2`);
+      expect `rax == 0xB099` (cb's abort sentinel), `cb_count == 2`,
+      log `[100, 200]`.
+  (4) walk-cap exceeded (synthetic 129+-link chain via mode-4
+      mock: `parent = lba + 1`, never terminates); expect
+      `rax == LPV_SNAP_ERR_WALK_CAP` (0x0B03), `cb_count == 128`.
+  Mock KIND_BLOCK_CACHE substituted via test-local `lpv_bc_read`
+  (same symbol the walker's `.o` has as an unresolved extern;
+  mode-driven synthesis from `.bss`-backed state rather than
+  materializing 128 full 4096-byte blocks). Returns 0 on all-pass
+  or the 1-based ordinal of the first failing case per the shared
+  M4 return-code convention (`tests/README.md`).
+
+### Changed
+
+- **`src/vol_snapshot.pdx`** — module header rewritten to
+  document the PFS-07 landing: the new signature, the snap-chain
+  block on-disk layout, the external block-read authority
+  contract, the 0x0B00..0x0B0F return band, and the orthogonality
+  with the existing 96-byte snap-metadata record layout.
+
+### Breaking (symbol-level)
+
+- **`snap_chain_walk` signature changes from 5 args to 3 args.**
+  The one in-tree caller (`mount.pdxfs/src/snapshot_wire.pdx`)
+  was explicitly flagged in `mount.pdxfs/CHANGELOG.md` as being
+  reachable only once this body lands; main's wave-closing
+  commit in the paideia-os parent repo must bump the submodule
+  pointer AND adapt that caller (or re-stub its passthrough)
+  in the same wave. No other callers exist in the paideia-os
+  tree as of 2026-10-11.
+
+### Notes
+
+- Encoder-pitfall discipline: no `test rN,rN`; no `add reg,[mem]`;
+  no 2-op `imul reg,imm` (the test's `data_root = lba * 7`
+  synthesis uses 3-op `imul rax,rdi,7`, matching
+  `mount_table_snapshot.pdx`'s established 3-op stride compute);
+  no multiline `pub let =`; no reserved labels (`loop`/`if`/`let`;
+  all labels prefixed `scw_` or `tcw_`); 128 compared via
+  `mov rax,128; cmp rN,rax; jae ...` to sidestep imm8 sign-extend.
+- The walker is single-writer non-reentrant: a callback that
+  itself calls `snap_chain_walk` would corrupt
+  `lpv_snap_scratch` + `lpv_snap_parent_cache`. This matches the
+  library's established `.bss` scratch discipline; nested walks
+  are a v2.x discussion.
+
 ## 1.1.6 — 2026-10-11 (PFS-06 / paideia-os#2573: real Kahn's-algorithm body for mount_table_sort_by_deps)
 
 **Patch bump — additive constants + a real body replacing a
