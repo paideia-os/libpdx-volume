@@ -291,6 +291,27 @@ paideia-os tree so the smoke witness (#24) can run for real.
 Deferred to a future patch/minor release (see `CHANGELOG.md`'s semver
 policy):
 
+- **`pdxb_block_encrypt` / `pdxb_block_decrypt` real bodies —
+  DESIGN CONTRACT LANDED, implementation pending.** The paired-block
+  AEAD metadata layout the v1.1.0 M5-001 (#29) landing deferred is
+  now frozen in `design/pdxfs/block-crypto-contract.md` in the
+  paideia-os repo (PFS-W3 / PFS-05 wave, 2026-10-11, parent
+  `paideia-os/paideia-os#2572`). The contract fixes: (a) one DEK
+  per volume unwrapped from the superblock `wrapped_dek` slot at
+  mount; (b) 12-byte nonce = `volume_prefix[4] || LE_u64(blk_lba)`
+  under the pdxfs CoW invariant (§4.1); (c) paired-metadata layout
+  at the data-region tail — 1 metadata block per 128 data blocks,
+  32-byte records (nonce[12] || tag[16] || flags[1] || reserved[3]);
+  (d) three new superblock anchor slots at `sb+268/+276/+284` for
+  epoch counter + metadata region start + metadata block count,
+  all inside the signed range `[0, 696)`. Real-body follow-up is
+  filed as `paideia-os/paideia-os#2730` ([PFS-05-IMPL]); until it
+  lands the stub bodies at `src/pdxb_crypto.pdx` L363-381 stay
+  fail-closed returning `LPV_CRYPTO_ERR_NOT_IMPL = 0x0901` so no
+  caller can accidentally write plaintext to disk under a flag that
+  claims encryption. `design/architecture.md` §11.4's "paired-block
+  layout agreement" bullet moves from "pending" to "frozen upstream;
+  real-body ticket filed" with this landing.
 - **Dual-sign + mirror-push run.** Blocked on (a) the paideia-as
   toolchain reachable in CI, (b) the `pkgs.paideia-os` mirror endpoint
   standing (does not exist as of R53 close), and (c) a live
