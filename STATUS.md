@@ -1,22 +1,32 @@
 # libpdx-volume — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** LV.M8 (v1.1.2 patch — additive superblock
-setter accessors) — landed. LV.M7 (v1.1.1 patch — quota
-input-contract + arithmetic-wrap guard) landed. LV.M6 (multivol
-ordering) landed (partial) at v1.1.0.
-**Version:** 1.1.5 (patch on v1.1.4: R91-XREPO.M1 Phase D — surface
-`paideia-satellite-runtime`'s `PDX_MLDSA_ERR_NO_SIGNER = -6`
+**Current milestone:** LV.M9 (v1.1.6 patch — PFS-06 /
+paideia-os#2573: real Kahn's-algorithm body for
+`mount_table_sort_by_deps`, closing M3-003 / LV.M6 follow-up).
+LV.M8 (v1.1.2 patch — additive superblock setter accessors) landed.
+LV.M7 (v1.1.1 patch — quota input-contract + arithmetic-wrap guard)
+landed. LV.M6 (multivol ordering) landed (partial) at v1.1.0, full
+sort body at v1.1.6.
+**Version:** 1.1.6 (patch on v1.1.5: PFS-06 /
+paideia-os#2573 — replace `mount_table_sort_by_deps` identity-order
+stub with a real Kahn's-algorithm topological sort over 40-byte
+MountTableEntry summaries, two 128-slot `.bss` work arrays, new
+`LPV_ORDER_ERR_TOO_MANY_ROWS` / `LPV_MOUNT_SORT_FAIL` fail-closed
+sentinel at the fixed-size cap, new `tests/test_mount_sort.pdx`
+five-case correctness matrix).
+**Version history:** 1.1.5 (patch on v1.1.4: R91-XREPO.M1 Phase D —
+surface `paideia-satellite-runtime`'s `PDX_MLDSA_ERR_NO_SIGNER = -6`
 fail-closed sentinel upward through `pdxb_sign_superblock` /
 `pdxb_sign_inode_tail` as a distinct `PDXB_SIGN_ERR_NO_SIGNER`
-sentinel rather than swallowing it into the generic `PDXB_SIGN_ERR`).
-**Version history:** 1.1.4 (patch on v1.1.3: additive
+sentinel rather than swallowing it into the generic
+`PDXB_SIGN_ERR`); 1.1.4 (patch on v1.1.3: additive
 `--extra-archive PATH` flag on `tools/build.sh` for
 R91-XREPO.M1 Phase C uniform-invocation contract); 1.1.3 (patch on
 v1.1.2: closes issue #35 — test-`run` symbol rename); 1.1.2 (patch
 on v1.1.1: closes issue #34 in `src/pdxb_superblock.pdx`; release
 manifest scaffolded; dual-sign + mirror push deferred — see
-`release/RELEASE-1.0.0.md` §3, still applicable at 1.1.5)
+`release/RELEASE-1.0.0.md` §3, still applicable at 1.1.6)
 
 See `design/tooling/volume-tooling-ux.md` §9.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -241,6 +251,29 @@ section; per-ticket landing state:
         distinct `LPV_ORDER_ERR_NOT_IMPL` sentinel (blocked on
         mountall.pdxfs input-shape agreement). New file
         `src/mount_deps.pdx`.
+  - [x] **M3-003 / PFS-06 (paideia-os#2573)** —
+        `mount_table_sort_by_deps` real Kahn's-algorithm body
+        (`src/mount_deps.pdx`). Replaces the identity-order
+        `LPV_ORDER_ERR_NOT_IMPL` stub with an in-place topological
+        sort over 40-byte MountTableEntry summaries by the direct-
+        nested-mount edge `V.root_vnode_idx == M.mountpoint_vnode_idx`:
+        two 128-slot u64 `.bss` scratch arrays (`lpv_mdt_in_degree`,
+        `lpv_mdt_queue`) carry the in-degree table + FIFO ready-queue,
+        single-writer non-reentrant per this library's established
+        `.bss` scratch discipline (same as `pdxb_crypto.pdx`'s
+        `lpv_argon2_scratch`). New return codes:
+        `LPV_ORDER_ERR_TOO_MANY_ROWS` (0x0A05, fail-closed cap at 128
+        entries; also surfaced under the alias `LPV_MOUNT_SORT_FAIL`
+        preserving the PFS-06 sentinel-name contract) and the newly
+        reachable `LPV_ORDER_ERR_CYCLE` (0x0A01, cycle gate on
+        `emitted != entry_count`). `deps_ptr` / `deps_count` arguments
+        reserved for a future explicit-override caller plumbing deps
+        from `mount_deps_parse` output; current callers pass `(0, 0)`
+        and receive the pure-vnode-prefix sort. New file
+        `tests/test_mount_sort.pdx` -- five correctness cases (linear
+        chain, diamond, reversed-input chain, two-node cycle, empty
+        table) returning 0 on pass or 1..5 per the shared M4
+        return-code convention (see `tests/README.md`).
 
 ### LV.M7 — Phase-2 patch (v1.1.1, landed)
 

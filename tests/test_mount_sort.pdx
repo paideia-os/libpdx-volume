@@ -1,0 +1,385 @@
+// tests/test_mount_sort.pdx — libpdx-volume PFS-06 (paideia-os#2573)
+// TestMountSort: correctness matrix for the real Kahn's-algorithm body
+// landed at `MountDeps::mount_table_sort_by_deps`
+// (`src/mount_deps.pdx`).
+//
+// ================================================================
+// The fixture -- a 4-entry MountTableEntry[] + a 4-u64 output slot,
+// both in this file's own `.bss`
+// ================================================================
+//
+// `mount_table_sort_by_deps(entries_ptr, entry_count, deps_ptr,
+// deps_count, out_ordered_ptr)` consumes a packed array of 40-byte
+// MountTableEntry summaries (MTE_OFF_MOUNTPOINT_VNODE_IDX = 0,
+// MTE_OFF_ROOT_VNODE_IDX = 8; the other three fields --
+// backend_type, flags, _reserved -- are not consulted by the sort,
+// so this driver leaves them at their `.bss` zero-init value).
+//
+// Five cases drive the matrix:
+//
+//   Case 1 -- linear chain A -> B -> C (three entries, in-order). The
+//             edges are V.root == M.mountpoint pairs, chosen so a
+//             stable Kahn's seed walking the input in order emits
+//             exactly [0, 1, 2]. Expected: LPV_ORDER_OK + out ==
+//             [0, 1, 2].
+//
+//   Case 2 -- diamond A -> {B, C} -> D (four entries, in-order), with
+//             D directly nested under B via `B.root == D.mountpoint`
+//             and under A via the transitive A -> B -> D chain; C is
+//             a side branch under A. The deterministic FIFO seed +
+//             input-order enumeration emit [0, 1, 2, 3]. Expected:
+//             LPV_ORDER_OK + out == [0, 1, 2, 3].
+//
+//   Case 3 -- reversed-input chain [D, C, B, A] (the same chain
+//             A -> B -> C -> D as case 1 extended to four nodes, but
+//             with the entries presented in reverse). Expected:
+//             LPV_ORDER_OK + out == [3, 2, 1, 0] -- the sort must
+//             walk the chain back to its root regardless of input
+//             order.
+//
+//   Case 4 -- two-node cycle A <-> B (A.root == B.mountpoint AND
+//             B.root == A.mountpoint). Expected: return code equal
+//             to LPV_ORDER_ERR_CYCLE (0x0A01); out buffer not
+//             inspected (the sort may have written partial state
+//             before the cycle gate fired, which the function's
+//             contract permits).
+//
+//   Case 5 -- empty table (entry_count = 0). Expected: LPV_ORDER_OK
+//             with no entries written to out (the sort returns from
+//             its own empty-input early-exit before touching
+//             out_ordered_ptr).
+//
+// ================================================================
+// Return-code convention -- NOT a literal emit+exit pair
+// ================================================================
+//
+// This library has no console/print capability anywhere in `caps.
+// decl` (same discipline as every other M4 driver here -- see
+// `tests/README.md` and `test_mount_table_snapshot.pdx`'s own
+// return-code block for the full rationale). `run()` therefore
+// returns a `u64` status code:
+//
+//   0     -- all five cases passed.
+//   1..5  -- the 1-based ordinal of the first case that failed.
+//
+// A future consumer with a real print primitive maps the ordinal
+// back to a human-readable name via the case list above.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//
+//   - No `@no_frame` anywhere.
+//   - Cross-module `call mount_table_sort_by_deps;` uses the bare
+//     unqualified symbol (this repo's convention, see
+//     `test_pdxb_roundtrip.pdx`'s header for the full libpdx-audit
+//     precedent and the standalone-compilation rationale).
+//   - Immediates 10/20/30/40, 100/200/300/400, 160/32 and the status
+//     codes 0 / 0x0A01 all fit imm8 or imm32 sign-extend cleanly; the
+//     only staged compare is `cmp rsi, 128` inside the sort itself,
+//     not here.
+//   - `imul` not used in this driver (each per-entry store uses a
+//     literal offset like `[r11 + 40]` rather than a runtime-computed
+//     stride, so no multiply is needed).
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0` or
+//     `cmp reg, reg`.
+//   - No `add reg, [mem]`; every add is reg,reg or reg,imm.
+//   - No byte loads; every per-entry field read is a full qword mov.
+//   - No cross-case register preservation needed in `run()`: each
+//     case is a flat populate+call+verify block that stashes its
+//     result as a `jne tms_cN_fail` dispatch before the next case
+//     reuses any register.
+//   - Label prefix `tms_` (TestMountSort).
+//
+// Upstream: paideia-os#2573 (PFS-06 chain-head);
+// `src/mount_deps.pdx` (this repo, M6-001 + PFS-06);
+// `tests/README.md` (this repo, return-code convention).
+
+module TestMountSort = structure {
+
+  // --- Status-code echoes (duplicated from src/mount_deps.pdx per this
+  // repo's no-cross-module-constant-import convention). ---
+  pub let TMS_LPV_ORDER_OK            : u64 = 0
+  pub let TMS_LPV_ORDER_ERR_CYCLE     : u64 = 0x0A01
+
+  // --- .bss fixture + scratch. ---
+  // Max case: 4 entries * 40 bytes = 160 bytes = 20 qwords.
+  pub let mut tms_entries : [u8; 160] = uninit @align(8)
+  // Max output: 4 indices * 8 bytes = 32 bytes = 4 qwords.
+  pub let mut tms_out     : [u8; 32]  = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Five flat case blocks, each clearing the fixture, populating entries,
+  // invoking mount_table_sort_by_deps, and verifying the return code
+  // plus (for OK cases) the per-slot output. See module header for the
+  // case list and return-code convention.
+  // ==========================================================================
+  pub let test_mount_sort_run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-volume PFS-06 (paideia-os#2573) TestMountSort::run entry point. Drives five correctness cases over MountDeps::mount_table_sort_by_deps's real Kahn's body. Each case: (1) zero tms_entries (160 B = 20 qwords) and tms_out (32 B = 4 qwords) via bounded xor/store/add/cmp/jb loops; (2) populate per-case MountTableEntry summaries at tms_entries+i*40, writing only +0 (mountpoint_vnode_idx) and +8 (root_vnode_idx) since the other three fields are not consulted by the sort; (3) marshal SysV args rdi=&tms_entries, rsi=entry_count, rdx=0 (deps_ptr unused), rcx=0 (deps_count unused), r8=&tms_out, then call mount_table_sort_by_deps; (4) check return rax (OK for cases 1/2/3/5, LPV_ORDER_ERR_CYCLE=0x0A01 for case 4); (5) for OK cases, reload lea r11,[rip+tms_out] and verify each out[i] against its expected index via cmp. On any failure jump to tms_cN_fail returning N (1..5); on all five passing fall through to xor rax,rax; ret. Case data: case1 chain A(10->20)/B(20->30)/C(30->40) expects [0,1,2]; case2 diamond A(5->10)/B(10->20)/C(10->30)/D(20->40) expects [0,1,2,3]; case3 reversed chain D(30->40)/C(20->30)/B(10->20)/A(0->10) expects [3,2,1,0]; case4 cycle A(10->20)/B(20->10) expects LPV_ORDER_ERR_CYCLE; case5 empty (entry_count=0) expects OK. No cross-case register state; each case reloads r11 via lea rip-rel after the sort call clobbers caller-save regs. Cross-module call uses the bare unqualified symbol per repo convention. No test mnemonic; no add reg,[mem]; no byte loads; no imul; every immediate fits imm8 or imm32 sign-extend cleanly. Label prefix tms_.",
+      block: {
+        // ====================================================================
+        // Case 1: linear chain A -> B -> C.
+        // Entries [A=(10,20), B=(20,30), C=(30,40)].
+        // ====================================================================
+
+        // Clear tms_entries (20 qwords).
+        lea r11, [rip + tms_entries];
+        xor rax, rax;
+        xor rcx, rcx;
+      tms_c1_zero_e:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 20;
+        jb  tms_c1_zero_e;
+
+        // Clear tms_out (4 qwords).
+        lea r11, [rip + tms_out];
+        xor rcx, rcx;
+      tms_c1_zero_o:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tms_c1_zero_o;
+
+        // Populate entries.
+        lea r11, [rip + tms_entries];
+        mov rax, 10; mov [r11 + 0],  rax;    // A.mountpoint
+        mov rax, 20; mov [r11 + 8],  rax;    // A.root
+        mov rax, 20; mov [r11 + 40], rax;    // B.mountpoint
+        mov rax, 30; mov [r11 + 48], rax;    // B.root
+        mov rax, 30; mov [r11 + 80], rax;    // C.mountpoint
+        mov rax, 40; mov [r11 + 88], rax;    // C.root
+
+        // Call mount_table_sort_by_deps(&entries, 3, 0, 0, &out).
+        lea rdi, [rip + tms_entries];
+        mov rsi, 3;
+        mov rdx, 0;
+        mov rcx, 0;
+        lea r8,  [rip + tms_out];
+        call mount_table_sort_by_deps;
+        cmp rax, 0;
+        jne tms_c1_fail;
+
+        // Verify out == [0, 1, 2].
+        lea r11, [rip + tms_out];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne tms_c1_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 1;
+        jne tms_c1_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 2;
+        jne tms_c1_fail;
+
+        // ====================================================================
+        // Case 2: diamond A -> {B, C} -> D (D nested under B).
+        // Entries [A=(5,10), B=(10,20), C=(10,30), D=(20,40)].
+        // ====================================================================
+
+        lea r11, [rip + tms_entries];
+        xor rax, rax;
+        xor rcx, rcx;
+      tms_c2_zero_e:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 20;
+        jb  tms_c2_zero_e;
+
+        lea r11, [rip + tms_out];
+        xor rcx, rcx;
+      tms_c2_zero_o:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tms_c2_zero_o;
+
+        lea r11, [rip + tms_entries];
+        mov rax, 5;  mov [r11 +   0], rax;   // A.mountpoint
+        mov rax, 10; mov [r11 +   8], rax;   // A.root
+        mov rax, 10; mov [r11 +  40], rax;   // B.mountpoint
+        mov rax, 20; mov [r11 +  48], rax;   // B.root
+        mov rax, 10; mov [r11 +  80], rax;   // C.mountpoint
+        mov rax, 30; mov [r11 +  88], rax;   // C.root
+        mov rax, 20; mov [r11 + 120], rax;   // D.mountpoint
+        mov rax, 40; mov [r11 + 128], rax;   // D.root
+
+        lea rdi, [rip + tms_entries];
+        mov rsi, 4;
+        mov rdx, 0;
+        mov rcx, 0;
+        lea r8,  [rip + tms_out];
+        call mount_table_sort_by_deps;
+        cmp rax, 0;
+        jne tms_c2_fail;
+
+        lea r11, [rip + tms_out];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne tms_c2_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 1;
+        jne tms_c2_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 2;
+        jne tms_c2_fail;
+        mov rax, [r11 + 24];
+        cmp rax, 3;
+        jne tms_c2_fail;
+
+        // ====================================================================
+        // Case 3: reversed-input chain [D, C, B, A] of A -> B -> C -> D.
+        // Entries [D=(30,40), C=(20,30), B=(10,20), A=(0,10)].
+        // Expected out == [3, 2, 1, 0] (A first, then B, C, D).
+        // ====================================================================
+
+        lea r11, [rip + tms_entries];
+        xor rax, rax;
+        xor rcx, rcx;
+      tms_c3_zero_e:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 20;
+        jb  tms_c3_zero_e;
+
+        lea r11, [rip + tms_out];
+        xor rcx, rcx;
+      tms_c3_zero_o:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tms_c3_zero_o;
+
+        lea r11, [rip + tms_entries];
+        mov rax, 30; mov [r11 +   0], rax;   // entries[0] = D.mountpoint
+        mov rax, 40; mov [r11 +   8], rax;   // entries[0] = D.root
+        mov rax, 20; mov [r11 +  40], rax;   // entries[1] = C.mountpoint
+        mov rax, 30; mov [r11 +  48], rax;   // entries[1] = C.root
+        mov rax, 10; mov [r11 +  80], rax;   // entries[2] = B.mountpoint
+        mov rax, 20; mov [r11 +  88], rax;   // entries[2] = B.root
+        mov rax, 0;  mov [r11 + 120], rax;   // entries[3] = A.mountpoint
+        mov rax, 10; mov [r11 + 128], rax;   // entries[3] = A.root
+
+        lea rdi, [rip + tms_entries];
+        mov rsi, 4;
+        mov rdx, 0;
+        mov rcx, 0;
+        lea r8,  [rip + tms_out];
+        call mount_table_sort_by_deps;
+        cmp rax, 0;
+        jne tms_c3_fail;
+
+        lea r11, [rip + tms_out];
+        mov rax, [r11 + 0];
+        cmp rax, 3;
+        jne tms_c3_fail;
+        mov rax, [r11 + 8];
+        cmp rax, 2;
+        jne tms_c3_fail;
+        mov rax, [r11 + 16];
+        cmp rax, 1;
+        jne tms_c3_fail;
+        mov rax, [r11 + 24];
+        cmp rax, 0;
+        jne tms_c3_fail;
+
+        // ====================================================================
+        // Case 4: two-node cycle A <-> B.
+        // Entries [A=(10,20), B=(20,10)].
+        // Expected return LPV_ORDER_ERR_CYCLE (0x0A01); out not inspected.
+        // ====================================================================
+
+        lea r11, [rip + tms_entries];
+        xor rax, rax;
+        xor rcx, rcx;
+      tms_c4_zero_e:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 20;
+        jb  tms_c4_zero_e;
+
+        lea r11, [rip + tms_out];
+        xor rcx, rcx;
+      tms_c4_zero_o:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tms_c4_zero_o;
+
+        lea r11, [rip + tms_entries];
+        mov rax, 10; mov [r11 +  0], rax;    // A.mountpoint
+        mov rax, 20; mov [r11 +  8], rax;    // A.root
+        mov rax, 20; mov [r11 + 40], rax;    // B.mountpoint
+        mov rax, 10; mov [r11 + 48], rax;    // B.root
+
+        lea rdi, [rip + tms_entries];
+        mov rsi, 2;
+        mov rdx, 0;
+        mov rcx, 0;
+        lea r8,  [rip + tms_out];
+        call mount_table_sort_by_deps;
+        mov rcx, 0x0A01;
+        cmp rax, rcx;
+        jne tms_c4_fail;
+
+        // ====================================================================
+        // Case 5: empty table (entry_count = 0).
+        // Expected return LPV_ORDER_OK (0); out buffer untouched.
+        // ====================================================================
+
+        lea r11, [rip + tms_entries];
+        xor rax, rax;
+        xor rcx, rcx;
+      tms_c5_zero_e:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 20;
+        jb  tms_c5_zero_e;
+
+        lea r11, [rip + tms_out];
+        xor rcx, rcx;
+      tms_c5_zero_o:
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tms_c5_zero_o;
+
+        lea rdi, [rip + tms_entries];
+        mov rsi, 0;
+        mov rdx, 0;
+        mov rcx, 0;
+        lea r8,  [rip + tms_out];
+        call mount_table_sort_by_deps;
+        cmp rax, 0;
+        jne tms_c5_fail;
+
+        // All five cases passed.
+        xor rax, rax;
+        ret;
+
+      tms_c1_fail:
+        mov rax, 1;
+        ret;
+
+      tms_c2_fail:
+        mov rax, 2;
+        ret;
+
+      tms_c3_fail:
+        mov rax, 3;
+        ret;
+
+      tms_c4_fail:
+        mov rax, 4;
+        ret;
+
+      tms_c5_fail:
+        mov rax, 5;
+        ret;
+      }
+    }
+}

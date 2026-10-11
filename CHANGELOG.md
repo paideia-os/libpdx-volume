@@ -1,5 +1,71 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.6 — 2026-10-11 (PFS-06 / paideia-os#2573: real Kahn's-algorithm body for mount_table_sort_by_deps)
+
+**Patch bump — additive constants + a real body replacing a
+previously-stubbed fail-closed sentinel. Callers that already
+treated the stub's `LPV_ORDER_ERR_NOT_IMPL` return as "sort
+unavailable" and fell back to insertion order remain correct
+(the new real body returns `LPV_ORDER_OK` instead, with a valid
+topological order) and no byte-level API shape changes.** Closes
+`paideia-os#2573` (PFS-06, chain-head wave PFS-W3).
+
+### Added
+
+- **`src/mount_deps.pdx`** —
+  `MountDeps::mount_table_sort_by_deps` real body implementing
+  Kahn's algorithm over 40-byte `MountTableEntry` summaries
+  (`MTE_OFF_MOUNTPOINT_VNODE_IDX = 0`,
+  `MTE_OFF_ROOT_VNODE_IDX = 8`, as in
+  `src/mount_table_snapshot.pdx`). Dependency edge: entry V must
+  mount before entry M iff `V.root_vnode_idx ==
+  M.mountpoint_vnode_idx` -- the direct-nested-mount relation
+  the live `_mount_table[]` already carries. On a cycle (any
+  node unreachable from an in-degree-0 seed), returns
+  `LPV_ORDER_ERR_CYCLE` (0x0A01, previously unreachable from
+  the identity-order stub).
+- **`src/mount_deps.pdx`** — `LPV_ORDER_ERR_TOO_MANY_ROWS`
+  (0x0A05) fail-closed sentinel for inputs exceeding the
+  fixed-size work array's 128-row cap; `LPV_MOUNT_SORT_FAIL`
+  (0x0A05, numerically-identical alias) preserving the PFS-06
+  `MOUNT_SORT_FAIL` sentinel-name contract. `LPV_MDT_MAX_ROWS`
+  (128) public constant documenting the cap.
+- **`src/mount_deps.pdx`** — two 128-slot u64 `.bss` scratch
+  arrays `lpv_mdt_in_degree` and `lpv_mdt_queue` (1024 B each)
+  carrying the Kahn's in-degree table + FIFO ready-queue.
+  Single-writer non-reentrant per this library's established
+  `.bss` scratch discipline (same shape as
+  `pdxb_crypto.pdx`'s `lpv_argon2_scratch`).
+- **`tests/test_mount_sort.pdx`** (new file) --
+  `TestMountSort::test_mount_sort_run()` five-case correctness
+  matrix: (1) linear chain A → B → C in input order, (2)
+  diamond A → {B, C} → D with D nested under B, (3)
+  reversed-input chain [D, C, B, A], (4) two-node cycle
+  A ↔ B, (5) empty table. Returns 0 on all-pass or the 1-based
+  ordinal of the first failing case per the shared M4
+  return-code convention (`tests/README.md`).
+
+### Changed
+
+- **`src/mount_deps.pdx`** — module header updated to document
+  the real sort relation, the two `.bss` work arrays, the
+  fail-closed `LPV_MOUNT_SORT_FAIL` sentinel, and the
+  reserved-for-now `deps_ptr` / `deps_count` arguments (a future
+  caller plumbing explicit `mount-before` / `mount-after` /
+  `mount-requires` edges from `mount_deps_parse` output will
+  layer them on top of the pure vnode-prefix sort).
+
+### Notes
+
+- The sort is deterministic: Kahn's seeds its ready-queue in
+  input index order and dequeues FIFO, so a cycle-free run on
+  a chain presented in-order emits a stable identity ordering;
+  the five-case test matrix relies on this determinism rather
+  than accepting any valid topological order.
+- `deps_ptr` / `deps_count` arguments remain reserved: current
+  callers pass `(0, 0)` and get the pure-vnode-prefix sort;
+  no caller in the paideia-os tree consults them today.
+
 ## 1.1.5 — 2026-09-02 (R91-XREPO.M1 Phase D: surface satellite-runtime NO_SIGNER upward)
 
 **Patch bump — additive error-sentinel surfacing; every v1.1.4 API

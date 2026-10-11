@@ -1,7 +1,7 @@
-// src/mount_deps.pdx — libpdx-volume.M6-001 (#31)
+// src/mount_deps.pdx — libpdx-volume.M6-001 (#31) + PFS-06 (paideia-os#2573)
 // MountDeps: mount-dependency wire format + client-side codec + a
 // topological-sort helper (`mount_table_sort_by_deps`) implementing
-// Kahn's algorithm over a pending-mounts array with parsed dep lists.
+// Kahn's algorithm over a pending-mounts array.
 //
 // -----------------------------------------------------------------------------
 // Wire format (per-volume, in superblock _reserved region)
@@ -34,7 +34,7 @@
 // from the block base, and so on.
 //
 // -----------------------------------------------------------------------------
-// Topological sort -- Kahn's algorithm
+// Topological sort -- Kahn's algorithm (PFS-06, paideia-os#2573)
 // -----------------------------------------------------------------------------
 //
 // Kahn's algorithm walks the DAG by repeatedly emitting a node with
@@ -42,30 +42,46 @@
 // node. If any node remains after all resolvable nodes are emitted,
 // the graph has a cycle.
 //
-// Implementation shape (concrete for this library):
-//   in_degree[i] = number of "mount-after" deps for entry i
-//   ready_queue = FIFO of indices with in_degree[i] == 0
+// Dependency relation at this landing: entry V must mount BEFORE
+// entry M iff `V.root_vnode_idx == M.mountpoint_vnode_idx` -- that is,
+// M is being mounted AT the vnode V is currently serving as its own
+// root. This is the direct-nested-mount relation the live
+// `_mount_table[]` carries (MTE_OFF_MOUNTPOINT_VNODE_IDX /
+// MTE_OFF_ROOT_VNODE_IDX in `src/mount_table_snapshot.pdx`); the
+// 40-byte MountTableEntry summary is the input shape this function
+// consumes verbatim.
+//
+// deps_ptr / deps_count arguments are RESERVED at this landing: a
+// future caller that has already parsed its superblock's dep-list
+// block via `mount_deps_parse` and wants to layer explicit
+// mount-before / mount-after / mount-requires edges on top of the
+// pure vnode-prefix relation will plumb them through here. Current
+// callers pass `(0, 0)` and get the pure-vnode-based sort.
+//
+// Implementation (concrete):
+//   in_degree[i] = count of entries V such that V.root_vnode_idx ==
+//                  entries[i].mountpoint_vnode_idx (V != i)
+//   ready_queue  = FIFO of indices with in_degree[k] == 0, seeded in
+//                  input order so a cycle-free run on a chain
+//                  presented in-order is a stable identity emit.
 //   while ready_queue not empty:
-//     emit ready_queue.pop()
-//     for each edge (emitted -> other):
-//       in_degree[other] -= 1
-//       if in_degree[other] == 0: ready_queue.push(other)
+//     cur = ready_queue.pop_front()
+//     emit cur
+//     for each j where entries[cur].root_vnode_idx ==
+//                       entries[j].mountpoint_vnode_idx (j != cur):
+//       in_degree[j] -= 1
+//       if in_degree[j] == 0: ready_queue.push_back(j)
 //   if emitted_count != entry_count: LPV_ORDER_ERR_CYCLE
 //
-// STUB body at this landing: the FULL sort with in-degree counters +
-// FIFO ring + edge matrix walking is a substantial chunk of code (100+
-// instructions) and depends on decisions about the caller's dep-list
-// storage format (parsed vs on-disk) that aren't nailed down until
-// mountall.pdxfs (the future proposed consumer) actually starts
-// building against it. The parser gets a real body; the sort helper
-// gets a fail-closed stub returning LPV_ORDER_OK (0) for entry_count
-// == 0 and LPV_ORDER_ERR_CYCLE for anything else -- so a caller
-// walking a nonempty pending-mounts list sees a clear "sort refused,
-// use insertion order" signal rather than silently accepting an
-// unordered walk.
-//
-// Follow-up filed against this repo for the full sort body once
-// mountall.pdxfs's exact input shape is agreed.
+// Work-storage: two 128-slot u64 .bss scratch arrays
+// (`lpv_mdt_in_degree`, `lpv_mdt_queue`), matching the single-writer
+// non-reentrant .bss discipline every other scratch surface in this
+// library already follows (see `src/pdxb_crypto.pdx` module header on
+// `lpv_argon2_scratch`). Fail-closed cap: `entry_count > 128` returns
+// `LPV_ORDER_ERR_TOO_MANY_ROWS` without touching the output buffer,
+// preserving the `MOUNT_SORT_FAIL` sentinel contract for malformed
+// (over-cap) inputs. Empty input (`entry_count == 0`) returns
+// `LPV_ORDER_OK` as the identity sort of an empty list.
 //
 // -----------------------------------------------------------------------------
 // paideia-as encoder notes
@@ -73,10 +89,22 @@
 //
 //   - PDDP magic (0x50444450) fits imm32 sign-extend bound.
 //   - Same u16-in-u32-word decode idiom as vol_snapshot.pdx.
+//   - 3-op `imul rN, rM, 40` for the 40-byte MTE_SUMMARY_BYTES stride,
+//     proven at `mount_table_snapshot.pdx` M2-003 (same imm).
+//   - All `cmp reg, 0` zero-checks (no `test rN, rN` 2-op form).
+//   - No `add reg, [mem]`: every add is reg,reg or reg,imm.
+//   - No byte loads anywhere -- every per-entry field read is a full
+//     qword `mov reg, [mem]`.
+//   - No `and r11, imm64` -- the only AND form here (`and r10, 0xFFFF`
+//     in `mount_deps_parse`) fits imm16/imm32 sign-extend cleanly.
+//   - 128-row cap: `mov rax, 128; cmp rsi, rax; ja too_many` -- staged
+//     via rax rather than `cmp rsi, 128` because 128 as i8 sign-
+//     extends to -128 which trips the i8 immediate guard.
 //   - Label prefixes: `lpv_mdp_` (parse), `lpv_mdt_` (topo sort).
 //
 // Upstream: design/tooling/volume-tooling-ux.md §9.4 (libpdx-volume#31);
-// design/architecture.md §<new-section-mount-deps> (this repo).
+// paideia-os#2573 (PFS-06 chain-head: real Kahn's body);
+// design/architecture.md §<mount-deps> (this repo).
 
 module MountDeps = structure {
 
@@ -99,14 +127,35 @@ module MountDeps = structure {
   pub let MDEP_KIND_MOUNT_REQUIRES : u64 = 2
 
   // Status codes (band 0x0A00).
-  pub let LPV_ORDER_OK              : u64 = 0
-  pub let LPV_ORDER_ERR_CYCLE       : u64 = 0x0A01
-  pub let LPV_ORDER_ERR_BAD_MAGIC   : u64 = 0x0A02
+  pub let LPV_ORDER_OK                : u64 = 0
+  pub let LPV_ORDER_ERR_CYCLE         : u64 = 0x0A01
+  pub let LPV_ORDER_ERR_BAD_MAGIC     : u64 = 0x0A02
   pub let LPV_ORDER_ERR_CAP_TOO_SMALL : u64 = 0x0A03
-  pub let LPV_ORDER_ERR_NOT_IMPL    : u64 = 0x0A04
+  pub let LPV_ORDER_ERR_NOT_IMPL      : u64 = 0x0A04
+  pub let LPV_ORDER_ERR_TOO_MANY_ROWS : u64 = 0x0A05
+
+  // Fail-closed sentinel for malformed-input over-cap entry_count --
+  // numerically identical to LPV_ORDER_ERR_TOO_MANY_ROWS; this alias
+  // preserves the `MOUNT_SORT_FAIL` naming the PFS-06 contract calls
+  // out while callers using the specific over-cap code remain
+  // byte-identical.
+  pub let LPV_MOUNT_SORT_FAIL         : u64 = 0x0A05
+
+  // Fixed-size work-array cap for the Kahn's scratch buffers below.
+  pub let LPV_MDT_MAX_ROWS            : u64 = 128
 
   // Summary sizes.
   pub let MDEP_SUMMARY_BYTES : u64 = 128   // one per-dep entry summary
+
+  // --- .bss scratch for the topological-sort body. See the module
+  // header's "Work-storage" note for the single-writer non-reentrant
+  // discipline this library's other .bss scratch surfaces also use. ---
+  //
+  // 128 * 8 bytes = 1024 bytes per array. Both are read + written
+  // only from inside `mount_table_sort_by_deps` and have no stable
+  // post-call contract -- callers must not inspect them.
+  pub let mut lpv_mdt_in_degree : [u8; 1024] = uninit @align(8)
+  pub let mut lpv_mdt_queue     : [u8; 1024] = uninit @align(8)
 
   // ==========================================================================
   // mount_deps_parse(block_ptr, out_ptr, out_cap, out_count_ptr) -> u64
@@ -177,31 +226,196 @@ module MountDeps = structure {
   // mount_table_sort_by_deps(entries_ptr, entry_count, deps_ptr,
   //                          deps_count, out_ordered_ptr) -> u64
   //
-  // Topological sort of `entries_ptr[0..entry_count)` by dependency
-  // edges from `deps_ptr[0..deps_count)`. Writes the ordered indices
-  // (u64 each, entry_count of them) to `out_ordered_ptr`.
+  // Topological sort of `entries_ptr[0..entry_count)` (40-byte
+  // MountTableEntry summaries, MTE_OFF_MOUNTPOINT_VNODE_IDX=0 and
+  // MTE_OFF_ROOT_VNODE_IDX=8) by the direct-nested-mount edge
+  // `V.root == M.mountpoint`. Writes `entry_count` u64 indices (in
+  // topological order) to `out_ordered_ptr`.
   //
-  // STUB at this landing (see module header rationale). Special-cases
-  // entry_count == 0 as LPV_ORDER_OK (trivial identity sort of an
-  // empty list). Every other input returns LPV_ORDER_ERR_NOT_IMPL --
-  // the sentinel is DIFFERENT from LPV_ORDER_ERR_CYCLE so a caller
-  // can distinguish "algorithm not yet landed" from "your graph has
-  // a cycle". Follow-up filed for the full Kahn's-algorithm body
-  // once mountall.pdxfs's input shape is agreed.
+  // deps_ptr / deps_count are reserved at this landing: see module
+  // header for the explicit-override plumbing a future caller can use.
+  //
+  // Returns:
+  //   LPV_ORDER_OK (0)                       -- sort succeeded; entry_count
+  //                                             indices written to out
+  //   LPV_ORDER_ERR_CYCLE (0x0A01)           -- cycle detected, no edge
+  //                                             resolution possible
+  //   LPV_ORDER_ERR_TOO_MANY_ROWS (0x0A05)   -- entry_count > 128; out
+  //                                             untouched (also surfaced
+  //                                             as LPV_MOUNT_SORT_FAIL)
   // ==========================================================================
   pub let mount_table_sort_by_deps : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (entries_ptr: u64) (entry_count: u64) (deps_ptr: u64) (deps_count: u64) (out_ordered_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-volume.M6-001 (#31): mount_table_sort_by_deps STUB. entry_count == 0: identity sort of empty list, return LPV_ORDER_OK. Else: LPV_ORDER_ERR_NOT_IMPL (0x0A04) -- distinct from LPV_ORDER_ERR_CYCLE (0x0A01) so a caller can tell 'algorithm pending' from 'real cycle detected'. Real body will implement Kahn's algorithm: in_degree[i] from mount-after deps, ready-FIFO seeded with in_degree==0 nodes, emit-and-decrement loop; on premature termination (emitted < entry_count) return LPV_ORDER_ERR_CYCLE. Labels prefixed lpv_mdt_.",
+      justification: "libpdx-volume PFS-06 (paideia-os#2573): mount_table_sort_by_deps real body implementing Kahn's algorithm over 40-byte MountTableEntry summaries (MTE_OFF_MOUNTPOINT_VNODE_IDX=0, MTE_OFF_ROOT_VNODE_IDX=8). Edge V->M iff V.root == M.mountpoint. Register plan: rdi=entries_ptr, rsi=entry_count, rdx=deps_ptr (reserved, unused), rcx=deps_count (reserved, unused), r8=out_ordered_ptr. Step 0: cmp rsi,0; je empty_ok (identity sort of empty list, LPV_ORDER_OK). Step 1: mov rax,128; cmp rsi,rax; ja too_many (fail-closed LPV_ORDER_ERR_TOO_MANY_ROWS / LPV_MOUNT_SORT_FAIL for over-cap input). After the two early-exit gates, preserve r12..r15 via push, then r12=entries_ptr, r13=entry_count, r14=out_ordered_ptr, r15=&lpv_mdt_in_degree (via lea rip-rel). Step 2: zero lpv_mdt_in_degree[0..entry_count] via bounded xor/store/add/cmp/jb loop; lpv_mdt_queue is overwritten unconditionally by Step 4's seed loop so needs no zero pass. Step 3 (in-degree compute): nested loop i=0..entry_count (r8) outer, j=0..entry_count (r9) inner; skip i==j; r10=&entries[i] via 3-op imul r10,r8,40 then add r10,r12; rdx=entries[i].root at [r10+8]; r11=&entries[j]; rax=entries[j].mountpoint at [r11+0]; if rax==rdx increment in_degree[j] via mov/add/mov to [r15+r9*8]. Step 4 (seed): lea rdi,[rip+lpv_mdt_queue]; xor r11,r11 (queue_tail); walk k=0..entry_count; if in_degree[k]==0 push k into queue (mov [rdi+r11*8],r9; add r11,1). Step 5 (Kahn's main loop): r10=queue_head, rsi=emitted; while queue_head<queue_tail: cur=queue[queue_head++] into r8, mov [r14+rsi*8],r8 to emit, add rsi,1; compute root_cur=entries[cur].root at [rcx+8] where rcx=&entries[cur] via imul rcx,r8,40 then add rcx,r12; walk j=0..entry_count, skip j==cur, load mountpoint_j from entries[j]; on match, decrement in_degree[j] via mov/sub/mov to [r15+r9*8], if the decrement reached 0 push j into queue at tail. Step 6 (cycle gate): cmp rsi,r13; jne cycle (LPV_ORDER_ERR_CYCLE). Success path pops r15/r14/r13/r12 and returns LPV_ORDER_OK; cycle path pops the same four and returns 0x0A01. empty_ok/too_many paths return directly without touching the preserved regs (push happens only after both early exits). Every imul form is 3-op reg,reg,imm with imm=40 (same stride proven at mount_table_snapshot.pdx M2-003). Zero-checks are cmp reg,0; no `test` mnemonic. No `add reg,[mem]`; every add is reg,reg or reg,imm. No byte loads; every MountTableEntry field read is a full qword mov. Immediates 128/0x0A01/0x0A05 all fit imm32 sign-extend cleanly; 128 is staged via mov rax,128 for the cmp since its i8 encoding sign-extends to -128 (trip-guard-safe). r12..r15 preserved via push/pop pairs (4 pushes = 32 bytes = 16-byte-alignment-preserving relative to the return address). Scratch is lpv_mdt_in_degree + lpv_mdt_queue (two .bss u64[128] arrays), single-writer non-reentrant per this library's established scratch discipline. Labels prefixed lpv_mdt_.",
       block: {
+        // ---- Step 0: empty table -> identity sort of empty list. ----
         cmp rsi, 0;
-        jne lpv_mdt_notimpl;
+        je  lpv_mdt_empty_ok;
 
-        xor rax, rax;                    // LPV_ORDER_OK (empty list)
+        // ---- Step 1: entry_count > LPV_MDT_MAX_ROWS (128) -> fail-closed. ----
+        mov rax, 128;
+        cmp rsi, rax;
+        ja  lpv_mdt_too_many;
+
+        // ---- Preserve callee-save regs we need across the whole body. ----
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // r12 = entries_ptr, r13 = entry_count, r14 = out_ordered_ptr.
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, r8;
+
+        // r15 = &lpv_mdt_in_degree.
+        lea r15, [rip + lpv_mdt_in_degree];
+
+        // ---- Step 2: Zero lpv_mdt_in_degree[0..entry_count]. ----
+        xor rax, rax;
+        xor r9, r9;
+      lpv_mdt_zero_id:
+        cmp r9, r13;
+        jae lpv_mdt_zero_id_done;
+        mov [r15 + r9 * 8], rax;
+        add r9, 1;
+        jmp lpv_mdt_zero_id;
+      lpv_mdt_zero_id_done:
+
+        // ---- Step 3: Compute in-degree over all (i, j) pairs. ----
+        xor r8, r8;                      // i = 0
+      lpv_mdt_indeg_outer:
+        cmp r8, r13;
+        jae lpv_mdt_indeg_done;
+
+        imul r10, r8, 40;                // entry_i_offset
+        add r10, r12;                    // r10 = &entries[i]
+        mov rdx, [r10 + 8];              // rdx = entries[i].root_vnode_idx
+
+        xor r9, r9;                      // j = 0
+      lpv_mdt_indeg_inner:
+        cmp r9, r13;
+        jae lpv_mdt_indeg_inner_done;
+
+        cmp r9, r8;
+        je  lpv_mdt_indeg_skip;
+
+        imul r11, r9, 40;
+        add r11, r12;                    // r11 = &entries[j]
+        mov rax, [r11 + 0];              // rax = entries[j].mountpoint_vnode_idx
+        cmp rax, rdx;
+        jne lpv_mdt_indeg_skip;
+
+        // Edge i -> j: increment in_degree[j].
+        mov rax, [r15 + r9 * 8];
+        add rax, 1;
+        mov [r15 + r9 * 8], rax;
+
+      lpv_mdt_indeg_skip:
+        add r9, 1;
+        jmp lpv_mdt_indeg_inner;
+      lpv_mdt_indeg_inner_done:
+        add r8, 1;
+        jmp lpv_mdt_indeg_outer;
+      lpv_mdt_indeg_done:
+
+        // ---- Step 4: Seed queue with in_degree-zero nodes (input order). ----
+        lea rdi, [rip + lpv_mdt_queue];  // rdi = &queue
+        xor r11, r11;                    // queue_tail = 0
+        xor r9, r9;                      // k = 0
+      lpv_mdt_seed_loop:
+        cmp r9, r13;
+        jae lpv_mdt_seed_done;
+        mov rax, [r15 + r9 * 8];
+        cmp rax, 0;
+        jne lpv_mdt_seed_skip;
+        mov [rdi + r11 * 8], r9;
+        add r11, 1;
+      lpv_mdt_seed_skip:
+        add r9, 1;
+        jmp lpv_mdt_seed_loop;
+      lpv_mdt_seed_done:
+
+        // ---- Step 5: Kahn's main loop. ----
+        // r10 = queue_head, rsi = emitted, r11 = queue_tail.
+        xor r10, r10;
+        xor rsi, rsi;
+      lpv_mdt_kahn_outer:
+        cmp r10, r11;
+        jae lpv_mdt_kahn_done;
+
+        // cur = queue[queue_head]; queue_head++.
+        mov r8, [rdi + r10 * 8];
+        add r10, 1;
+
+        // out_ordered[emitted] = cur; emitted++.
+        mov [r14 + rsi * 8], r8;
+        add rsi, 1;
+
+        // root_cur = entries[cur].root_vnode_idx.
+        imul rcx, r8, 40;
+        add rcx, r12;
+        mov rdx, [rcx + 8];
+
+        xor r9, r9;                      // j = 0
+      lpv_mdt_kahn_inner:
+        cmp r9, r13;
+        jae lpv_mdt_kahn_inner_done;
+
+        cmp r9, r8;
+        je  lpv_mdt_kahn_skip;
+
+        imul rcx, r9, 40;
+        add rcx, r12;
+        mov rax, [rcx + 0];              // rax = entries[j].mountpoint_vnode_idx
+        cmp rax, rdx;
+        jne lpv_mdt_kahn_skip;
+
+        // Edge cur -> j: decrement in_degree[j].
+        mov rax, [r15 + r9 * 8];
+        sub rax, 1;
+        mov [r15 + r9 * 8], rax;
+        cmp rax, 0;
+        jne lpv_mdt_kahn_skip;
+
+        // in_degree[j] just reached 0; push j into the queue.
+        mov [rdi + r11 * 8], r9;
+        add r11, 1;
+
+      lpv_mdt_kahn_skip:
+        add r9, 1;
+        jmp lpv_mdt_kahn_inner;
+      lpv_mdt_kahn_inner_done:
+        jmp lpv_mdt_kahn_outer;
+      lpv_mdt_kahn_done:
+
+        // ---- Step 6: Cycle gate (emitted != entry_count -> CYCLE). ----
+        cmp rsi, r13;
+        jne lpv_mdt_cycle;
+
+        // ---- Success. ----
+        xor rax, rax;                    // LPV_ORDER_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
         ret;
 
-      lpv_mdt_notimpl:
-        mov rax, 0x0A04;                 // LPV_ORDER_ERR_NOT_IMPL
+      lpv_mdt_cycle:
+        mov rax, 0x0A01;                 // LPV_ORDER_ERR_CYCLE
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      lpv_mdt_empty_ok:
+        xor rax, rax;                    // LPV_ORDER_OK
+        ret;
+
+      lpv_mdt_too_many:
+        mov rax, 0x0A05;                 // LPV_ORDER_ERR_TOO_MANY_ROWS / LPV_MOUNT_SORT_FAIL
         ret;
       }
     }
