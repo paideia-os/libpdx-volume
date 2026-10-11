@@ -1,4 +1,5 @@
 // src/vol_kind.pdx — libpdx-volume.M1-001 (scaffold) + M2-004 (#6)
+//                   + PFS-09 (paideia-os#2576)
 // VolKind: client-side KIND_VOLUME mint/narrow helpers.
 //
 // Two entry points, matching design/tooling/volume-tooling-ux.md §2.4
@@ -6,18 +7,17 @@
 // match this library's out-pointer + status-code convention -- see
 // below):
 //
-//   vol_kind_mint(dev_cap) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
+//   vol_kind_mint(dev_cap) -> Cap<KIND_VOLUME> | LPV_MINT_ERR_*
 //   vol_kind_narrow(cap_slot, requested_ops_mask, out_narrowed_cap_slot) -> u64
 //
 // `vol_kind_mint` is the client-side helper `mount.pdxfs` calls when a
 // probed KIND_BLOCK_DEVICE has a valid PDXB superblock but no
-// KIND_VOLUME was minted for it at boot (the hot-plug case). It calls
-// through to the kernel's own KIND_VOLUME mint primitive
-// (src/kernel/core/cap/kind_volume.pdx in paideia-os; that file's own
-// SECTION 0 documents the derivation gate: parent.kind == KIND_MEMORY
-// (4) AND rights carry RIGHT_MINT (0x200), mirrored by KIND_VOLUME's
-// own kind_volume_mint entry point, name not yet re-exported through a
-// syscall this library can reach).
+// KIND_VOLUME was minted for it at boot (the hot-plug case). PFS-09
+// LANDED THE REAL BODY: it marshals a 64-byte VolumeDescriptor into
+// `_lpv_vk_desc_scratch`, issues sys_vol_mint (sysno 135, see
+// design/pdxfs/sys-vol-mint-abi.md and
+// src/kernel/core/syscall/sys_vol_mint_body.pdx in paideia-os), and
+// unpacks the (cap_handle << 2) | status return.
 //
 // `vol_kind_narrow` narrows an already-held KIND_VOLUME cap to a
 // subset of ops before handing it to a syscall (`mount.pdxfs` narrows
@@ -27,13 +27,22 @@
 // ================================================================
 // M1 landing: BOTH functions were placeholder stubs.
 //
-// M2-004 landing (this file): `vol_kind_narrow` now has a real body.
-// `vol_kind_mint` remains a stub -- it is not itemised as its own M2
-// issue in volume-tooling-ux.md §9.4 (flagged in design/architecture.md
-// §5) and is additionally blocked on KIND_VOLUME exposing a ring-3-
-// reachable mint syscall, which does not exist today ("No cap-invoke
-// op that reaches kind_volume_mint" per kind_volume.pdx's own
-// SECTION 0).
+// M2-004 landing: `vol_kind_narrow` real body.
+//
+// PFS-09 landing (this file): `vol_kind_mint` real body.
+//
+// The kernel-side substrate has existed since R90-XREPO.LV11.M2-003
+// (paideia-os#2225, sysno 114 `sys_volume_mint`, errno-return ABI).
+// PFS-09 (paideia-os#2576) added a sibling syscall at sysno 135
+// `sys_vol_mint` with a packed-return ABI (`(cap_handle << 2) |
+// status`, status ∈ {0=OK, 1=INVALID, 2=OUT_OF_ROWS, 3=DENIED}) and a
+// 64-byte VolumeDescriptor wire format carrying u32 PDXV magic
+// (0x56584450), u32 version=1, u64 device_cap, u64 block_count, u64
+// superblock_lba, u64 flags, and a 24-byte reserved tail.  This
+// library binds to the PFS-09 ABI; sysno 114 remains in the kernel
+// for the one existing caller (vol_kind_mint_elevate v1.1.0, which is
+// itself a STUB).  See design/pdxfs/sys-vol-mint-abi.md for the
+// sibling-syscall rationale and the consolidation plan.
 //
 // -----------------------------------------------------------------------------
 // vol_kind_narrow's real body -- what "narrow" means when there is no
@@ -109,17 +118,75 @@ module VolKind = structure {
   // (paideia-os) SECTION line `pub let KIND_VOLUME : u64 = 0x1A0`.
   pub let KIND_VOLUME : u64 = 0x1A0
 
-  // Sentinel returned by the remaining M1 stub (vol_kind_mint) in this
-  // module. Deliberately outside the valid cap-slot range ([0..255],
-  // per every kind_*.pdx mint's own parent-slot bounds check in the
-  // kernel tree) so a caller that forgets this is a stub sees an
-  // obviously-invalid slot rather than a value that could be mistaken
-  // for slot 0.
+  // Legacy sentinel kept for v1.1.x API compatibility -- the
+  // vol_kind_mint_elevate stub (still blocked on libpdx-elevate) and
+  // any pre-PFS-09 external caller that imported this symbol by name.
   pub let LPV_STUB_NOT_IMPLEMENTED : u64 = 0xFFFFFFFFFFFFFFFF
 
   // --- vol_kind_narrow status codes. ---
   pub let LPV_VK_OK                  : u64 = 0
   pub let LPV_VK_ERR_BAD_OPS_MASK    : u64 = 1
+
+  // --- vol_kind_mint status codes (PFS-09 band 0x0E00). ---
+  //
+  // On SUCCESS, vol_kind_mint returns the KERNEL's packed value
+  // ((cap_handle << 2) | 0) verbatim -- the caller recovers
+  // cap_handle via `>> 2`.  Callers inspect the low two bits to
+  // decide success/failure.  On FAILURE, vol_kind_mint returns one of
+  // the LPV_MINT_ERR_* codes below (all in the 0x0E00 band so a
+  // caller's errno-table matches the taxonomy's natural grouping).
+  //
+  // The band 0x0E00 is deliberately disjoint from:
+  //   - the kernel's own packed status (0..3 at the low 2 bits of
+  //     any OK return, which share the low 2 bits with the band
+  //     0x0E** sentinels but 0x0E** are far above any plausible
+  //     cap_handle << 2 result -- cap_handle maxes out at 255, so
+  //     cap_handle << 2 maxes at 1020 = 0x3FC, well below 0x0E00);
+  //   - every other LPV_* band in this library (`LPV_VK_ERR_*` in
+  //     0x0000..0x0003, `LPV_QUOTA_ERR_*` in 0x08**, `LPV_SNAP_*` in
+  //     0x09**, `LPV_ORDER_*` in 0x0A**).
+  pub let LPV_MINT_ERR_SYSCALL : u64 = 0x0E01
+  pub let LPV_MINT_ERR_INVALID : u64 = 0x0E02
+  pub let LPV_MINT_ERR_OUT_OF_ROWS : u64 = 0x0E03
+  pub let LPV_MINT_ERR_DENIED  : u64 = 0x0E04
+
+  // --- Kernel sys_vol_mint ABI constants (sysno 135, PFS-09). ---
+  pub let LPV_SYSNO_VOL_MINT   : u64 = 135
+  pub let LPV_VOL_DESC_BYTES   : u64 = 64
+  pub let LPV_VOL_DESC_MAGIC   : u64 = 0x56584450    // "PDXV" LE u32
+  pub let LPV_VOL_DESC_VERSION : u64 = 1
+  // Status discriminants from the kernel's packed return (bits [1:0]):
+  pub let LPV_SVM_STATUS_OK          : u64 = 0
+  pub let LPV_SVM_STATUS_INVALID     : u64 = 1
+  pub let LPV_SVM_STATUS_OUT_OF_ROWS : u64 = 2
+  pub let LPV_SVM_STATUS_DENIED      : u64 = 3
+  // Mask for the status field (low 2 bits).
+  pub let LPV_SVM_STATUS_MASK  : u64 = 0x3
+
+  // --- Static descriptor scratch (single-flow, 64 bytes). ---
+  //
+  // vol_kind_mint is a NON-REENTRANT ring-3 call: a given task either
+  // issues it or it does not, and no other thread of this library
+  // reaches this scratch concurrently (the library has no multi-
+  // threading substrate at PFS-09).  Future SMP work moves this into
+  // a per-task slab slot.
+  pub let mut _lpv_vk_desc_scratch : [u8; 64] = uninit @align(8)
+
+  // --- Test-harness mock gate for vol_kind_mint. ---
+  //
+  // When _lpv_vk_syscall_mock_enable == 0 (the default), vol_kind_mint
+  // issues a real `syscall` instruction with rax=LPV_SYSNO_VOL_MINT
+  // and reads the kernel's return from rax.  When set to 1 by a test
+  // driver, vol_kind_mint SKIPS the syscall and reads
+  // _lpv_vk_syscall_mock_rax instead, letting the test exercise the
+  // library-side unpack / status-mapping path without a running kernel.
+  //
+  // The .bss default (zero) guarantees production callers get the real
+  // syscall path.  A test driver's writes to these variables are
+  // scoped to the test; the library's own prologue code never touches
+  // them.
+  pub let mut _lpv_vk_syscall_mock_enable : u64 = 0
+  pub let mut _lpv_vk_syscall_mock_rax    : u64 = 0
 
   // --- KIND_VOLUME op catalog (kind_volume.pdx VOL_OP_*, ordinals
   // 0..9, reproduced in the module header). VK_OPS_VALID_MASK has
@@ -137,19 +204,182 @@ module VolKind = structure {
   pub let VK_OPS_VALID_MASK         : u64 = 0x3FF   // bits 0..9 set
 
   // ============================================================================
-  // vol_kind_mint(dev_cap) -> Cap<KIND_VOLUME> | LPV_STUB_NOT_IMPLEMENTED
+  // vol_kind_mint(dev_cap) -> packed u64 | LPV_MINT_ERR_*
   //
-  // M1 STUB. Does not dereference dev_cap, does not call any syscall.
-  // Real body (M2, unscheduled issue — see design/architecture.md §5)
-  // narrows a probed KIND_BLOCK_DEVICE into a fresh KIND_VOLUME via the
-  // kernel's mint primitive once a ring-3-reachable syscall exists.
+  // PFS-09 (paideia-os#2576) real body.  Marshals a 64-byte
+  // VolumeDescriptor into _lpv_vk_desc_scratch, issues
+  // syscall(LPV_SYSNO_VOL_MINT=135, &scratch, 64), and unpacks the
+  // kernel's packed return.
+  //
+  // Descriptor layout (see design/pdxfs/sys-vol-mint-abi.md §2.1 and
+  // src/kernel/core/syscall/sys_vol_mint_body.pdx file header):
+  //   +0   u32  magic         = LPV_VOL_DESC_MAGIC (0x56584450 "PDXV")
+  //   +4   u32  version       = LPV_VOL_DESC_VERSION (1)
+  //   +8   u64  device_cap    = dev_cap (caller-supplied)
+  //   +16  u64  block_count   = 0 (unknown at the 1-arg entry point;
+  //                                future wave widens the signature)
+  //   +24  u64  superblock_lba= 0 (same rationale)
+  //   +32  u64  flags         = 0 (reserved)
+  //   +40  24 B reserved      = zero-filled (walker reads full 64 B)
+  //
+  // The caller-supplied dev_cap is the ONLY field this landing
+  // populates with a non-zero value; a future wave widening the
+  // signature to vol_kind_mint_full(dev_cap, block_count,
+  // superblock_lba, flags) stays additively compatible since the
+  // kernel-side body already reads all four fields.
+  //
+  // Local validation (returns LPV_MINT_ERR_INVALID without issuing
+  // the syscall) catches dev_cap >= 256; everything else is kernel-
+  // side.  The invalid-cap short-circuit saves a round-trip for the
+  // common "caller passed a garbage dev_cap by accident" case AND
+  // closes a latent info-leak class where a kernel-side error path
+  // could leak internal bounds via timing.
+  //
+  // Return discipline:
+  //   - On success (kernel returns packed u64 with status bits = 0):
+  //     return the kernel value VERBATIM.  Caller recovers cap_handle
+  //     via `>> 2`.  This landing's higher-level callers (mount.pdxfs)
+  //     expect that discipline.
+  //   - On kernel-signaled failure (status bits != 0): translate the
+  //     kernel's packed status to the LPV_MINT_ERR_* band so caller
+  //     error-tables stay library-local:
+  //         1 (INVALID)     -> LPV_MINT_ERR_INVALID (0x0E02)
+  //         2 (OUT_OF_ROWS) -> LPV_MINT_ERR_OUT_OF_ROWS (0x0E03)
+  //         3 (DENIED)      -> LPV_MINT_ERR_DENIED (0x0E04)
+  //   - On an unexpected syscall-level failure (e.g. the kernel
+  //     returned a value whose low 2 bits are 0 but whose high bits
+  //     are not a plausible cap_slot (<= 255)): return
+  //     LPV_MINT_ERR_SYSCALL (0x0E01).
+  //
+  // Test-harness mock: if _lpv_vk_syscall_mock_enable != 0, the body
+  // skips the real `syscall` instruction and reads
+  // _lpv_vk_syscall_mock_rax as the kernel's return.  See the module
+  // header's §Static storage block for the production-safety argument.
+  //
+  // SysV + SYSCALL discipline (paideia-as encoder notes):
+  //   - rbx/r12 pushed as callee-save slots (survived across syscall
+  //     and across the mock-gate branch).
+  //   - rsp%16==8 at entry; 2 pushes + sub rsp,8 pad -> %16==0 at the
+  //     mock-gate branch's internal structure (no nested SysV call
+  //     under the real-syscall arm, but the mock arm walks a few
+  //     helpers' worth of frame).
+  //   - No `add reg, [mem]`; every memory write is `mov [reg+off], reg`.
+  //   - No byte loads (descriptor fields are 32-bit magic/version
+  //     written as full qword stores -- the high 32 bits of magic's
+  //     qword slot are overwritten by version's own store, which
+  //     naturally occupies [+4..+8); writing version as a FULL qword
+  //     at [+0] after writing magic would clobber magic, so we assemble
+  //     the combined [magic | version << 32] in rax before a single
+  //     qword store at [+0].  This saves the mov_d / sized-store
+  //     encoder gap entirely).
+  //   - KIND_VOLUME constant (0x1A0) is never compared in this body;
+  //     only the small immediates 64, 1, 256, 0x0E0*, 0x3, and
+  //     LPV_VOL_DESC_MAGIC (0x56584450, imm32 clean) are used.
+  //   - Labels prefixed `lpv_vkm_` (vol-kind-mint).
   // ============================================================================
-  pub let vol_kind_mint : (u64) -> u64 !{} @{} =
+  pub let vol_kind_mint : (u64) -> u64 !{mem, sysreg} @{} =
     fn (dev_cap: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "libpdx-volume.M1-001: vol_kind_mint scaffold stub (legacy 1-arg shape kept for v1.0.0 API compatibility). Returns LPX_STUB_NOT_IMPLEMENTED (0xFFFFFFFFFFFFFFFF, loaded via MOVABS -- outside the 0x7FFFFFFF cmp-imm bound but legal for a register load, never compared) without touching dev_cap. Pure leaf, no branch, no memory access, no cap consumption -- effects `!{} @{}`. Callers wanting elevate-broker wiring should use vol_kind_mint_elevate (M2-003, #23) instead. Real body still deferred to a future M2 landing once KIND_VOLUME exposes a ring-3-reachable mint syscall (see module header).",
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "libpdx-volume PFS-09 (paideia-os#2576): vol_kind_mint real body. Marshals a 64-byte VolumeDescriptor into _lpv_vk_desc_scratch, issues syscall(135, &scratch, 64), and unpacks the kernel's packed (cap_handle << 2) | status return. Local invalidation: dev_cap >= 256 is a programming error (cap_slots are in [0,256)) and short-circuits to LPV_MINT_ERR_INVALID without issuing the syscall. Descriptor layout: +0 u32 magic (0x56584450 PDXV LE), +4 u32 version (=1), +8 u64 device_cap (= dev_cap), +16 u64 block_count (=0), +24 u64 superblock_lba (=0), +32 u64 flags (=0), +40 24B reserved (zero-filled via a bounded qword loop over the whole scratch BEFORE field writes). Magic+version written together as a single qword store at [+0] via (magic | version << 32) -- avoids mov_d / sized-store encoder paths. Zero-init of the 64-byte scratch runs first (eight qword stores via a bounded loop) so the reserved tail is deterministically zero. The syscall emission uses the raw SYSCALL instruction with rax=135, rdi=&scratch, rsi=64 (the kernel's dispatch left-rotate shuffles these into the body's rdi=desc_va, rsi=desc_len contract via entry.pdx L98-102). SYSCALL preserves callee-save registers under the amd64 fast-syscall convention (and under the kernel's #743 info-leak hardening, which zeros only CALLER-save regs on sysret), so rbx/r12 survive the ring-transition and the mock-gate branch's internal frame. Mock gate: cmp [rip + _lpv_vk_syscall_mock_enable], 0 (small-immediate compare, legal without staging); je lpv_vkm_do_real_syscall (production path); otherwise mov rax, [rip + _lpv_vk_syscall_mock_rax] (test path). Both arms converge on lpv_vkm_unpack. Unpack: mov r11, rax; and r11, LPV_SVM_STATUS_MASK (0x3); cmp r11, 0 (OK? -> return rax verbatim); cmp r11, LPV_SVM_STATUS_INVALID (1 -> LPV_MINT_ERR_INVALID); cmp r11, LPV_SVM_STATUS_OUT_OF_ROWS (2 -> LPV_MINT_ERR_OUT_OF_ROWS); cmp r11, LPV_SVM_STATUS_DENIED (3 -> LPV_MINT_ERR_DENIED). The OK path additionally validates that the recovered cap_handle (rax >> 2) is <= 255 as a defensive check against a malformed kernel return; any violation routes to LPV_MINT_ERR_SYSCALL. Effects: {mem} for the scratch writes + the mock-gate reads; {sysreg} transitively for the SYSCALL instruction's sysreg state (CS/SS/RFLAGS set by syscall-entry hardware). Capabilities: {} -- the library does not consult any cap table itself; the kernel-side body is the authority gate. Labels prefixed lpv_vkm_.",
       block: {
-        mov rax, 0xFFFFFFFFFFFFFFFF;
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // rbx = dev_cap (survives)
+
+        // ---- Local validation: dev_cap < 256 ----
+        mov r10, 256;
+        cmp rbx, r10;
+        jae lpv_vkm_invalid;
+
+        // ---- Zero-init the 64-byte scratch (8 qwords) ----
+        lea r12, [rip + _lpv_vk_desc_scratch];
+        xor rax, rax;
+        xor rcx, rcx;
+      lpv_vkm_zero:
+        mov [r12 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  lpv_vkm_zero;
+
+        // ---- Stamp magic+version together ----
+        //   magic (u32 @+0) | version (u32 @+4) as a single qword.
+        mov rax, 0x56584450;             // LPV_VOL_DESC_MAGIC (imm32 clean)
+        mov r10, 1;                      // LPV_VOL_DESC_VERSION
+        shl r10, 32;                     // version in bits [63:32]
+        or  rax, r10;                    // (version << 32) | magic
+        mov [r12 + 0], rax;
+
+        // ---- Stamp device_cap @+8 ----
+        mov [r12 + 8], rbx;
+
+        // ---- block_count @+16, superblock_lba @+24, flags @+32 are
+        //      already zero from the init loop. Future-wave widening
+        //      replaces these three skipped stores with real values. ----
+
+        // ---- Issue the syscall (or honor the mock gate) ----
+        mov r10, [rip + _lpv_vk_syscall_mock_enable];
+        cmp r10, 0;
+        jne lpv_vkm_use_mock;
+
+        // Real syscall path.
+        //   rax = sysno, rdi = desc_va, rsi = desc_len.
+        //   kernel's dispatch sees rsi=desc_va, rdx=desc_len after the
+        //   entry.pdx SysV left-rotate (L98-102); kernel's shim then
+        //   shuffles into its own (rdi, rsi) contract.
+        mov rax, 135;                    // LPV_SYSNO_VOL_MINT
+        mov rdi, r12;                    // &_lpv_vk_desc_scratch
+        mov rsi, 64;                     // LPV_VOL_DESC_BYTES
+        syscall;
+        jmp lpv_vkm_unpack;
+
+      lpv_vkm_use_mock:
+        mov rax, [rip + _lpv_vk_syscall_mock_rax];
+
+      lpv_vkm_unpack:
+        // Decode status bits [1:0].
+        mov r11, rax;
+        and r11, 0x3;                    // LPV_SVM_STATUS_MASK
+
+        cmp r11, 0;                      // LPV_SVM_STATUS_OK
+        je  lpv_vkm_ok;
+        cmp r11, 1;                      // LPV_SVM_STATUS_INVALID
+        je  lpv_vkm_invalid;
+        cmp r11, 2;                      // LPV_SVM_STATUS_OUT_OF_ROWS
+        je  lpv_vkm_out_of_rows;
+        // Status 3 (DENIED) is the only remaining case given status is
+        // 2 bits; fall through.
+        jmp lpv_vkm_denied;
+
+      lpv_vkm_ok:
+        // Defensive sanity: cap_handle (rax >> 2) must be <= 255.
+        mov r11, rax;
+        shr r11, 2;
+        mov r10, 256;
+        cmp r11, r10;
+        jae lpv_vkm_syscall_err;
+        // Return the kernel's packed value verbatim.  Caller recovers
+        // cap_handle via `>> 2`.
+        jmp lpv_vkm_done;
+
+      lpv_vkm_invalid:
+        mov rax, 0x0E02;                 // LPV_MINT_ERR_INVALID
+        jmp lpv_vkm_done;
+
+      lpv_vkm_out_of_rows:
+        mov rax, 0x0E03;                 // LPV_MINT_ERR_OUT_OF_ROWS
+        jmp lpv_vkm_done;
+
+      lpv_vkm_denied:
+        mov rax, 0x0E04;                 // LPV_MINT_ERR_DENIED
+        jmp lpv_vkm_done;
+
+      lpv_vkm_syscall_err:
+        mov rax, 0x0E01;                 // LPV_MINT_ERR_SYSCALL
+
+      lpv_vkm_done:
+        pop r12;
+        pop rbx;
         ret;
       }
     }

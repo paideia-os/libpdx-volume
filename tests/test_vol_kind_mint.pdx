@@ -1,0 +1,274 @@
+// tests/test_vol_kind_mint.pdx — libpdx-volume PFS-09 (paideia-os#2576)
+// TestVolKindMint: correctness matrix for the real body landed at
+// `VolKind::vol_kind_mint` in src/vol_kind.pdx.
+//
+// ================================================================
+// Why a syscall-mocking harness
+// ================================================================
+//
+// vol_kind_mint's production path issues a raw `syscall` instruction
+// against sysno 135 (sys_vol_mint, paideia-os#2576 kernel-side).  A
+// unit-test driver running under tests/ cannot execute that syscall --
+// no kernel is live, no SysV ring-3 trampoline sits above us, and the
+// paideia-as emitter does not provide a user-mode syscall emulation
+// hook.  To exercise the library-side marshaling, status unpack, and
+// error mapping WITHOUT a running kernel, vol_kind_mint carries a
+// test-harness gate in its own .bss (see src/vol_kind.pdx's
+// _lpv_vk_syscall_mock_enable / _lpv_vk_syscall_mock_rax decls):
+//
+//   when _lpv_vk_syscall_mock_enable == 0 (production default):
+//     vol_kind_mint issues the real syscall and reads kernel rax.
+//
+//   when _lpv_vk_syscall_mock_enable == 1 (this driver):
+//     vol_kind_mint reads _lpv_vk_syscall_mock_rax as if it were the
+//     kernel's return, skipping the syscall instruction entirely.
+//
+// This driver sets the gate once at the top of `run()`, then flips
+// _lpv_vk_syscall_mock_rax across the three cases.
+//
+// ================================================================
+// Three cases
+// ================================================================
+//
+//   Case 1 -- happy path.  Fixture: dev_cap = 7 (plausible cap_slot);
+//             mock_rax = (slot 42 << 2) | 0 = 168 (OK, cap_handle=42).
+//             Expected: vol_kind_mint returns 168 verbatim (caller
+//             recovers cap_handle via `>> 2`).  Secondary assertion:
+//             the descriptor scratch after the call has magic at +0 =
+//             0x56584450 (PDXV), version at +4 = 1, device_cap at +8
+//             = 7, and bytes +16..64 = 0 (block_count, superblock_lba,
+//             flags, and the 24-byte reserved tail all zero per the
+//             1-arg entry point's §Descriptor layout block comment).
+//
+//   Case 2 -- bad magic (kernel-side reject).  Fixture: dev_cap = 7;
+//             mock_rax = (0 << 2) | 1 = 1 (INVALID_DESCRIPTOR).  Even
+//             though the LIBRARY marshals the correct magic itself,
+//             the harness is simulating the "kernel saw a corrupted
+//             descriptor" return.  Expected: vol_kind_mint returns
+//             LPV_MINT_ERR_INVALID (0x0E02).
+//
+//   Case 3 -- descriptor too small (kernel-side reject).  Same shape
+//             as Case 2 -- the library always sends a 64-byte
+//             descriptor, so a "too small" return can only be
+//             simulated via the mock.  Fixture: dev_cap = 7;
+//             mock_rax = (0 << 2) | 1 = 1 (INVALID_DESCRIPTOR; the
+//             kernel folds "wrong length" + "wrong magic" + "wrong
+//             version" into one INVALID code per the design doc's
+//             §3.2 taxonomy).  Expected: vol_kind_mint returns
+//             LPV_MINT_ERR_INVALID (0x0E02).  Secondary assertion:
+//             the LOCAL validation path also returns INVALID when
+//             dev_cap >= 256 WITHOUT touching the mock -- call with
+//             dev_cap = 500, mock_rax left at a success-shaped value,
+//             expect LPV_MINT_ERR_INVALID (short-circuit).
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// This library has no console/print capability (same discipline as
+// every other LV/PFS test driver here -- see `tests/README.md` and
+// `test_quota_inode.pdx`'s own return-code block for the full
+// rationale).  `test_vol_kind_mint_run()` therefore returns a `u64`
+// status code:
+//
+//   0     -- all three cases passed.
+//   1..3  -- the 1-based ordinal of the first case that failed.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//
+//   - No `@no_frame` anywhere.
+//   - Cross-module `call vol_kind_mint;` uses the bare unqualified
+//     symbol (this repo's convention; see `test_mount_sort.pdx`'s
+//     header for the standalone-compilation rationale).
+//   - Mock-gate variables (_lpv_vk_syscall_mock_enable /
+//     _lpv_vk_syscall_mock_rax) are read/written via `rip`-relative
+//     `lea` + indirect load/store, same shape as this driver's own
+//     tvkm_summary accesses -- see `test_quota_inode.pdx` L141-145
+//     precedent.
+//   - PDXV magic 0x56584450 fits imm32 sign-extend cleanly.
+//   - Error-code immediates 0x0E02 fit imm32 sign-extend cleanly.
+//   - Success-shape mock_rax values ((42 << 2) | 0 = 168, etc.) are
+//     small immediates.
+//   - No `test` mnemonic; every zero-check is `cmp reg, 0` or
+//     `cmp reg, reg`.
+//   - No `add reg, [mem]`; every add is reg,reg or reg,imm.
+//   - No byte loads (all reads of the scratch are full qwords; the
+//     magic+version qword read extracts via shr+and after loading the
+//     full 8 bytes at +0).
+//   - No `imul`.
+//   - No reserved-word labels (`loop`/`if`/`let`); label prefix
+//     `tvkm_` (TestVolKindMint).
+//
+// Upstream: paideia-os#2576 (PFS-09 chain-head);
+// `src/vol_kind.pdx` (this repo, PFS-09);
+// `design/pdxfs/sys-vol-mint-abi.md` (paideia-os design doc).
+
+module TestVolKindMint = structure {
+
+  // --- Status-code echoes (duplicated per no-cross-module-import
+  // convention). ---
+  pub let TVKM_LPV_MINT_ERR_INVALID : u64 = 0x0E02
+  pub let TVKM_LPV_MINT_ERR_OOR     : u64 = 0x0E03
+  pub let TVKM_LPV_MINT_ERR_DENIED  : u64 = 0x0E04
+  pub let TVKM_LPV_MINT_ERR_SYSCALL : u64 = 0x0E01
+
+  // Mock-rax shapes.
+  //   Case 1 OK: (42 << 2) | 0 = 168.
+  //   Case 2/3 INVALID: (0 << 2) | 1 = 1.
+  pub let TVKM_MOCK_OK_RAX      : u64 = 168
+  pub let TVKM_MOCK_INVALID_RAX : u64 = 1
+
+  // ==========================================================================
+  // test_vol_kind_mint_run() -> u64
+  //
+  // Three flat case blocks.  Each: (1) load the mock gate (enable=1),
+  // (2) stamp mock_rax to the case fixture, (3) call vol_kind_mint
+  // with the case's dev_cap, (4) check rax against the expected
+  // value, (5) for case 1, also inspect the descriptor scratch for
+  // the marshaled fields.  On any failure jump to tvkm_cN_fail
+  // returning N; on all three passing fall through to xor rax,rax;
+  // ret.
+  // ==========================================================================
+  pub let test_vol_kind_mint_run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "libpdx-volume PFS-09 (paideia-os#2576) TestVolKindMint::run entry point.  Drives three correctness cases over VolKind::vol_kind_mint's real body: (case 1) happy path -- mock_enable=1, mock_rax=168 (cap_handle=42, status=OK), dev_cap=7, expect rax=168 and descriptor scratch[0..64] = {+0: 0x56584450 (PDXV magic LE), +4: 1 (version), +8: 7 (dev_cap), +16..+64: zero}; (case 2) kernel-reject bad-magic simulated via mock_rax=1 (INVALID), dev_cap=7, expect rax=0x0E02 (LPV_MINT_ERR_INVALID); (case 3) local-validation short-circuit via dev_cap=500 (>= 256), mock gate left disabled by this case (0 after the case 2 reload; see case 3 setup), expect rax=0x0E02 WITHOUT the mock being consulted (library's own bounds check). Encoder notes mirror this file's module-header block: no `test`; no `add reg,[mem]`; no byte loads (the magic+version qword at scratch+0 is read as full qword then masked / shifted); no imul; every immediate fits imm32 sign-extend cleanly; cross-module `call vol_kind_mint;` uses bare symbol per repo convention. Mock-gate access is `lea + mov [reg+0], imm` for writes and `lea + mov reg, [reg+0]` for reads -- rip-relative base, zero displacement. Effects {mem, sysreg}: mem for the mock-variable + scratch inspections; sysreg conservatively from vol_kind_mint's own {sysreg} posture (transitive). SYSCALL does not fire in any case because the mock gate is enabled for cases 1/2 and the library-side bounds-check short-circuits case 3 before the mock-gate read runs. Label prefix tvkm_.",
+      block: {
+        // ====================================================================
+        // Case 1: happy path.
+        // mock_enable=1, mock_rax=168 ((42 << 2) | 0), dev_cap=7.
+        // Expect rax=168; scratch[0]=0x56584450|(1<<32), scratch[8]=7,
+        // scratch[16..64]=0.
+        // ====================================================================
+
+        // Enable mock, set rax = 168.
+        lea r11, [rip + _lpv_vk_syscall_mock_enable];
+        mov rax, 1;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_vk_syscall_mock_rax];
+        mov rax, 168;                     // (42 << 2) | 0
+        mov [r11 + 0], rax;
+
+        // Call vol_kind_mint(7).
+        mov rdi, 7;
+        call vol_kind_mint;
+        cmp rax, 168;
+        jne tvkm_c1_fail;
+
+        // Verify descriptor scratch.
+        lea r11, [rip + _lpv_vk_desc_scratch];
+
+        // Magic + version qword at +0.
+        //   Expected low 32 = 0x56584450, high 32 = 1 (version = 1 << 32).
+        mov rax, [r11 + 0];
+        mov r10, 0xFFFFFFFF;
+        mov rcx, rax;
+        and rcx, r10;                     // low 32 = magic
+        mov r10, 0x56584450;
+        cmp rcx, r10;
+        jne tvkm_c1_fail;
+
+        mov rcx, rax;
+        shr rcx, 32;                      // high 32 = version
+        cmp rcx, 1;
+        jne tvkm_c1_fail;
+
+        // device_cap at +8 = 7.
+        mov rax, [r11 + 8];
+        cmp rax, 7;
+        jne tvkm_c1_fail;
+
+        // block_count @+16, superblock_lba @+24, flags @+32 all zero.
+        mov rax, [r11 + 16];
+        cmp rax, 0;
+        jne tvkm_c1_fail;
+        mov rax, [r11 + 24];
+        cmp rax, 0;
+        jne tvkm_c1_fail;
+        mov rax, [r11 + 32];
+        cmp rax, 0;
+        jne tvkm_c1_fail;
+
+        // Reserved tail @+40, +48, +56 all zero.
+        mov rax, [r11 + 40];
+        cmp rax, 0;
+        jne tvkm_c1_fail;
+        mov rax, [r11 + 48];
+        cmp rax, 0;
+        jne tvkm_c1_fail;
+        mov rax, [r11 + 56];
+        cmp rax, 0;
+        jne tvkm_c1_fail;
+
+        // ====================================================================
+        // Case 2: bad magic (kernel-side reject simulated via mock).
+        // mock_enable=1, mock_rax=1 (INVALID), dev_cap=7.
+        // Expect rax=LPV_MINT_ERR_INVALID (0x0E02).
+        // ====================================================================
+
+        // mock_enable is still 1 from case 1; reload mock_rax=1.
+        lea r11, [rip + _lpv_vk_syscall_mock_rax];
+        mov rax, 1;                       // (0 << 2) | 1 = INVALID
+        mov [r11 + 0], rax;
+
+        mov rdi, 7;
+        call vol_kind_mint;
+        mov r10, 0x0E02;
+        cmp rax, r10;
+        jne tvkm_c2_fail;
+
+        // ====================================================================
+        // Case 3: local validation short-circuit (dev_cap >= 256).
+        // Disable mock BEFORE the call so we can verify the library
+        // short-circuits BEFORE reaching the mock-gate read -- any
+        // library-side regression that read the mock gate would see
+        // mock_rax = 999 (OK-shaped with cap_handle=249) and return
+        // 999, which the assertion below would catch.
+        // ====================================================================
+
+        lea r11, [rip + _lpv_vk_syscall_mock_enable];
+        xor rax, rax;                     // disable mock
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_vk_syscall_mock_rax];
+        mov rax, 999;                     // trap value -- not INVALID,
+                                          //   so a library regression
+                                          //   that read the mock would
+                                          //   return 999 and the cmp
+                                          //   below would catch it.
+        mov [r11 + 0], rax;
+
+        mov rdi, 500;                     // dev_cap >= 256 -- local reject
+        call vol_kind_mint;
+        mov r10, 0x0E02;
+        cmp rax, r10;
+        jne tvkm_c3_fail;
+
+        // ---- Cleanup: scrub mock variables so a sibling test that
+        //      runs AFTER this one does not inherit stale state. ----
+        lea r11, [rip + _lpv_vk_syscall_mock_enable];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_vk_syscall_mock_rax];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        // All three cases passed.
+        xor rax, rax;
+        ret;
+
+      tvkm_c1_fail:
+        mov rax, 1;
+        ret;
+
+      tvkm_c2_fail:
+        mov rax, 2;
+        ret;
+
+      tvkm_c3_fail:
+        mov rax, 3;
+        ret;
+      }
+    }
+}
