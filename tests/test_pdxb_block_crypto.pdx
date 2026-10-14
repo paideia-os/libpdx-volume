@@ -1,0 +1,280 @@
+// tests/test_pdxb_block_crypto.pdx -- libpdx-volume PFS-14 (paideia-os#2732)
+// TestPdxbBlockCrypto: correctness matrix for the real bodies landed at
+// `PdxbCrypto::pdxb_block_encrypt` + `pdxb_block_decrypt` in
+// src/pdxb_crypto.pdx.
+//
+// ================================================================
+// Why a syscall-mocking harness
+// ================================================================
+//
+// pdxb_block_encrypt / _decrypt's production path issues a raw
+// `syscall` instruction against sysno 137 (sys_dek_apply, paideia-os
+// #2732 kernel-side).  A unit-test driver running under tests/ cannot
+// execute that syscall -- no kernel is live.  To exercise the library-
+// side marshaling, mode-arg wiring, NO_DEK preflight, and SDA-to-LPV
+// return translator WITHOUT a running kernel, the production bodies
+// carry a test-harness gate in their own .bss (see src/pdxb_crypto.pdx's
+// _lpv_crypto_syscall_mock_enable / _rax decls):
+//
+//   when _lpv_crypto_syscall_mock_enable == 0 (default):
+//     bodies issue the real SYSCALL and read kernel rax.
+//
+//   when _lpv_crypto_syscall_mock_enable == 1 (this driver):
+//     bodies read _lpv_crypto_syscall_mock_rax as if it were the
+//     kernel's return, skipping the SYSCALL entirely.
+//
+// This driver flips the gate on, varies mock_rax across cases, and
+// confirms the library maps each SDA_* return to the correct
+// LPV_CRYPTO_* code.
+//
+// Note on scope: a full round-trip test (encrypt then decrypt yields
+// the original plaintext) requires a live kernel + a KIND_DEK row;
+// such a test belongs in a QEMU smoke scenario, NOT a syscall-mocked
+// unit test.  This driver's coverage is the LIBRARY-SIDE translation
+// + preflight + mode-wiring surface, which is where PFS-14 adds the
+// most new logic.
+//
+// ================================================================
+// Six cases
+// ================================================================
+//
+//   Case 1 -- NO_DEK preflight.  Fixture: _lpv_dek_row_id =
+//             LPV_DEK_ROW_UNSET (0xFFFF...FF) (default .bss state
+//             after module load; we SET it to the sentinel explicitly
+//             to guard against sibling-test state), mock disabled.
+//             Call pdxb_block_encrypt(buf=0xDEAD, lba=0).  Expected:
+//             rax = LPV_CRYPTO_ERR_NO_DEK (0x0907) WITHOUT the mock
+//             being consulted (library's preflight short-circuits).
+//
+//   Case 2 -- Happy encrypt.  Fixture: _lpv_dek_row_id = 3,
+//             _lpv_volume_prefix = 0xC0FFEE, mock enabled, mock_rax =
+//             0 (SDA_OK).  Call pdxb_block_encrypt(buf=0x1000, lba=4).
+//             Expected: rax = LPV_CRYPTO_OK (0).
+//
+//   Case 3 -- Happy decrypt.  Same fixture as case 2, mock_rax = 0.
+//             Call pdxb_block_decrypt(buf=0x1000, lba=4).  Expected:
+//             rax = LPV_CRYPTO_OK (0).
+//
+//   Case 4 -- AEAD fail (decrypt tag mismatch).  Fixture: mock_rax = 4
+//             (SDA_AEAD_FAIL).  Call pdxb_block_decrypt(buf=0x1000,
+//             lba=4).  Expected: rax = LPV_CRYPTO_ERR_AEAD_FAIL
+//             (0x0903).
+//
+//   Case 5 -- LBA exhausted.  Fixture: mock_rax = 3 (SDA_INVALID_LBA).
+//             Call pdxb_block_encrypt(buf=0x1000, lba=0x1_0000_0000_0000).
+//             Expected: rax = LPV_CRYPTO_ERR_LBA_EXHAUSTED (0x0908).
+//
+//   Case 6 -- Kernel-rejected row.  Fixture: mock_rax = 1
+//             (SDA_INVALID_ROW).  Call pdxb_block_encrypt(buf=0x1000,
+//             lba=4).  Expected: rax = LPV_CRYPTO_ERR_NO_DEK (0x0907)
+//             (SDA_INVALID_ROW maps to NO_DEK -- the library treats a
+//             post-sync stale row as equivalent to a never-set row).
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Same discipline as test_vol_kind_mint.pdx (no console in this
+// library; test driver returns a u64 case ordinal).
+//
+//   0     -- all six cases passed.
+//   1..6  -- the 1-based ordinal of the first case that failed.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//
+//   - No `@no_frame`.
+//   - Cross-module `call pdxb_block_encrypt;` / `pdxb_block_decrypt;` /
+//     `pdxb_crypto_set_dek_row_id;` / `pdxb_crypto_set_volume_prefix;`
+//     all use the bare unqualified symbol (repo convention).
+//   - Mock-gate variables accessed via `lea rip` + indirect store/load.
+//   - All LPV_CRYPTO_* immediates (0x0903, 0x0906, 0x0907, 0x0908) fit
+//     imm32 sign-extend cleanly; the 2^48 LBA constant is staged via
+//     mov r10, 1; shl r10, 48 (encoder pitfall discipline).
+//   - LPV_DEK_ROW_UNSET (0xFFFFFFFFFFFFFFFF) is staged via `mov r11,
+//     0xFFFF...FF` (movabs); do NOT fit as imm32.
+//   - No `test`; every zero/equality is `cmp reg,0` or `cmp reg,reg`.
+//   - No `add reg,[mem]`; no byte loads; no imul.
+//   - Labels prefixed `tpbc_` (TestPdxbBlockCrypto).
+
+module TestPdxbBlockCrypto = structure {
+
+  // --- Status-code echoes (duplicated per no-cross-module-import). ---
+  pub let TPBC_LPV_CRYPTO_OK         : u64 = 0
+  pub let TPBC_LPV_CRYPTO_AEAD_FAIL  : u64 = 0x0903
+  pub let TPBC_LPV_CRYPTO_SYSCALL    : u64 = 0x0906
+  pub let TPBC_LPV_CRYPTO_NO_DEK     : u64 = 0x0907
+  pub let TPBC_LPV_CRYPTO_LBA_EXH    : u64 = 0x0908
+
+  // ==========================================================================
+  // test_pdxb_block_crypto_run() -> u64
+  //
+  // Six flat case blocks.
+  // ==========================================================================
+  pub let test_pdxb_block_crypto_run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "libpdx-volume PFS-14 (paideia-os#2732) TestPdxbBlockCrypto::run entry point.  Six cases over pdxb_block_encrypt / _decrypt's library-side logic (preflight NO_DEK, mock gate, mode arg, SDA-to-LPV translator) with the kernel syscall mocked out.  Case 1 (NO_DEK preflight short-circuit): set _lpv_dek_row_id = LPV_DEK_ROW_UNSET (movabs 0xFFFF...FF), disable mock, call encrypt(0xDEAD, 0), expect 0x0907. Case 2 (happy encrypt): row_id=3, prefix=0xC0FFEE, enable mock, mock_rax=0, call encrypt(0x1000, 4), expect 0. Case 3 (happy decrypt): mock_rax=0, call decrypt(0x1000, 4), expect 0. Case 4 (AEAD fail): mock_rax=4, call decrypt(0x1000, 4), expect 0x0903. Case 5 (LBA exh): mock_rax=3, call encrypt(0x1000, 0x1_0000_0000_0000 -- high-bit u64 staged via movabs), expect 0x0908. Case 6 (invalid row): mock_rax=1, call encrypt(0x1000, 4), expect 0x0907. Cleanup at end: scrub all four .bss variables (_lpv_dek_row_id, _lpv_volume_prefix, _lpv_crypto_syscall_mock_enable, _lpv_crypto_syscall_mock_rax) so sibling tests see a fresh state. Encoder-pitfall discipline matches test_vol_kind_mint one-for-one: no `test`, no `add reg,[mem]`, no byte loads, no imul, no reserved-word labels. 0xFFFF...FF is staged via `mov r11, 0xFFFFFFFFFFFFFFFF` (movabs; libasm emits this verbatim). 2^48 is staged via `mov r10, 1; shl r10, 48`. Effects {mem, sysreg}: mem for the mock + preflight variable writes; sysreg conservatively from the production bodies' own {sysreg} effect (transitively; the mock gate short-circuits before the SYSCALL executes).",
+      block: {
+        // ====================================================================
+        // Case 1: NO_DEK preflight.
+        //   _lpv_dek_row_id = LPV_DEK_ROW_UNSET.
+        //   mock disabled (0) -- if the body ever reaches the mock
+        //     gate on this case it would read mock_rax = sentinel 999
+        //     (SDA translator falls through to SYSCALL -> 0x0906, which
+        //     would make the cmp below fail -- so our zero-prep is a
+        //     passive hazard-detector).
+        // ====================================================================
+
+        // Explicitly stamp UNSET to defuse sibling-test leftover state.
+        lea r11, [rip + _lpv_dek_row_id];
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + _lpv_crypto_syscall_mock_enable];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_crypto_syscall_mock_rax];
+        mov rax, 999;                     // trap value for any regression
+        mov [r11 + 0], rax;
+
+        mov rdi, 0xDEAD;
+        mov rsi, 0;
+        call pdxb_block_encrypt;
+        mov r10, 0x0907;                  // LPV_CRYPTO_ERR_NO_DEK
+        cmp rax, r10;
+        jne tpbc_c1_fail;
+
+        // ====================================================================
+        // Case 2: happy encrypt.
+        // ====================================================================
+
+        // Install a valid row_id + prefix.
+        mov rdi, 3;
+        call pdxb_crypto_set_dek_row_id;
+        mov rdi, 0xC0FFEE;
+        call pdxb_crypto_set_volume_prefix;
+
+        // Enable mock, set rax = 0 (SDA_OK).
+        lea r11, [rip + _lpv_crypto_syscall_mock_enable];
+        mov rax, 1;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_crypto_syscall_mock_rax];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        mov rdi, 0x1000;
+        mov rsi, 4;
+        call pdxb_block_encrypt;
+        cmp rax, 0;
+        jne tpbc_c2_fail;
+
+        // ====================================================================
+        // Case 3: happy decrypt.
+        // ====================================================================
+
+        // mock_enable + mock_rax already set from case 2 (both still 0 / 1).
+        mov rdi, 0x1000;
+        mov rsi, 4;
+        call pdxb_block_decrypt;
+        cmp rax, 0;
+        jne tpbc_c3_fail;
+
+        // ====================================================================
+        // Case 4: AEAD fail (decrypt).
+        //   mock_rax = 4 (SDA_AEAD_FAIL) -> LPV_CRYPTO_ERR_AEAD_FAIL (0x0903).
+        // ====================================================================
+
+        lea r11, [rip + _lpv_crypto_syscall_mock_rax];
+        mov rax, 4;
+        mov [r11 + 0], rax;
+
+        mov rdi, 0x1000;
+        mov rsi, 4;
+        call pdxb_block_decrypt;
+        mov r10, 0x0903;                  // LPV_CRYPTO_ERR_AEAD_FAIL
+        cmp rax, r10;
+        jne tpbc_c4_fail;
+
+        // ====================================================================
+        // Case 5: LBA exhausted.
+        //   mock_rax = 3 (SDA_INVALID_LBA) -> LPV_CRYPTO_ERR_LBA_EXHAUSTED
+        //   (0x0908).  LBA = 2^48 is staged via movabs.
+        // ====================================================================
+
+        lea r11, [rip + _lpv_crypto_syscall_mock_rax];
+        mov rax, 3;
+        mov [r11 + 0], rax;
+
+        mov rdi, 0x1000;
+        mov rsi, 1;
+        shl rsi, 48;                      // lba = 1 << 48 = 2^48
+        call pdxb_block_encrypt;
+        mov r10, 0x0908;                  // LPV_CRYPTO_ERR_LBA_EXHAUSTED
+        cmp rax, r10;
+        jne tpbc_c5_fail;
+
+        // ====================================================================
+        // Case 6: Invalid row (kernel-side stale row).
+        //   mock_rax = 1 (SDA_INVALID_ROW) -> LPV_CRYPTO_ERR_NO_DEK (0x0907).
+        // ====================================================================
+
+        lea r11, [rip + _lpv_crypto_syscall_mock_rax];
+        mov rax, 1;
+        mov [r11 + 0], rax;
+
+        mov rdi, 0x1000;
+        mov rsi, 4;
+        call pdxb_block_encrypt;
+        mov r10, 0x0907;                  // LPV_CRYPTO_ERR_NO_DEK
+        cmp rax, r10;
+        jne tpbc_c6_fail;
+
+        // ====================================================================
+        // Cleanup: scrub all PFS-14 .bss variables so a sibling test
+        // that runs AFTER this one does not inherit stale state.
+        // ====================================================================
+        lea r11, [rip + _lpv_dek_row_id];
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_volume_prefix];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_crypto_syscall_mock_enable];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+        lea r11, [rip + _lpv_crypto_syscall_mock_rax];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        // All six cases passed.
+        xor rax, rax;
+        ret;
+
+      tpbc_c1_fail:
+        mov rax, 1;
+        ret;
+
+      tpbc_c2_fail:
+        mov rax, 2;
+        ret;
+
+      tpbc_c3_fail:
+        mov rax, 3;
+        ret;
+
+      tpbc_c4_fail:
+        mov rax, 4;
+        ret;
+
+      tpbc_c5_fail:
+        mov rax, 5;
+        ret;
+
+      tpbc_c6_fail:
+        mov rax, 6;
+        ret;
+      }
+    }
+}

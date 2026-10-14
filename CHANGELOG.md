@@ -1,5 +1,93 @@
 # libpdx-volume — CHANGELOG
 
+## 1.1.10 — 2026-10-13 (PFS-14 / paideia-os#2732: pdxb_block_encrypt / _decrypt real bodies)
+
+**Patch bump — additive and signature-widening (the four-arg stub
+retired here was fail-closed, so no caller depended on its shape).
+Closes the per-block encrypt-at-rest path PFS-05 froze in design/
+pdxfs/block-crypto-contract.md and PFS-13 (Wave 97) prepared via
+sys_dek_seal.** Closes `paideia-os#2732` (PFS-14, Wave PFS-W11).
+
+### Added
+
+- **`src/pdxb_crypto.pdx`** — `PdxbCrypto::pdxb_block_encrypt`
+  real body (new signature `(buf_ptr, lba) -> u64`). Marshals a
+  syscall against sysno 137 (sys_dek_apply, paideia-os-side) with
+  mode=0, carrying the cached dek_row_id + volume_prefix from
+  mount-time .bss state. The 32-byte DEK never leaves kernel
+  space (closes GAP #P2 in mount.pdxfs's passphrase_wire.pdx). The
+  caller's buffer is 4112 bytes (4096 data + 16 tag inline);
+  PFS-14b will own the on-disk pairing of these frames with their
+  persistent metadata block. Returns `LPV_CRYPTO_OK` (0),
+  `LPV_CRYPTO_ERR_NO_DEK` (0x0907), `LPV_CRYPTO_ERR_SYSCALL`
+  (0x0906), `LPV_CRYPTO_ERR_LBA_EXHAUSTED` (0x0908), or
+  `LPV_CRYPTO_ERR_AEAD_FAIL` (0x0903).
+- **`src/pdxb_crypto.pdx`** — `PdxbCrypto::pdxb_block_decrypt`
+  real body (new signature `(buf_ptr, lba) -> u64`). Mirror of
+  the encrypt side with mode=1. The caller provides ciphertext
+  + tag in the 4112-byte buffer; the kernel-side AEAD open
+  verifies the tag and writes 4096 plaintext bytes back (the tag
+  slot at buf+4096 is left untouched). Same return taxonomy.
+- **`src/pdxb_crypto.pdx`** — mount-time setters +
+  symmetric getters: `pdxb_crypto_set_dek_row_id(row_id)`,
+  `pdxb_crypto_set_volume_prefix(prefix_u32)`,
+  `pdxb_crypto_get_dek_row_id()`, `pdxb_crypto_get_volume_prefix()`.
+  mount.pdxfs's post-sys_dek_seal hook installs the row_id (from
+  the seal syscall's `rax >> 2`) and the first 4 bytes of the
+  superblock's kdf_salt. _lpv_dek_row_id defaults to the sentinel
+  `LPV_DEK_ROW_UNSET` (0xFFFFFFFFFFFFFFFF); the preflight in both
+  bodies maps a non-overwritten sentinel to `LPV_CRYPTO_ERR_NO_DEK`
+  WITHOUT issuing the syscall.
+- **`src/pdxb_crypto.pdx`** — three new return-code constants in
+  the already-reserved 0x0900..0x09FF crypto band:
+  `LPV_CRYPTO_ERR_SYSCALL = 0x0906` (kernel SDA_INVALID_PAGE /
+  SDA_INVALID_MODE), `LPV_CRYPTO_ERR_NO_DEK = 0x0907` (library
+  preflight OR kernel SDA_INVALID_ROW), `LPV_CRYPTO_ERR_LBA_EXHAUSTED
+  = 0x0908` (kernel SDA_INVALID_LBA, nonce birthday-bound at 2^48
+  per PFS-05 §4.2). The dispatch brief named
+  `LPV_CRYPTO_ERR_SYSCALL = 0x0902` but 0x0902 was already
+  `LPV_CRYPTO_ERR_KDF_FAIL` from v1.1.0 (M5-001); allocating
+  0x0906+ preserves the v1.0.x numeric-stability contract
+  documented in `src/lpv_errors.pdx` §Compatibility posture.
+- **`tests/test_pdxb_block_crypto.pdx`** — new test driver with
+  six cases over the library-side logic (NO_DEK preflight,
+  happy encrypt, happy decrypt, AEAD fail, LBA exhausted, invalid
+  row). Uses the mock-syscall gate `_lpv_crypto_syscall_mock_enable`
+  / `_lpv_crypto_syscall_mock_rax` added here so the test runs
+  without a live kernel (same shape as `test_vol_kind_mint.pdx`).
+  A full plaintext-round-trip + real-AEAD test belongs in a QEMU
+  smoke scenario, not a unit driver.
+
+### Retired
+
+- The v1.1.0 four-arg `pdxb_block_encrypt(dek_ptr, block_ptr,
+  nonce_ptr, out_tag_ptr)` + `pdxb_block_decrypt(dek_ptr,
+  block_ptr, nonce_ptr, tag_ptr)` stubs that returned
+  `LPV_CRYPTO_ERR_NOT_IMPL` (0x0901) are retired in favor of the
+  two-arg real bodies. No caller depended on the 4-arg stub
+  (grep audit at landing time surfaces STATUS.md / CHANGELOG /
+  design-doc references only); the 0x0901 return code remains
+  in the band for backward-compatibility, no longer emitted.
+
+### Deferred
+
+- **`src/pdxb_block_meta.pdx`** (new module, PFS-14b) — the
+  on-disk paired-metadata module per PFS-05 §5: 32-byte records
+  (nonce[12] + tag[16] + flags[1] + reserved[3]), 128 records
+  per metadata block, tail-of-data-region layout, with
+  `pdxb_block_meta_read` / `_write` helpers. Deferred because the
+  bodies landed here handle the AEAD transport within a single
+  user buffer (data[4096] + tag[16] = 4112 B); persisting that
+  tag to a paired block is a separate scope (needs mkfs.pdxfs
+  wire-up for `meta_region_lba_start`, atomicity-under-WAL
+  design decisions, and the three new superblock accessor pairs
+  below). Follow-up ticket to be filed.
+- Three new superblock accessor pairs
+  (`pdxb_sb_get/set_epoch_counter` at `sb+268`,
+  `pdxb_sb_get/set_meta_region_lba_start` at `sb+276`,
+  `pdxb_sb_get/set_meta_block_count` at `sb+284`) per PFS-05 §5.3.
+  Deferred with PFS-14b.
+
 ## 1.1.8 — 2026-10-11 (PFS-08 / paideia-os#2575: inode-path quota check + commit)
 
 **Patch bump — additive. Closes the inode-path half of the quota

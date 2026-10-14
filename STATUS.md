@@ -407,26 +407,31 @@ Deferred to a future patch/minor release (see `CHANGELOG.md`'s semver
 policy):
 
 - **`pdxb_block_encrypt` / `pdxb_block_decrypt` real bodies —
-  DESIGN CONTRACT LANDED, implementation pending.** The paired-block
-  AEAD metadata layout the v1.1.0 M5-001 (#29) landing deferred is
-  now frozen in `design/pdxfs/block-crypto-contract.md` in the
-  paideia-os repo (PFS-W3 / PFS-05 wave, 2026-10-11, parent
-  `paideia-os/paideia-os#2572`). The contract fixes: (a) one DEK
-  per volume unwrapped from the superblock `wrapped_dek` slot at
-  mount; (b) 12-byte nonce = `volume_prefix[4] || LE_u64(blk_lba)`
-  under the pdxfs CoW invariant (§4.1); (c) paired-metadata layout
-  at the data-region tail — 1 metadata block per 128 data blocks,
-  32-byte records (nonce[12] || tag[16] || flags[1] || reserved[3]);
-  (d) three new superblock anchor slots at `sb+268/+276/+284` for
-  epoch counter + metadata region start + metadata block count,
-  all inside the signed range `[0, 696)`. Real-body follow-up is
-  filed as `paideia-os/paideia-os#2730` ([PFS-05-IMPL]); until it
-  lands the stub bodies at `src/pdxb_crypto.pdx` L363-381 stay
-  fail-closed returning `LPV_CRYPTO_ERR_NOT_IMPL = 0x0901` so no
-  caller can accidentally write plaintext to disk under a flag that
-  claims encryption. `design/architecture.md` §11.4's "paired-block
-  layout agreement" bullet moves from "pending" to "frozen upstream;
-  real-body ticket filed" with this landing.
+  LANDED (v1.1.10, PFS-14 wave).** The paired-block AEAD contract
+  frozen at PFS-05 (`design/pdxfs/block-crypto-contract.md`,
+  paideia-os/paideia-os#2572) has its real bodies landed as of
+  v1.1.10: a Path-B kernel-side design where the 32-byte DEK never
+  leaves kernel space (`sys_dek_apply` sysno 137 on the paideia-os
+  side owns the ChaCha20-Poly1305 encrypt/decrypt + nonce
+  derivation), and the library bodies are two-arg `(buf_ptr, lba)`
+  thin marshallers around that syscall. Preconditions: mount.pdxfs
+  installs the mount's dek_row_id (from `sys_dek_seal`'s return) +
+  the volume_prefix (first 4 bytes of superblock kdf_salt) via
+  `pdxb_crypto_set_dek_row_id` / `pdxb_crypto_set_volume_prefix`
+  BEFORE the first block I/O. See `CHANGELOG.md` 1.1.10 entry for
+  the full inventory; six-case mock-syscall test driver at
+  `tests/test_pdxb_block_crypto.pdx`.
+- **`pdxb_block_meta.pdx` + three superblock accessor pairs —
+  DEFERRED to PFS-14b.** The on-disk paired-metadata module per
+  PFS-05 §5 (32-byte records of nonce[12] + tag[16] + flags[1] +
+  reserved[3], 128 records per metadata block, tail-of-data-region
+  layout) plus `pdxb_sb_get/set_epoch_counter` /
+  `_meta_region_lba_start` / `_meta_block_count` at `sb+268/+276/+284`
+  per PFS-05 §5.3 are a separate landing. Scope driver: the v1.1.10
+  bodies carry the tag INLINE at `buf+4096..buf+4112` for a
+  single-buffer AEAD transport; persisting that tag to a paired
+  metadata block (with mkfs.pdxfs wire-up for
+  `meta_region_lba_start` + WAL atomicity) is PFS-14b's own ticket.
 - **Dual-sign + mirror-push run.** Blocked on (a) the paideia-as
   toolchain reachable in CI, (b) the `pkgs.paideia-os` mirror endpoint
   standing (does not exist as of R53 close), and (c) a live

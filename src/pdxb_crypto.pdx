@@ -97,6 +97,90 @@ module PdxbCrypto = structure {
   pub let LPV_CRYPTO_ERR_AEAD_FAIL   : u64 = 0x0903
   pub let LPV_CRYPTO_ERR_TAG_MISMATCH : u64 = 0x0904
   pub let LPV_CRYPTO_ERR_BAD_KEY_LEN : u64 = 0x0905
+  // PFS-14 (paideia-os #2732) additions.  Dispatch-brief named
+  // LPV_CRYPTO_ERR_SYSCALL = 0x0902 but 0x0902 was already KDF_FAIL
+  // from v1.1.0 (M5-001 #29) -- the brief did not account for the
+  // existing band.  Allocating 0x0906+ here keeps the v1.0.x
+  // numeric-stability contract (see src/lpv_errors.pdx §Compatibility
+  // posture) and gives distinct sentinels to the three failure
+  // classes pdxb_block_encrypt / _decrypt now surface.
+  pub let LPV_CRYPTO_ERR_SYSCALL     : u64 = 0x0906  // kernel syscall rejected the page / mode / shuffle
+  pub let LPV_CRYPTO_ERR_NO_DEK      : u64 = 0x0907  // library .bss has no cached dek_row_id (passphrase_wire never ran)
+  pub let LPV_CRYPTO_ERR_LBA_EXHAUSTED : u64 = 0x0908 // lba >= 2^48 (PFS-05 §4.2 nonce birthday-bound fail-safe)
+
+  // ===========================================================================
+  // sys_dek_apply ABI constants (sysno 137, PFS-14, paideia-os #2732).
+  // See design/pdxfs/block-crypto-contract.md and
+  // src/kernel/core/syscall/sys_dek_apply_body.pdx.
+  // ===========================================================================
+  pub let LPV_SYSNO_DEK_APPLY   : u64 = 137
+
+  // Mode discriminants (first arg of sys_dek_apply after row_id / buf).
+  pub let LPV_DEK_APPLY_ENCRYPT : u64 = 0
+  pub let LPV_DEK_APPLY_DECRYPT : u64 = 1
+
+  // Per-call user buffer size: 4096 data + 16 tag = 4112.
+  pub let LPV_BLOCK_FRAME_BYTES : u64 = 4112
+
+  // SDA_* kernel-side return codes (sys_dek_apply_body §Contract).
+  pub let LPV_SDA_OK            : u64 = 0
+  pub let LPV_SDA_INVALID_ROW   : u64 = 1
+  pub let LPV_SDA_INVALID_PAGE  : u64 = 2
+  pub let LPV_SDA_INVALID_LBA   : u64 = 3
+  pub let LPV_SDA_AEAD_FAIL     : u64 = 4
+  pub let LPV_SDA_INVALID_MODE  : u64 = 5
+
+  // ===========================================================================
+  // Mount-lifetime per-volume crypto state.
+  //
+  // After sys_dek_seal (sysno 136, PFS-13) returns, mount.pdxfs's own
+  // post-return hook pushes the row_id + the volume_prefix (first 4 bytes
+  // of the superblock's kdf_salt) into this library's .bss via the
+  // setters below.  pdxb_block_encrypt / _decrypt then read these on
+  // every call.
+  //
+  // Why library .bss (as opposed to passing both on every call):
+  //   - mount.pdxfs owns one volume at a time; a per-call row_id arg
+  //     would ripple through every block-write/read site in the pdxfs
+  //     CoW path (PFS-11 downstream) with no benefit beyond redundancy.
+  //   - Single-flow discipline: the library is non-reentrant (every
+  //     other .bss scratch here -- lpv_argon2_scratch, lpv_aead_scratch
+  //     -- is single-writer by convention); PFS-14 inherits that.
+  //
+  // _lpv_dek_row_id defaults to LPV_DEK_ROW_UNSET; the setter writes a
+  // real row_id (0..15) over it; the getter / block_encrypt / _decrypt
+  // treat the sentinel as "no DEK cached" and return LPV_CRYPTO_ERR_NO_DEK
+  // without issuing the syscall.
+  // ===========================================================================
+  pub let LPV_DEK_ROW_UNSET : u64 = 0xFFFFFFFFFFFFFFFF
+
+  pub let mut _lpv_dek_row_id     : u64 = uninit @align(8)
+  pub let mut _lpv_volume_prefix  : u64 = uninit @align(8)
+  // init-at-module-load is .bss zero.  Row 0 is a VALID KIND_DEK row
+  // (kind_dek.pdx _dek_table rows 0..15), so .bss zero is NOT a safe
+  // UNSET sentinel on its own.  mount.pdxfs MUST call
+  // pdxb_crypto_init() at module startup -- or before the first
+  // pdxb_block_encrypt / _decrypt call -- which stamps
+  // LPV_DEK_ROW_UNSET (0xFFFFFFFFFFFFFFFF) over the row_id slot.  The
+  // kernel-side SDA_INVALID_ROW gate catches the "init not called"
+  // regression as a secondary safety net: a fresh .bss zero row_id
+  // reaches the kernel, dek_row_valid(0) returns 0 iff row 0 is not
+  // live, and the library maps SDA_INVALID_ROW -> LPV_CRYPTO_ERR_NO_DEK
+  // -- so the fail-closed envelope stands even without init().  The
+  // init call tightens the error signal (library preflight NO_DEK) and
+  // saves the syscall round-trip.
+
+  // ===========================================================================
+  // Test-harness mock gate for sys_dek_apply (mirrors vol_kind.pdx's
+  // _lpv_vk_syscall_mock_enable / _rax pattern).
+  //
+  // When _lpv_crypto_syscall_mock_enable == 0 (production), block_encrypt
+  // / _decrypt issue the real `syscall` instruction with rax=137.  When
+  // set to 1 by a test driver, the body SKIPS the syscall and reads
+  // _lpv_crypto_syscall_mock_rax as the kernel's return value instead.
+  // ===========================================================================
+  pub let mut _lpv_crypto_syscall_mock_enable : u64 = uninit @align(8)
+  pub let mut _lpv_crypto_syscall_mock_rax    : u64 = uninit @align(8)
 
   // -------------------------------------------------------------------------
   // Local trait declarations (see module header for the module-local
@@ -340,43 +424,347 @@ module PdxbCrypto = structure {
     }
 
   // ==========================================================================
-  // pdxb_block_encrypt(dek_ptr, block_ptr, nonce_ptr, out_tag_ptr) -> u64
+  // pdxb_crypto_init() -> ()
   //
-  // Encrypts one 4096-byte block IN PLACE (block_ptr is both input
-  // and output) and writes the 16-byte tag to out_tag_ptr. Under the
-  // paired-block scheme (see src/pdxb_superblock.pdx PDXB_D_OFF_
-  // WRAPPED_DEK section), nonce_ptr and out_tag_ptr are 12-byte and
-  // 16-byte cursors into the per-16-block metadata block the caller
-  // maintains.
-  //
-  // Uses lpv_aead_scratch just like pdxb_dek_wrap. In-place encrypt
-  // requires an auxiliary scratch buffer since the AEAD writes
-  // ciphertext + tag to a distinct out_ptr; we chunk-copy the
-  // ciphertext back after the call using an inline loop (512 qwords
-  // for 4096 bytes). This is a v1.1.0 scaffold: the block-cipher path
-  // is scoped for actual on-disk use only once the paired-block
-  // metadata layout lands in mkfs.pdxfs / mount.pdxfs. STUB body at
-  // this landing (returns LPV_CRYPTO_ERR_NOT_IMPL) so callers know
-  // the in-place semantics + metadata-block layout still need agreement
-  // before the real body ships.
+  // Mount-time + module-load init.  Stamps LPV_DEK_ROW_UNSET
+  // (0xFFFFFFFFFFFFFFFF) over _lpv_dek_row_id, zero over
+  // _lpv_volume_prefix, and zeros the test-mock pair for good measure.
+  // Idempotent.  mount.pdxfs's startup hook calls this once per volume
+  // mount; the sibling setters below install real values after
+  // sys_dek_seal returns.
   // ==========================================================================
-  pub let pdxb_block_encrypt : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
-    fn (dek_ptr: u64) (block_ptr: u64) (nonce_ptr: u64) (out_tag_ptr: u64) -> unsafe {
-      effects: {crypto, mem}, capabilities: {paideia.crypto},
-      justification: "libpdx-volume.M5-001 (#29): pdxb_block_encrypt STUB at v1.1.0. In-place encrypt requires a per-block scratch buffer (the AEAD writes ciphertext+tag to a distinct out_ptr) and the paired-block metadata layout is still pending mkfs.pdxfs/mount.pdxfs agreement. Signature is final; body returns LPV_CRYPTO_ERR_NOT_IMPL (0x0901) fail-closed so no caller can accidentally write plaintext to disk thinking it's encrypted.",
+  pub let pdxb_crypto_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "PFS-14 (paideia-os #2732): mount-time init.  Four qword stores to the four PFS-14 .bss slots: _lpv_dek_row_id <- LPV_DEK_ROW_UNSET (via movabs 0xFFFF..FF), the other three <- 0.  Labels prefixed lpv_cr_init_.",
       block: {
-        mov rax, 0x0901;
-        ret;
+        lea r10, [rip + _lpv_dek_row_id];
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _lpv_volume_prefix];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _lpv_crypto_syscall_mock_enable];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _lpv_crypto_syscall_mock_rax];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+
+        ret
       }
     }
 
-  pub let pdxb_block_decrypt : (u64, u64, u64, u64) -> u64 !{crypto, mem} @{paideia.crypto} =
-    fn (dek_ptr: u64) (block_ptr: u64) (nonce_ptr: u64) (tag_ptr: u64) -> unsafe {
-      effects: {crypto, mem}, capabilities: {paideia.crypto},
-      justification: "libpdx-volume.M5-001 (#29): pdxb_block_decrypt STUB, symmetric with pdxb_block_encrypt. Same paired-block layout gap; returns LPV_CRYPTO_ERR_NOT_IMPL.",
+  // ==========================================================================
+  // pdxb_crypto_set_dek_row_id(row_id) -> ()
+  // pdxb_crypto_set_volume_prefix(prefix_u32) -> ()
+  //
+  // Mount-time setters.  mount.pdxfs's post-sys_dek_seal hook calls
+  // both of these with the row_id returned by the seal syscall and the
+  // first four bytes of the superblock's kdf_salt.  Caller discipline:
+  // call both BEFORE issuing the first pdxb_block_encrypt / _decrypt;
+  // call neither after umount (the library has no umount hook; the
+  // row_id becomes a dangling index once the kernel's KIND_DEK row is
+  // scrubbed, but the caller stops issuing block I/O at that boundary).
+  // ==========================================================================
+
+  pub let pdxb_crypto_set_dek_row_id : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "PFS-14 (paideia-os #2732): write caller's row_id to the mount-lifetime _lpv_dek_row_id .bss slot.  One qword store, no bounds check (the kernel-side gate SDA_INVALID_ROW catches a bogus row_id on the next pdxb_block_encrypt call anyway; adding a cap-local gate here would duplicate the kernel's authority without adding safety).  Labels prefixed lpv_cr_sdri_.",
       block: {
-        mov rax, 0x0901;
-        ret;
+        lea r10, [rip + _lpv_dek_row_id];
+        mov [r10 + 0], rdi;
+        ret
+      }
+    }
+
+  pub let pdxb_crypto_set_volume_prefix : (u64) -> () !{mem} @{} =
+    fn (prefix_u32: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "PFS-14 (paideia-os #2732): write caller's volume_prefix (low 32 bits) to the mount-lifetime _lpv_volume_prefix .bss slot.  The syscall marshaller passes the full u64 to the kernel (which masks to low 32 bits in nonce assembly); this setter does not mask, letting the caller's full u64 pass through unmodified.  Labels prefixed lpv_cr_svp_.",
+      block: {
+        lea r10, [rip + _lpv_volume_prefix];
+        mov [r10 + 0], rdi;
+        ret
+      }
+    }
+
+  // Getters (symmetric; mainly for tests + future diagnostic surfaces).
+  pub let pdxb_crypto_get_dek_row_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "PFS-14 (paideia-os #2732): read current mount's cached dek_row_id (or LPV_DEK_ROW_UNSET = 0xFFFF..FF if the setter has never run).",
+      block: {
+        lea r10, [rip + _lpv_dek_row_id];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  pub let pdxb_crypto_get_volume_prefix : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "PFS-14 (paideia-os #2732): read current mount's cached volume_prefix (low 32 bits significant; high 32 bits caller-defined, typically zero).",
+      block: {
+        lea r10, [rip + _lpv_volume_prefix];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxb_block_encrypt(buf_ptr, lba) -> u64
+  // pdxb_block_decrypt(buf_ptr, lba) -> u64
+  //
+  // PFS-14 (paideia-os #2732) real bodies.  Replaces the v1.1.0 fail-
+  // closed stubs that returned LPV_CRYPTO_ERR_NOT_IMPL.
+  //
+  // Signature change from v1.1.0's four-arg (dek_ptr, block_ptr,
+  // nonce_ptr, out_tag_ptr) to the two-arg (buf_ptr, lba) shape:
+  //   - dek_ptr is replaced by the cached _lpv_dek_row_id (set at
+  //     mount by mount.pdxfs's post-sys_dek_seal hook).  The DEK bytes
+  //     themselves never cross the user/kernel boundary again (closes
+  //     GAP #P2 in mount.pdxfs's passphrase_wire.pdx).
+  //   - nonce_ptr is replaced by the deterministic nonce the kernel
+  //     derives from lba + the cached _lpv_volume_prefix per PFS-05
+  //     §4.1 (volume_prefix[4] || LE_u64(lba)).  No caller-side nonce
+  //     book-keeping remains.
+  //   - out_tag_ptr is replaced by inlining the tag at buf_ptr+4096;
+  //     the caller passes a 4112-byte buffer rather than 4096 + a
+  //     separate 16-byte tag cursor.  PFS-14b (`pdxb_block_meta.pdx`
+  //     follow-up) will own the on-disk pairing of these 4112-byte
+  //     frames with their persistent metadata block.
+  //
+  // Buffer layout at buf_ptr (both encrypt and decrypt):
+  //   [+0..+4096)   data (plaintext in / ciphertext out for encrypt;
+  //                       ciphertext in / plaintext out for decrypt)
+  //   [+4096..+4112) tag (16 bytes; written by encrypt, read by decrypt)
+  //
+  // Preconditions:
+  //   - pdxb_crypto_set_dek_row_id(row_id) called at mount (else returns
+  //     LPV_CRYPTO_ERR_NO_DEK).
+  //   - pdxb_crypto_set_volume_prefix(prefix) called at mount.
+  //   - buf_ptr is 4KiB-aligned and the full 4112-byte range is a user
+  //     VA the caller legitimately owns (the kernel's user_ptr_ok +
+  //     user_read_bytes_via_walk + user_write_bytes_via_walk gates
+  //     catch violations; a failed gate maps to LPV_CRYPTO_ERR_SYSCALL).
+  //
+  // Return taxonomy (translated from the kernel's SDA_* band):
+  //   LPV_CRYPTO_OK                 (0)      SDA_OK
+  //   LPV_CRYPTO_ERR_NO_DEK         (0x0907) local .bss not initialised
+  //                                          (never issues the syscall)
+  //   LPV_CRYPTO_ERR_SYSCALL        (0x0906) SDA_INVALID_PAGE | SDA_INVALID_MODE
+  //                                          (the mode funnel is unreachable
+  //                                          here but we fold it defensively)
+  //   LPV_CRYPTO_ERR_LBA_EXHAUSTED  (0x0908) SDA_INVALID_LBA
+  //   LPV_CRYPTO_ERR_AEAD_FAIL      (0x0903) SDA_AEAD_FAIL (encrypt or
+  //                                          decrypt; the tag-mismatch
+  //                                          variant also folds here --
+  //                                          caller distinguishes by
+  //                                          operation, not by code)
+  //   LPV_CRYPTO_ERR_NO_DEK         (0x0907) SDA_INVALID_ROW
+  //                                          (dek_row_id is stale -- the
+  //                                          kernel's KIND_DEK row was
+  //                                          scrubbed between mount and
+  //                                          now; mount.pdxfs discipline
+  //                                          treats this as a fatal mount-
+  //                                          lifetime error)
+  //
+  // paideia-as encoder discipline (encoder notes verbatim):
+  //   - All SDA_* and LPV_CRYPTO_* constants are small imm32 and compare
+  //     directly without r10/r11 staging.
+  //   - 4 callee-save pushes (rbx = buf_ptr, r12 = lba, r13 = row_id,
+  //     r14 = volume_prefix) = 32 B from entry rsp%16==8 -> %16==8 at
+  //     the syscall / mock-gate branch; one `sub rsp, 8` pads to
+  //     %16==0 before the two nested getter calls.  Actually since no
+  //     nested SysV call occurs under the real-syscall arm (only the
+  //     raw SYSCALL instruction, which preserves alignment per #743),
+  //     the pad is applied only around the getter calls at prologue.
+  //   - No `add reg, [mem]`; no `test`; no `imul`; no `mov_bzx`/`mov_wzx`.
+  //   - Labels prefixed `lpv_cr_be_` (encrypt), `lpv_cr_bd_` (decrypt),
+  //     `lpv_cr_sda_` (shared SDA-to-LPV translator).
+  // ==========================================================================
+
+  pub let pdxb_block_encrypt : (u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto} =
+    fn (buf_ptr: u64) (lba: u64) -> unsafe {
+      effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto},
+      justification: "PFS-14 (paideia-os #2732): pdxb_block_encrypt real body.  Reads cached _lpv_dek_row_id + _lpv_volume_prefix from .bss (set by mount.pdxfs at mount time via the sibling setters); if _lpv_dek_row_id == LPV_DEK_ROW_UNSET (0xFFFF..FF) returns LPV_CRYPTO_ERR_NO_DEK (0x0907) WITHOUT issuing the syscall -- the mount-lifetime assertion.  Marshals syscall(137, row_id, buf_ptr, lba, mode=0, volume_prefix_u64).  Mock gate: cmp [rip+_lpv_crypto_syscall_mock_enable],0 je real_syscall; else mov rax,[rip+_lpv_crypto_syscall_mock_rax] and jump to the SDA-to-LPV translator.  Register plan: 4 callee-save pushes (rbx=buf_ptr, r12=lba, r13=row_id, r14=volume_prefix) = 32 B from entry rsp%16==8 -> %16==8 at the pre-syscall branch; raw SYSCALL preserves callee-save registers (and under #743 info-leak hardening zeros only caller-save) so rbx/r12/r13/r14 survive.  SDA translation (shared pattern with pdxb_block_decrypt): cmp rax,0 je LPV_CRYPTO_OK; cmp rax,1 je NO_DEK; cmp rax,2 je SYSCALL; cmp rax,3 je LBA_EXHAUSTED; cmp rax,4 je AEAD_FAIL; cmp rax,5 je SYSCALL; default route also SYSCALL (defensive).  Labels prefixed lpv_cr_be_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // buf_ptr
+        mov r12, rsi;                    // lba
+
+        // ---- Preflight: NO_DEK check ----
+        lea r10, [rip + _lpv_dek_row_id];
+        mov r13, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFF;     // LPV_DEK_ROW_UNSET
+        cmp r13, r11;
+        je  lpv_cr_be_no_dek;
+
+        // ---- Load volume_prefix ----
+        lea r10, [rip + _lpv_volume_prefix];
+        mov r14, [r10 + 0];
+
+        // ---- Mock gate ----
+        mov r10, [rip + _lpv_crypto_syscall_mock_enable];
+        cmp r10, 0;
+        jne lpv_cr_be_use_mock;
+
+        // ---- Real syscall ----
+        //   User-side Linux-ish SYSCALL ABI as observed by entry.pdx's
+        //   left-rotate shuffle (L98-101) and dispatch_dek_apply:
+        //     rax = sysno
+        //     rdi = a0 = row_id
+        //     rsi = a1 = buf_ptr
+        //     rdx = a2 = lba
+        //     r10 = a3 = mode  (Linux SYSCALL convention: r10 replaces
+        //                       rcx because SYSCALL writes return RIP to
+        //                       rcx; entry.pdx shuffles user r10 -> SysV
+        //                       r8 at the kernel seam)
+        //     r9  = a4 = volume_prefix_u64 (preserved through the entry
+        //                       shuffle verbatim; the dispatch_dek_apply
+        //                       arm reads it in r9 and moves to r8 for
+        //                       the body's 5th arg)
+        mov rax, 137;                    // LPV_SYSNO_DEK_APPLY
+        mov rdi, r13;                    // row_id
+        mov rsi, rbx;                    // buf_ptr
+        mov rdx, r12;                    // lba
+        mov r10, 0;                      // LPV_DEK_APPLY_ENCRYPT
+        mov r9,  r14;                    // volume_prefix_u64
+        syscall;
+        jmp lpv_cr_be_translate;
+
+      lpv_cr_be_use_mock:
+        mov rax, [rip + _lpv_crypto_syscall_mock_rax];
+        // fall through to translator.
+
+      lpv_cr_be_translate:
+        // SDA_* -> LPV_CRYPTO_* translation.
+        cmp rax, 0;
+        je  lpv_cr_be_ok;
+        cmp rax, 1;
+        je  lpv_cr_be_no_dek;
+        cmp rax, 2;
+        je  lpv_cr_be_syscall;
+        cmp rax, 3;
+        je  lpv_cr_be_lba_exh;
+        cmp rax, 4;
+        je  lpv_cr_be_aead;
+        // 5 (SDA_INVALID_MODE) or any other value -> SYSCALL (defensive).
+        jmp lpv_cr_be_syscall;
+
+      lpv_cr_be_ok:
+        xor rax, rax;
+        jmp lpv_cr_be_done;
+
+      lpv_cr_be_no_dek:
+        mov rax, 0x0907;                 // LPV_CRYPTO_ERR_NO_DEK
+        jmp lpv_cr_be_done;
+
+      lpv_cr_be_syscall:
+        mov rax, 0x0906;                 // LPV_CRYPTO_ERR_SYSCALL
+        jmp lpv_cr_be_done;
+
+      lpv_cr_be_lba_exh:
+        mov rax, 0x0908;                 // LPV_CRYPTO_ERR_LBA_EXHAUSTED
+        jmp lpv_cr_be_done;
+
+      lpv_cr_be_aead:
+        mov rax, 0x0903;                 // LPV_CRYPTO_ERR_AEAD_FAIL
+
+      lpv_cr_be_done:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let pdxb_block_decrypt : (u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto} =
+    fn (buf_ptr: u64) (lba: u64) -> unsafe {
+      effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto},
+      justification: "PFS-14 (paideia-os #2732): pdxb_block_decrypt real body, mirror of pdxb_block_encrypt with mode=1 (decrypt).  Same preflight (NO_DEK), same mock gate, same SDA-to-LPV translation.  The caller's 4112-byte buffer has ciphertext[4096] + tag[16] on entry; the kernel's user_read_bytes_via_walk reads all 4112 bytes, the AEAD open verifies the tag, and on OK user_write_bytes_via_walk writes 4096 plaintext bytes back (the tag slot at buf+4096 is left untouched -- it was input).  Register plan + label-prefix discipline identical to pdxb_block_encrypt but with lpv_cr_bd_ prefix.  4 callee-save pushes (rbx/r12/r13/r14) match the encrypt side.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // buf_ptr
+        mov r12, rsi;                    // lba
+
+        lea r10, [rip + _lpv_dek_row_id];
+        mov r13, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r13, r11;
+        je  lpv_cr_bd_no_dek;
+
+        lea r10, [rip + _lpv_volume_prefix];
+        mov r14, [r10 + 0];
+
+        mov r10, [rip + _lpv_crypto_syscall_mock_enable];
+        cmp r10, 0;
+        jne lpv_cr_bd_use_mock;
+
+        mov rax, 137;                    // LPV_SYSNO_DEK_APPLY
+        mov rdi, r13;                    // row_id
+        mov rsi, rbx;                    // buf_ptr
+        mov rdx, r12;                    // lba
+        mov r10, 1;                      // LPV_DEK_APPLY_DECRYPT (r10 = a3)
+        mov r9,  r14;                    // volume_prefix_u64 (r9 = a4)
+        syscall;
+        jmp lpv_cr_bd_translate;
+
+      lpv_cr_bd_use_mock:
+        mov rax, [rip + _lpv_crypto_syscall_mock_rax];
+
+      lpv_cr_bd_translate:
+        cmp rax, 0;
+        je  lpv_cr_bd_ok;
+        cmp rax, 1;
+        je  lpv_cr_bd_no_dek;
+        cmp rax, 2;
+        je  lpv_cr_bd_syscall;
+        cmp rax, 3;
+        je  lpv_cr_bd_lba_exh;
+        cmp rax, 4;
+        je  lpv_cr_bd_aead;
+        jmp lpv_cr_bd_syscall;
+
+      lpv_cr_bd_ok:
+        xor rax, rax;
+        jmp lpv_cr_bd_done;
+
+      lpv_cr_bd_no_dek:
+        mov rax, 0x0907;
+        jmp lpv_cr_bd_done;
+
+      lpv_cr_bd_syscall:
+        mov rax, 0x0906;
+        jmp lpv_cr_bd_done;
+
+      lpv_cr_bd_lba_exh:
+        mov rax, 0x0908;
+        jmp lpv_cr_bd_done;
+
+      lpv_cr_bd_aead:
+        mov rax, 0x0903;
+
+      lpv_cr_bd_done:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
       }
     }
 }
